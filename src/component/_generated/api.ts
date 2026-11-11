@@ -8,7 +8,14 @@
  * @module
  */
 
+import type * as constants from "../constants.js";
+import type * as crons from "../crons.js";
+import type * as exporter from "../exporter.js";
 import type * as lib from "../lib.js";
+import type * as outbox from "../outbox.js";
+import type * as retention from "../retention.js";
+import type * as settings from "../settings.js";
+import type * as tracing from "../tracing.js";
 
 import type {
   ApiFromModules,
@@ -18,7 +25,14 @@ import type {
 import { anyApi, componentsGeneric } from "convex/server";
 
 const fullApi: ApiFromModules<{
+  constants: typeof constants;
+  crons: typeof crons;
+  exporter: typeof exporter;
   lib: typeof lib;
+  outbox: typeof outbox;
+  retention: typeof retention;
+  settings: typeof settings;
+  tracing: typeof tracing;
 }> = anyApi as any;
 
 /**
@@ -47,4 +61,6 @@ export const internal: FilterApi<
   FunctionReference<any, "internal">
 > = anyApi as any;
 
-export const components = componentsGeneric() as unknown as {};
+export const components = componentsGeneric() as unknown as {
+  batchWorker: import("@convex-dev/batch-worker/_generated/component.js").ComponentApi<"batchWorker">;
+};
