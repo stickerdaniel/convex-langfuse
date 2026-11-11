@@ -44,7 +44,8 @@ function usageDetails(usage: Record<string, number>): string | undefined {
 /**
  * Keeps finite numbers and appends `total` when it is missing. Langfuse derives
  * a total cost only when every key is `input` or `output`; with any other key
- * and no `total`, the observation would show no cost.
+ * and no `total`, the observation would show no cost. Writes no cost at all
+ * when the sum is not finite, because JSON would turn that total into `null`.
  */
 function costDetails(cost: Record<string, number>): string | undefined {
   const kept = Object.fromEntries(
@@ -54,6 +55,7 @@ function costDetails(cost: Record<string, number>): string | undefined {
   if (values.length === 0) return undefined;
   if (!("total" in kept)) {
     const sum = values.reduce((total, value) => total + value, 0);
+    if (!Number.isFinite(sum)) return undefined;
     kept.total = Number(sum.toFixed(12));
   }
   return JSON.stringify(kept);

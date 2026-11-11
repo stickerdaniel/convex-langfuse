@@ -186,8 +186,20 @@ describe("encodeSpan", () => {
     expect(attribute(span, ATTR.experimentId)).toEqual({
       stringValue: "exp-1",
     });
+    expect(attribute(span, ATTR.experimentName)).toEqual({
+      stringValue: "prompt v2",
+    });
+    expect(attribute(span, ATTR.experimentDatasetId)).toEqual({
+      stringValue: "dataset-1",
+    });
+    expect(attribute(span, ATTR.experimentItemId)).toEqual({
+      stringValue: "item-1",
+    });
     expect(attribute(span, ATTR.experimentItemRootObservationId)).toEqual({
       stringValue: "fedcba9876543210",
+    });
+    expect(attribute(span, ATTR.experimentMetadata)).toEqual({
+      stringValue: '{"run":3}',
     });
   });
 
@@ -236,6 +248,13 @@ describe("cost", () => {
       input: 0.001,
       total: 0.001,
     });
+  });
+
+  test("writes no cost when the total overflows", () => {
+    const span = encode({
+      cost: { input: 1e308, input_audio_tokens: 1e308 },
+    });
+    expect(attribute(span, ATTR.cost)).toBeUndefined();
   });
 
   test("writes no cost without cost data", () => {
