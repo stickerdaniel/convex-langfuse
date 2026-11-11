@@ -46,7 +46,8 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "NOTICE"
   ],
   "exports": {
     "./package.json": "./package.json",
