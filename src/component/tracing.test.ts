@@ -100,6 +100,30 @@ describe("record", () => {
     expect((await tables(t)).outbox).toHaveLength(0);
   });
 
+  test("env defaults do not count against the 900 KiB of a span", async () => {
+    enableExport();
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "production");
+    vi.stubEnv("LANGFUSE_RELEASE", "release-".repeat(20));
+    const t = initConvexTest();
+    // The client measures spans with this encoder and without the defaults.
+    expect(
+      await t.mutation(api.tracing.record, {
+        trace: TRACE,
+        observations: [observationOfBytes(0, MAX_ROW_BYTES)],
+      }),
+    ).toEqual({ enqueued: 1 });
+    const [row] = (await tables(t)).outbox;
+    expect(row!.bytes).toBeGreaterThan(MAX_ROW_BYTES);
+    expect(
+      await refusalCode(
+        t.mutation(api.tracing.record, {
+          trace: TRACE,
+          observations: [observationOfBytes(1, MAX_ROW_BYTES + 1)],
+        }),
+      ),
+    ).toBe("row_too_large");
+  });
+
   test("a 4 MiB call and the largest claims stay inside transaction limits", async () => {
     enableExport();
     const t = initConvexTest({ transactionLimits: true });
