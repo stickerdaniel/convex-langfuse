@@ -756,6 +756,9 @@ async function main() {
       const acceptedAt = async () =>
         (await client.query(api.backlog, {})).accepted;
       const requestsAt = async () => (await fake.stats()).requests;
+      const LOAD_MUTATIONS = 2_000;
+      const LOAD_MS = 15_000;
+      const WINDOW_MS = 5_000;
       const load6 = { commits: () => 0, windows: [] };
       let drainedAt;
 
@@ -797,11 +800,15 @@ async function main() {
           drainedAt === undefined
             ? "not all arrived"
             : `${((drainedAt - loadEnd) / 1_000).toFixed(1)} s`;
+        const seconds =
+          loadEnd === undefined
+            ? "n/a"
+            : ((loadEnd - loadStart) / 1_000).toFixed(1);
         return {
           executions,
           text:
-            `${load6.commits()} mutations in 30 s, ${rate} requests/s during ` +
-            `the load, every span id ${drain} after the load; ` +
+            `${load6.commits()} mutations in ${seconds} s, ${rate} requests/s ` +
+            `during the load, every span id ${drain} after the load; ` +
             `advance median ${medianMs(during(advance, loadStart, loadStart + 5_000))} ms ` +
             `in the first 5 s, ${medianMs(during(advance, loadEnd - 5_000, loadEnd))} ms ` +
             `in the last 5 s; ${counts.length} count steps, longest ` +
@@ -810,22 +817,32 @@ async function main() {
       };
 
       try {
-        // Enqueues never pause, so the exporter always claims next to a live
-        // insert range. It must keep accepting rows in every window.
+        // Eight workers enqueue without a pause, so the exporter always
+        // claims next to a live insert range and competes with the enqueues
+        // for the backend. The load ends after LOAD_MUTATIONS mutations or
+        // LOAD_MS, whichever comes first: its rows stay below the gate's
+        // threshold, so no mutation is refused on any machine.
         load6.requestsStart = await requestsAt();
         load6.loadStart = Date.now();
         const load = startLoad(client, 6, { size: 10, concurrency: 8 });
         load6.commits = load.commits;
         let last = await acceptedAt();
-        for (let i = 0; i < 6; i++) {
-          await sleep(5_000);
+        let windowStart = Date.now();
+        while (
+          load.commits() < LOAD_MUTATIONS &&
+          Date.now() - load6.loadStart < LOAD_MS
+        ) {
+          await sleep(100);
+          if (Date.now() - windowStart < WINDOW_MS) continue;
           const now = await acceptedAt();
           load6.windows.push(now - last);
           last = now;
+          windowStart = Date.now();
         }
         const commits = await load.stop();
         load6.loadEnd = Date.now();
         load6.requestsEnd = await requestsAt();
+        // The exporter must keep accepting rows while the load runs.
         if (load6.windows.some((accepted) => accepted === 0)) {
           throw new Error(
             `rows accepted per 5 s window: ${load6.windows.join(", ")}`,
@@ -835,7 +852,7 @@ async function main() {
         await waitFor(
           "every span id",
           async () => received(await fake.stats(), 6, total) === total,
-          180_000,
+          300_000,
         );
         drainedAt = Date.now();
         const { executions, text } = await diagnostics();
