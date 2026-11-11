@@ -212,9 +212,9 @@ export const advance = internalMutation({
     const now = Date.now();
     // Outbox rows this call deletes; each one adds to the removed totals.
     const removed: Doc<"outbox">[] = [];
-    // Only a closed gate can change through a deletion or the end of a run.
-    // `reconcileGate` then decides from both totals; this mutation never
-    // reads the counter, so it does not conflict with a count step.
+    // Only a closed gate can change through a deletion or the end of a run:
+    // both ask `reconcileGate`, which decides from both totals. This mutation
+    // never reads the counter, so it does not conflict with a count step.
     let reconciling = false;
     const reopen = async () => {
       if (reconciling || !(await gateClosed(ctx))) return;
@@ -226,6 +226,9 @@ export const advance = internalMutation({
       return withRemoved(exporter, removed);
     };
     const endRun = async (patch: Partial<Doc<"exporter">>) => {
+      // After the run nothing may be left to delete, so a gate that is
+      // closed over an empty outbox would stay closed.
+      await reopen();
       await ctx.db.patch("exporter", exporter._id, {
         ...patch,
         ...(await settle()),
@@ -349,12 +352,7 @@ export const advance = internalMutation({
       spans.push(payload.data);
       bytes += row.bytes;
     }
-    if (claimed.length === 0) {
-      // A gate that is closed over an empty outbox has no deletion left to
-      // reopen it.
-      await reopen();
-      return await endRun(patch);
-    }
+    if (claimed.length === 0) return await endRun(patch);
 
     await ctx.db.patch("exporter", exporter._id, {
       ...patch,

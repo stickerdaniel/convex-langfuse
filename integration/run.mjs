@@ -839,13 +839,14 @@ async function main() {
           last = now;
           windowStart = Date.now();
         }
-        const commits = await load.stop();
-        load6.loadEnd = Date.now();
-        load6.requestsEnd = await requestsAt();
-        // A load shorter than one window still has to show progress.
+        // A load shorter than one window still has to show progress, so it
+        // is sampled while the workers still enqueue.
         if (load6.windows.length === 0) {
           load6.windows.push((await acceptedAt()) - last);
         }
+        const commits = await load.stop();
+        load6.loadEnd = Date.now();
+        load6.requestsEnd = await requestsAt();
         // The exporter must keep accepting rows while the load runs.
         if (load6.windows.some((accepted) => accepted === 0)) {
           throw new Error(

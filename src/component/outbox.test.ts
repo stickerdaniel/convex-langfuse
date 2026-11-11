@@ -428,6 +428,31 @@ describe("counting", () => {
     }
   });
 
+  test("a run that ends on a failed request whose rows are gone still opens a closed gate", async () => {
+    const t = initConvexTest();
+    await drift(t);
+    const [row] = await insertRows(t, [{ data: "x" }]);
+    expect(
+      await t.mutation(internal.exporter.advance, { generation: 1 }),
+    ).toEqual({ done: false, spans: ["x"] });
+    // The whole claim vanishes before its report, for example by hand.
+    await t.run(async (ctx) => {
+      const claimed = await ctx.db.get("outbox", row!);
+      await ctx.db.delete("payloads", claimed!.payloadId);
+      await ctx.db.delete("outbox", row!);
+    });
+    expect(
+      await t.mutation(internal.exporter.advance, {
+        generation: 1,
+        report: { outcome: "transient", status: 503 },
+      }),
+    ).toEqual({ done: true });
+    await runScheduledNow(t);
+    const health = await t.query(api.outbox.health, {});
+    expect(health.pendingCounted).toEqual({ rows: 0, bytes: 0 });
+    expect(health.accepting).toBe(true);
+  });
+
   test("stale totals stay while the outbox holds a row", async () => {
     const t = initConvexTest();
     await drift(t);
