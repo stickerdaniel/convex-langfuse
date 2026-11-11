@@ -6,6 +6,7 @@ export default defineConfig({
     exclude: ["scratch/**", ".claude/**", "dist/**", "**/node_modules/**"],
     typecheck: {
       tsconfig: "./tsconfig.test.json",
+      exclude: ["scratch/**", ".claude/**", "dist/**", "**/node_modules/**"],
     },
   },
 });

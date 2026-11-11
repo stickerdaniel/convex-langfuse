@@ -113,6 +113,11 @@ export default defineSchema({
     measuredAt: v.optional(v.number()),
     /** Outbox rows with `seq` up to this value are in the pending counters. */
     countedThrough: v.optional(v.int64()),
+    /**
+     * Set while a count step stopped inside the commit `countedThrough`: its
+     * rows are counted up to this `_creationTime`.
+     */
+    countedTime: v.optional(v.number()),
     /** Counted pending span rows and their payload bytes. */
     pendingRows: v.number(),
     pendingBytes: v.number(),

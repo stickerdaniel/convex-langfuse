@@ -34,9 +34,9 @@ export default [
   },
   pluginJs.configs.recommended,
   ...tseslint.configs.recommended,
-  // Integration harness scripts - Node environment
+  // Integration harness and maintenance scripts - Node environment
   {
-    files: ["integration/**/*.mjs"],
+    files: ["integration/**/*.mjs", "scripts/**/*.mjs"],
     languageOptions: {
       globals: globals.node,
     },

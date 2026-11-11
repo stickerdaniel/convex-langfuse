@@ -41,6 +41,8 @@ export const BREAKER_REJECTED_SPANS = 20;
 export const MEASURE_INTERVAL_MS = MINUTE;
 /** Outbox rows one count step reads. */
 export const COUNT_BATCH = 1_000;
+/** Most dead letters one `retryDeadLetters` call moves back to the outbox. */
+export const RETRY_DEAD_LETTERS_MAX = 500;
 /** The gate closes above this many pending rows. */
 export const PENDING_ROWS_THRESHOLD = 25_000;
 /** The gate closes above this many pending payload bytes. */

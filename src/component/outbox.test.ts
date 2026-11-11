@@ -149,6 +149,86 @@ describe("counting", () => {
     expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
   });
 
+  test("a commit larger than a batch is counted in steps of at most 1,000 rows", async () => {
+    // Rows of one transaction share a seq. Reading that whole commit in one
+    // step would exceed the read limit.
+    const t = initConvexTest({ transactionLimits: { documentsRead: 1_100 } });
+    await insertRows(
+      t,
+      Array.from({ length: 1_500 }, () => ({ data: "x" })),
+    );
+    await count(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
+    await count(t);
+    await count(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_500, bytes: 1_500 });
+  });
+
+  test("a step that stops inside a commit subtracts only the rows it counted", async () => {
+    const t = initConvexTest();
+    const now = Date.now();
+    // One commit of 1,200 rows. The last 200 are available earlier, so the
+    // exporter claims them first, while a count step reaches them last.
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 1_200; i++) {
+        const payloadId = await ctx.db.insert("payloads", { data: "x" });
+        await ctx.db.insert("outbox", {
+          kind: "span",
+          ref: `r${i}`,
+          bytes: 1,
+          availableAt: i < 1_000 ? now : now - 1_000,
+          payloadId,
+          seq: ctx.db.vars.commitTs,
+        });
+      }
+    });
+    await count(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
+
+    await startRunByHand(t);
+    const accepted = { outcome: "accepted" as const, status: 200 };
+    await t.mutation(internal.exporter.advance, { generation: 1 });
+    // 50 uncounted rows of the same commit are exported.
+    await t.mutation(internal.exporter.advance, {
+      generation: 1,
+      report: accepted,
+    });
+    expect(await outboxSize(t)).toBe(1_150);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
+
+    // The rest of the commit is counted; the 50 rows in flight still exist.
+    await count(t);
+    await count(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_150, bytes: 1_150 });
+    await t.mutation(internal.exporter.advance, {
+      generation: 1,
+      report: accepted,
+    });
+    expect(await outboxSize(t)).toBe(1_100);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_100, bytes: 1_100 });
+  });
+
+  test("retryDeadLetters moves at most 500 dead letters per call", async () => {
+    const t = initConvexTest();
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 520; i++) {
+        const payloadId = await ctx.db.insert("payloads", { data: "x" });
+        await ctx.db.insert("deadLetters", {
+          kind: "span",
+          ref: `r${i}`,
+          bytes: 1,
+          payloadId,
+          reason: "rejected",
+          failedAt: i,
+        });
+      }
+    });
+    expect(
+      await t.mutation(internal.outbox.retryDeadLetters, { limit: 10_000 }),
+    ).toEqual({ moved: 500 });
+    expect((await tables(t)).deadLetters).toHaveLength(20);
+  });
+
   test("a row committed after the step's snapshot is counted once, by a later step", async () => {
     const t = initConvexTest();
     await t.run(async (ctx) => {

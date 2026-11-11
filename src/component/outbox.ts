@@ -14,6 +14,7 @@ import {
   MEASURE_INTERVAL_MS,
   PENDING_BYTES_THRESHOLD,
   PENDING_ROWS_THRESHOLD,
+  RETRY_DEAD_LETTERS_MAX,
   WORKER_NAME,
 } from "./constants.js";
 import { exportConfig } from "./settings.js";
@@ -70,16 +71,19 @@ export async function pingExporter(ctx: MutationCtx): Promise<void> {
 /** The pending counters of the exporter document. */
 export type Counters = Pick<Doc<"exporter">, "pendingRows" | "pendingBytes">;
 
-/** Whether a count step has already added the row with this `seq`. */
+/**
+ * Whether a count step has already added this row. The cursor is
+ * `countedThrough`, a commit timestamp, plus `countedTime` while a step
+ * stopped inside one commit: rows of that commit are counted up to that
+ * `_creationTime`, which every insert of a transaction advances.
+ */
 function isCounted(
-  seq: Doc<"outbox">["seq"],
-  countedThrough: bigint | undefined,
+  row: Doc<"outbox">,
+  { countedThrough, countedTime }: Doc<"exporter">,
 ): boolean {
-  return (
-    typeof seq === "bigint" &&
-    countedThrough !== undefined &&
-    seq <= countedThrough
-  );
+  if (typeof row.seq !== "bigint" || countedThrough === undefined) return false;
+  if (row.seq !== countedThrough) return row.seq < countedThrough;
+  return countedTime === undefined || row._creationTime <= countedTime;
 }
 
 /**
@@ -92,9 +96,7 @@ export function withoutRows(
 ): Counters {
   let { pendingRows, pendingBytes } = exporter;
   for (const row of removed) {
-    if (row.kind !== "span" || !isCounted(row.seq, exporter.countedThrough)) {
-      continue;
-    }
+    if (row.kind !== "span" || !isCounted(row, exporter)) continue;
     pendingRows -= 1;
     pendingBytes -= row.bytes;
   }
@@ -154,75 +156,83 @@ export async function scheduleCount(
 }
 
 /**
- * Safety net for drifted counters: when the outbox is empty but the counters
- * are not zero or the gate is closed, opens the gate and returns zero
- * counters for the caller to store. Returns `null` when nothing changes.
+ * Safety net for drifted counters, for example after rows were deleted by
+ * hand: when the counters are not zero or the gate is closed although the
+ * outbox is empty, opens the gate and returns zero counters for the caller to
+ * store. Returns `null` when nothing changes. Reads the outbox only when a
+ * reset is possible, so the usual end of a run takes no read dependency on it.
  */
 export async function resetCountersIfEmpty(
   ctx: MutationCtx,
   exporter: Doc<"exporter">,
 ): Promise<Counters | null> {
-  if (await ctx.db.query("outbox").first()) return null;
   const drifted = exporter.pendingRows !== 0 || exporter.pendingBytes !== 0;
   if (!drifted && !(await gateClosed(ctx))) return null;
+  if (await ctx.db.query("outbox").first()) return null;
   const zero = { pendingRows: 0, pendingBytes: 0 };
   await moveGate(ctx, zero);
   return zero;
 }
 
 /**
- * One count step. Adds the outbox rows committed after `countedThrough` to
- * the pending counters, about `COUNT_BATCH` rows at most, and moves the gate.
- * Rows that commit after this transaction's snapshot lie outside the read
- * range, so concurrent enqueues do not conflict with it. Deletions subtract
- * counted rows and write the exporter document too, so they serialize with
- * this step. A full step schedules the next one at once.
+ * One count step. Adds at most `COUNT_BATCH` outbox rows committed after the
+ * cursor to the pending counters and moves the gate. Rows are read in commit
+ * order. A step that fills its batch stops at its last row, also inside a
+ * commit, and the next step continues after that row. Rows that commit after
+ * this transaction's snapshot lie outside the read range, so concurrent
+ * enqueues do not conflict with it. Deletions subtract counted rows and write
+ * the exporter document too, so they serialize with this step. A step that
+ * may have left rows behind schedules the next one at once.
  */
 export const count = internalMutation({
   args: {},
   returns: v.null(),
   handler: async (ctx) => {
     const exporter = await getOrCreateExporter(ctx);
+    const { countedThrough, countedTime } = exporter;
+    const insideCommit =
+      countedThrough !== undefined && countedTime !== undefined;
     const snapshot = ctx.meta.getSnapshotTs();
-    const from = exporter.countedThrough ?? 0n;
-    const rows = await ctx.db
-      .query("outbox")
-      .withIndex("by_seq", (q) => q.gt("seq", from).lte("seq", snapshot))
-      .take(COUNT_BATCH);
-    const full = rows.length === COUNT_BATCH;
-    let batch = rows;
-    let countedThrough = snapshot;
-    if (full) {
-      // Rows of one commit share a `seq`. Stop before the last commit in the
-      // batch so the next step counts its rows together; a single commit
-      // larger than the batch is read whole.
-      const last = rows.at(-1)!.seq;
-      batch = rows.filter((row) => row.seq !== last);
-      if (batch.length === 0) {
-        batch = await ctx.db
+    const rows = insideCommit
+      ? await ctx.db
           .query("outbox")
-          .withIndex("by_seq", (q) => q.eq("seq", last))
-          .collect();
-      }
-      const through = batch.at(-1)!.seq;
-      if (typeof through !== "bigint") throw new Error("count: uncommitted");
-      countedThrough = through;
+          .withIndex("by_seq", (q) =>
+            q.eq("seq", countedThrough).gt("_creationTime", countedTime),
+          )
+          .take(COUNT_BATCH)
+      : await ctx.db
+          .query("outbox")
+          .withIndex("by_seq", (q) =>
+            q.gt("seq", countedThrough ?? 0n).lte("seq", snapshot),
+          )
+          .take(COUNT_BATCH);
+    const last = rows.at(-1);
+    const full = rows.length === COUNT_BATCH && last !== undefined;
+    let cursor: Pick<Doc<"exporter">, "countedThrough" | "countedTime">;
+    if (full) {
+      if (typeof last.seq !== "bigint") throw new Error("count: uncommitted");
+      cursor = { countedThrough: last.seq, countedTime: last._creationTime };
+    } else if (insideCommit) {
+      // The rest of that commit is counted.
+      cursor = { countedThrough, countedTime: undefined };
+    } else {
+      cursor = { countedThrough: snapshot, countedTime: undefined };
     }
     const counters: Counters = {
       pendingRows: exporter.pendingRows,
       pendingBytes: exporter.pendingBytes,
     };
-    for (const row of batch) {
+    for (const row of rows) {
       if (row.kind !== "span") continue;
       counters.pendingRows += 1;
       counters.pendingBytes += row.bytes;
     }
-    await ctx.db.patch("exporter", exporter._id, {
-      ...counters,
-      countedThrough,
-    });
+    await ctx.db.patch("exporter", exporter._id, { ...counters, ...cursor });
     await moveGate(ctx, counters);
-    if (full) await ctx.scheduler.runAfter(0, internal.outbox.count, {});
+    // After a commit was finished, later commits may still be uncounted.
+    if (full || insideCommit) {
+      await ctx.scheduler.runAfter(0, internal.outbox.count, {});
+    }
     return null;
   },
 });
@@ -296,8 +306,8 @@ export const health = query({
 });
 
 /**
- * Moves up to `limit` (default 100) dead letters, oldest first, back to the
- * outbox and wakes the exporter. A moved row gets a new `seq`, so the next
+ * Moves up to `limit` (default 100, at most `RETRY_DEAD_LETTERS_MAX`) dead
+ * letters, oldest first, back to the outbox and wakes the exporter. A moved row gets a new `seq`, so the next
  * count step counts it. Does nothing while the gate is closed. Run it from the
  * dashboard or CLI after fixing what made Langfuse reject them.
  */
@@ -309,7 +319,7 @@ export const retryDeadLetters = internalMutation({
     const deadLetters = await ctx.db
       .query("deadLetters")
       .withIndex("by_failedAt")
-      .take(Math.max(0, Math.floor(limit)));
+      .take(Math.min(RETRY_DEAD_LETTERS_MAX, Math.max(0, Math.floor(limit))));
     const now = Date.now();
     for (const { _id, kind, ref, bytes, payloadId } of deadLetters) {
       await ctx.db.insert("outbox", {

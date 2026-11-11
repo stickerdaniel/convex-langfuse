@@ -117,9 +117,28 @@ export const nextWork = internalQuery({
 });
 
 /**
- * The worker mutation of the batch-worker loop. Re-reads the state, because
- * `nextWork` saw a stale snapshot. Always returns a `debounceMs`, so the loop
- * stays `running` and an enqueue `ping` stays read-only.
+ * Ids of the first `CLAIM_WINDOW` rows that are available at `now`. `advance`
+ * runs it on a stale snapshot and reads the rows by id afterwards. A range
+ * read inside `advance` would end at its own `Date.now()`, and every enqueue
+ * that commits into that range would force a retry with a later bound.
+ */
+export const claimable = internalQuery({
+  args: { now: v.number() },
+  returns: v.array(v.id("outbox")),
+  handler: async (ctx, { now }) => {
+    const rows = await ctx.db
+      .query("outbox")
+      .withIndex("by_availableAt", (q) => q.lte("availableAt", now))
+      .take(CLAIM_WINDOW);
+    return rows.map((row) => row._id);
+  },
+});
+
+/**
+ * The worker mutation of the batch-worker loop. Re-reads the exporter state,
+ * because `nextWork` saw a stale snapshot. It reads no outbox range, so
+ * enqueues do not conflict with the loop. Always returns a `debounceMs`, so
+ * the loop stays `running` and an enqueue `ping` stays read-only.
  */
 export const dispatch = internalMutation({
   args: vMutationArgs,
@@ -136,11 +155,7 @@ export const dispatch = internalMutation({
     if (backoff > 0) {
       return { debounceMs: Math.min(backoff, BACKOFF_POLL_MS) };
     }
-    const available = await ctx.db
-      .query("outbox")
-      .withIndex("by_availableAt", (q) => q.lte("availableAt", now))
-      .first();
-    if (!available) return { debounceMs: 100 };
+    // `nextWork` saw an available row. If it is gone, the run ends at once.
     const generation = exporter.generation + 1;
     await ctx.db.patch("exporter", exporter._id, {
       generation,
@@ -296,16 +311,22 @@ export const advance = internalMutation({
       return await endRun(patch);
     }
 
-    const window = await ctx.db
-      .query("outbox")
-      .withIndex("by_availableAt", (q) => q.lte("availableAt", now))
-      .take(CLAIM_WINDOW);
+    // Candidates come from a stale snapshot, so this mutation takes no read
+    // dependency on the range that enqueues write into. Each row is read by
+    // id; one that is gone or not available any more is skipped.
+    const window = await ctx.runQuery(
+      internal.exporter.claimable,
+      { now },
+      { useStaleSnapshot: true },
+    );
     // The longest prefix within the span and byte budgets, at least one row;
     // exactly one row while isolating the rows of a rejected batch.
     const claimed: Doc<"outbox">["_id"][] = [];
     const spans: string[] = [];
     let bytes = 0;
-    for (const row of window) {
+    for (const id of window) {
+      const row = await ctx.db.get("outbox", id);
+      if (!row || row.availableAt > now) continue;
       if (
         claimed.length > 0 &&
         (isolateRemaining > 0 ||

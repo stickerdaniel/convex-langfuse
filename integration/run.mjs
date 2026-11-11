@@ -259,9 +259,10 @@ async function convex(backend, args) {
 }
 
 /**
- * Streams the backend's function log as JSONL until `stop`, which returns
- * every completed execution with its `identifier`, `executionTime` in
- * seconds and `error`.
+ * Streams the backend's function log as JSONL until `stop`, which ends the
+ * stream, waits until its output is read to the end, and returns every
+ * completed execution with its `identifier`, `executionTime` in seconds and
+ * `error`.
  */
 function streamLogs(backend) {
   const child = track(
@@ -273,22 +274,31 @@ function streamLogs(backend) {
   );
   const entries = [];
   let buffer = "";
+  const take = (line) => {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.kind === "Completion") entries.push(entry);
+    } catch {
+      // Not a log event.
+    }
+  };
   child.stdout.on("data", (chunk) => {
     buffer += chunk;
     const lines = buffer.split("\n");
     buffer = lines.pop();
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.kind === "Completion") entries.push(entry);
-      } catch {
-        // Not a log event.
-      }
-    }
+    lines.forEach(take);
   });
+  const closed = new Promise((resolve) => child.once("close", resolve));
   return {
-    stop() {
+    async stop() {
+      // The CLI polls the log; give it one more poll before it is stopped.
+      await sleep(1_500);
+      child.kill("SIGTERM");
+      await Promise.race([closed, sleep(5_000)]);
       child.kill("SIGKILL");
+      await closed;
+      take(buffer);
+      buffer = "";
       return entries;
     },
   };
@@ -309,6 +319,7 @@ const TRACE_IDS = {
   3: "a0000000000000000000000000000003",
   4: "a0000000000000000000000000000004",
   5: "a0000000000000000000000000000005",
+  6: "a0000000000000000000000000000006",
 };
 
 /** First span id number of a case, so cases never share ids. */
@@ -354,6 +365,57 @@ async function recordMany(
   return results;
 }
 
+/**
+ * Runs record mutations of `size` spans each, `concurrency` at a time, until
+ * `stop`, which returns the commit time of every mutation. `commits` is the
+ * number committed so far. A mutation refused by the local backend's write
+ * throughput limit is sent again after a pause.
+ */
+function startLoad(client, caseNo, { size, concurrency }) {
+  const commits = [];
+  let next = 0;
+  let running = true;
+  let failure;
+  const worker = async () => {
+    while (running) {
+      const args = {
+        traceId: TRACE_IDS[caseNo],
+        from: firstId(caseNo) + next++ * size,
+        count: size,
+      };
+      for (;;) {
+        try {
+          const result = await client.mutation(api.record, args, {
+            skipQueue: true,
+          });
+          if (result.enqueued !== size) {
+            throw new Error(`record returned ${JSON.stringify(result)}`);
+          }
+          commits.push(Date.now());
+          break;
+        } catch (error) {
+          if (!/TooManyWrites/.test(String(error))) {
+            failure ??= error;
+            running = false;
+            return;
+          }
+          await sleep(1_000);
+        }
+      }
+    }
+  };
+  const workers = Promise.all(Array.from({ length: concurrency }, worker));
+  return {
+    commits: () => commits.length,
+    async stop() {
+      running = false;
+      await workers;
+      if (failure) throw failure;
+      return commits;
+    },
+  };
+}
+
 /** Span ids of a case the fake endpoint has received. */
 function received(stats, caseNo, total) {
   let count = 0;
@@ -363,7 +425,7 @@ function received(stats, caseNo, total) {
   return count;
 }
 
-/** Span ids whose deliveries did not all carry the same bytes. */
+/** Span ids whose deliveries did not all carry the same content. */
 function divergent(stats) {
   return Object.entries(stats.spans).filter(
     ([, hashes]) => new Set(hashes).size > 1,
@@ -397,15 +459,15 @@ async function main() {
     let logs = streamLogs(backend);
     const executions = [];
     // Case 3 restarts the backend, which ends the stream.
-    const restartLogs = () => {
-      executions.push(...logs.stop());
+    const restartLogs = async () => {
+      executions.push(...(await logs.stop()));
       logs = streamLogs(backend);
     };
     let finished = false;
-    const finish = () => {
+    const finish = async () => {
       if (finished) return executions;
       finished = true;
-      executions.push(...logs.stop());
+      executions.push(...(await logs.stop()));
       for (const log of executions.filter((entry) => entry.error)) {
         functionErrors.push(
           `${name}: ${log.identifier}: ${String(log.error).split("\n")[0].slice(0, 160)}`,
@@ -415,7 +477,7 @@ async function main() {
     };
     try {
       const detail = await body({ finish, restartLogs });
-      finish();
+      await finish();
       results.push({
         name,
         ok: true,
@@ -424,7 +486,7 @@ async function main() {
         detail,
       });
     } catch (error) {
-      finish();
+      await finish();
       results.push({
         name,
         ok: false,
@@ -495,16 +557,23 @@ async function main() {
       const total = 300;
       await fake.control({ mode: "delay", delayMs: 15_000 });
       await recordMany(client, 3, { count: 6, size: 50, concurrency: 1 });
-      await waitFor(
+      // The request the backend dies in: the fake has received it and holds
+      // its answer back, so the exporter never learns that it was accepted.
+      const atKill = await waitFor(
         "a request in flight",
-        async () => (await fake.stats()).inflight > 0,
+        async () => {
+          const stats = await fake.stats();
+          return stats.inflightLog.length > 0 && stats;
+        },
         30_000,
         100,
       );
+      const inflight = atKill.inflightLog.map((index) => atKill.log[index]);
+      const seenAtKill = atKill.log.length;
       await backend.kill();
       await fake.control({ mode: "healthy" });
       await backend.start();
-      restartLogs();
+      await restartLogs();
       const stats = await waitFor(
         "every row after restart",
         async () => {
@@ -514,28 +583,53 @@ async function main() {
         360_000,
         1_000,
       );
+      // Recovery must send the in-flight batch again, with the same bytes.
+      const afterKill = stats.log.slice(seenAtKill);
+      for (const { bodyHash, spanIds } of inflight) {
+        if (!afterKill.some((request) => request.bodyHash === bodyHash)) {
+          throw new Error("the in-flight request was not sent again unchanged");
+        }
+        const once = spanIds.filter((id) => stats.spans[id].length < 2);
+        if (once.length > 0) {
+          throw new Error(`${once.length} in-flight spans were not resent`);
+        }
+      }
+      await waitFor(
+        "an empty outbox",
+        async () => (await client.query(api.backlog, {})).pendingAtLeast === 0,
+        60_000,
+      );
       const diverging = divergent(stats);
       if (diverging.length > 0) {
-        throw new Error(`${diverging.length} span ids with different bytes`);
+        throw new Error(`${diverging.length} span ids with different content`);
       }
-      return `${total} span ids, ${deliveries(stats, 3, total)} deliveries, identical bytes`;
+      const resent = inflight.reduce((sum, r) => sum + r.spanIds.length, 0);
+      return (
+        `${total} span ids, ${deliveries(stats, 3, total)} deliveries, ` +
+        `${resent} in-flight spans resent with identical request bytes`
+      );
     });
 
     await runCase("4 redeploy under load", async () => {
-      const total = 2_000;
       const marker = join(HERE, "convex", "redeploy.ts");
-      const load = recordMany(client, 4, {
-        count: 200,
-        size: 10,
-        concurrency: 20,
-      });
+      // Load runs until it is stopped, so the deploy overlaps it by
+      // construction: mutations must commit before, during and after it.
+      const load = startLoad(client, 4, { size: 10, concurrency: 8 });
+      let deployStart;
+      let deployEnd;
       try {
-        await sleep(500);
+        await waitFor(
+          "load before the deploy",
+          () => load.commits() >= 20,
+          30_000,
+          50,
+        );
         writeFileSync(
           marker,
           `import { query } from "./_generated/server";\n` +
             `export const marker = query({ args: {}, handler: async () => ${Date.now()} });\n`,
         );
+        deployStart = Date.now();
         await convex(backend, [
           "deploy",
           "--yes",
@@ -544,18 +638,38 @@ async function main() {
           "--typecheck",
           "disable",
         ]);
+        deployEnd = Date.now();
+        const atEnd = load.commits();
+        await waitFor(
+          "load after the deploy",
+          () => load.commits() >= atEnd + 20,
+          30_000,
+          50,
+        );
       } finally {
         rmSync(marker, { force: true });
       }
-      const recorded = await load;
-      const enqueued = recorded.reduce((sum, r) => sum + r.enqueued, 0);
-      if (enqueued !== total) throw new Error(`enqueued ${enqueued}`);
+      const commits = await load.stop();
+      const before = commits.filter((at) => at < deployStart).length;
+      const during = commits.filter(
+        (at) => at >= deployStart && at <= deployEnd,
+      ).length;
+      const after = commits.filter((at) => at > deployEnd).length;
+      if (before === 0 || during === 0 || after === 0) {
+        throw new Error(
+          `commits before/during/after the deploy: ${before}/${during}/${after}`,
+        );
+      }
+      const total = commits.length * 10;
       await waitFor(
-        "2,000 span ids after redeploy",
+        "every span id after the redeploy",
         async () => received(await fake.stats(), 4, total) === total,
         180_000,
       );
-      return `redeployed during load, ${total} distinct span ids`;
+      return (
+        `${before}/${during}/${after} mutations committed before/during/after ` +
+        `the deploy, ${total} distinct span ids`
+      );
     });
 
     await runCase("5 gate closes", async ({ finish }) => {
@@ -588,7 +702,7 @@ async function main() {
       if (refused.reason !== "backlog") {
         throw new Error(`record returned ${JSON.stringify(refused)}`);
       }
-      const counts = finish().filter((log) =>
+      const counts = (await finish()).filter((log) =>
         /outbox(\.js)?:count/.test(log.identifier),
       );
       const failed = counts.filter((log) => log.error);
@@ -608,13 +722,65 @@ async function main() {
       );
     });
 
+    await runCase("6 progress under sustained enqueue", async ({ finish }) => {
+      await fake.control({ mode: "healthy" });
+      // Start from an empty outbox: with few rows waiting, a claim reads up
+      // to the newest row, which is where enqueues write.
+      await waitFor(
+        "an open gate and an empty outbox",
+        async () => {
+          const backlog = await client.query(api.backlog, {});
+          return backlog.accepting && backlog.pendingAtLeast === 0;
+        },
+        900_000,
+        2_000,
+      );
+      const acceptedAt = async () =>
+        (await client.query(api.backlog, {})).accepted;
+      // Enqueues never pause, so the exporter always claims next to a live
+      // insert range. It must keep accepting rows in every window.
+      const load = startLoad(client, 6, { size: 10, concurrency: 8 });
+      const windows = [];
+      let last = await acceptedAt();
+      for (let i = 0; i < 6; i++) {
+        await sleep(5_000);
+        const now = await acceptedAt();
+        windows.push(now - last);
+        last = now;
+      }
+      const commits = await load.stop();
+      if (windows.some((accepted) => accepted === 0)) {
+        throw new Error(`rows accepted per 5 s window: ${windows.join(", ")}`);
+      }
+      const total = commits.length * 10;
+      await waitFor(
+        "every span id",
+        async () => received(await fake.stats(), 6, total) === total,
+        180_000,
+      );
+      const conflicts = (await finish()).filter(
+        (log) =>
+          log.error &&
+          /exporter(\.js)?:(advance|dispatch)/.test(log.identifier),
+      );
+      if (conflicts.length > 0) {
+        throw new Error(
+          `${conflicts.length} failed exporter mutations: ${String(conflicts[0].error).split("\n")[0].slice(0, 120)}`,
+        );
+      }
+      return (
+        `${commits.length} mutations in 30 s, accepted per 5 s window: ` +
+        `${windows.join(", ")}; ${total} distinct span ids`
+      );
+    });
+
     const diverging = divergent(await fake.stats());
     results.push({
-      name: "all byte-identical resends",
+      name: "all deliveries of a span identical",
       ok: diverging.length === 0,
       ms: 0,
       requests: 0,
-      detail: `${diverging.length} span ids with different bytes`,
+      detail: `${diverging.length} span ids with different content`,
     });
   } catch (error) {
     results.push({

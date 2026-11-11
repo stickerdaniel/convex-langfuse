@@ -3,8 +3,8 @@
 //   node integration/fake-langfuse.mjs --port 0
 //
 // Prints `listening <port>` once ready. `POST /api/public/otel/v1/traces`
-// records every span id with the hash of that span, then answers according to
-// the mode. `POST /control` with `{ "mode": "healthy" | "status" | "delay" |
+// records every span id with a hash of that span's content and every request
+// with the hash of its raw body, then answers according to the mode. `POST /control` with `{ "mode": "healthy" | "status" | "delay" |
 // "down", "status"?: number, "delayMs"?: number }` switches the mode;
 // `GET /stats` returns what was received.
 
@@ -19,8 +19,12 @@ const stats = {
   inflight: 0,
   /** Requests without the headers the exporter must send. */
   badHeaders: 0,
-  /** Span id to the hash of every delivery of that span. */
+  /** Span id to the content hash of every delivery of that span. */
   spans: {},
+  /** Every request in arrival order: raw body hash and span ids. */
+  log: [],
+  /** Indexes into `log` of the requests that are being delayed right now. */
+  inflightLog: [],
 };
 
 function readBody(req) {
@@ -37,8 +41,14 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+/** Records one request and returns its index in `stats.log`. */
 function recordSpans(body) {
   const parsed = JSON.parse(body);
+  const spanIds = [];
+  stats.log.push({
+    bodyHash: createHash("sha256").update(body).digest("hex"),
+    spanIds,
+  });
   for (const resource of parsed.resourceSpans) {
     for (const scope of resource.scopeSpans) {
       for (const span of scope.spans) {
@@ -47,9 +57,11 @@ function recordSpans(body) {
           .digest("hex")
           .slice(0, 16);
         (stats.spans[span.spanId] ??= []).push(hash);
+        spanIds.push(span.spanId);
       }
     }
   }
+  return stats.log.length - 1;
 }
 
 const server = createServer(async (req, res) => {
@@ -76,12 +88,14 @@ const server = createServer(async (req, res) => {
       stats.badHeaders += 1;
     }
     const body = await readBody(req);
-    recordSpans(body);
+    const index = recordSpans(body);
     if (mode.mode === "status") return json(res, mode.status, {});
     if (mode.mode === "delay") {
       stats.inflight += 1;
+      stats.inflightLog.push(index);
       await new Promise((resolve) => setTimeout(resolve, mode.delayMs));
       stats.inflight -= 1;
+      stats.inflightLog = stats.inflightLog.filter((i) => i !== index);
     }
     return json(res, 200, {});
   } catch {
