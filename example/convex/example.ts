@@ -4,8 +4,11 @@ import { Langfuse } from "../../src/client/index.js";
 import { v } from "convex/values";
 
 const langfuse = new Langfuse(components.convexLangfuse, {
+  // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
   publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
+  // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
   secretKey: process.env.LANGFUSE_SECRET_KEY!,
+  // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
   baseUrl: process.env.LANGFUSE_BASE_URL,
 });
 
@@ -106,6 +109,7 @@ export const listTracesBySession = query({
 export const getDashboardUrl = query({
   args: {},
   handler: async () => {
+    // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
     return process.env.LANGFUSE_BASE_URL ?? "https://cloud.langfuse.com";
   },
 });

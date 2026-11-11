@@ -176,7 +176,7 @@ export const recordTrace = mutation({
       .first();
 
     if (existing) {
-      await ctx.db.patch(existing._id, { ...args, updatedAt: now });
+      await ctx.db.patch("traces", existing._id, { ...args, updatedAt: now });
       return existing._id;
     }
 
@@ -213,7 +213,7 @@ export const recordObservation = mutation({
       .first();
 
     if (existing) {
-      await ctx.db.patch(existing._id, args);
+      await ctx.db.patch("observations", existing._id, args);
       return existing._id;
     }
 
@@ -240,7 +240,7 @@ export const recordScore = mutation({
       .first();
 
     if (existing) {
-      await ctx.db.patch(existing._id, args);
+      await ctx.db.patch("scores", existing._id, args);
       return existing._id;
     }
 
