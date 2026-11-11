@@ -64,10 +64,9 @@ export default defineSchema({
     .index("by_scoreId", ["scoreId"])
     .index("by_traceId", ["traceId"]),
 
-  // Pending exports. The payload lives in its own table, so claims, backlog
-  // counting and retention read only these small rows. Every deletion of
-  // an `outbox` or `deadLetters` row deletes its `payloads` row in the same
-  // mutation.
+  // Pending exports. The payload lives in its own table, so claims and
+  // retention read only these small rows. Every deletion of an `outbox` or
+  // `deadLetters` row deletes its `payloads` row in the same mutation.
   outbox: defineTable({
     kind: v.union(v.literal("span")),
     /** `<traceId>:<spanId>`, at most `MAX_REF_BYTES`. */
@@ -76,14 +75,40 @@ export default defineSchema({
     bytes: v.number(),
     availableAt: v.number(),
     payloadId: v.id("payloads"),
-    /** Commit timestamp of the insert; the backlog is counted in this order. */
-    seq: v.commitTs(),
-  })
-    .index("by_availableAt", ["availableAt"])
-    .index("by_seq", ["seq"]),
+  }).index("by_availableAt", ["availableAt"]),
 
   /** One encoded OTLP span, stored once and sent byte-identically. */
   payloads: defineTable({ data: v.string() }),
+
+  /**
+   * One document per mutation that added span rows to the outbox: their
+   * number and summed `bytes`. A count step adds it to the `counter` totals
+   * and deletes it, so the backlog is counted without reading outbox rows.
+   */
+  receipts: defineTable({
+    rows: v.number(),
+    bytes: v.number(),
+    /** Commit timestamp of the insert; receipts are consumed in this order. */
+    seq: v.commitTs(),
+  }).index("by_seq", ["seq"]),
+
+  /**
+   * Singleton state of the count chain, created by the first `scheduleCount`.
+   * Only `scheduleCount` and the count steps write it, never `advance`.
+   * The pending backlog is `addedRows` minus `exporter.removedRows`,
+   * and the same for bytes.
+   */
+  counter: defineTable({
+    /** Totals of every consumed receipt. */
+    addedRows: v.number(),
+    addedBytes: v.number(),
+    /** Receipts with a smaller `seq` are consumed; a step scans from here. */
+    countedFrom: v.optional(v.int64()),
+    /** Number of the current count chain. A step of another chain stops. */
+    chain: v.number(),
+    /** When the current chain last scheduled a step. */
+    steppedAt: v.optional(v.number()),
+  }),
 
   deadLetters: defineTable({
     kind: v.union(v.literal("span")),
@@ -109,18 +134,12 @@ export default defineSchema({
     consecutiveRejected: v.number(),
     /** Rows still to be sent one at a time after a rejected batch. */
     isolateRemaining: v.number(),
-    /** When the last count step was scheduled. */
-    measuredAt: v.optional(v.number()),
-    /** Outbox rows with `seq` up to this value are in the pending counters. */
-    countedThrough: v.optional(v.int64()),
     /**
-     * Set while a count step stopped inside the commit `countedThrough`: its
-     * rows are counted up to this `_creationTime`.
+     * Totals of every span row that left the outbox and of its `bytes`:
+     * accepted, dead-lettered, without payload or expired.
      */
-    countedTime: v.optional(v.number()),
-    /** Counted pending span rows and their payload bytes. */
-    pendingRows: v.number(),
-    pendingBytes: v.number(),
+    removedRows: v.number(),
+    removedBytes: v.number(),
     lastAcceptedAt: v.optional(v.number()),
     lastError: v.optional(
       v.object({

@@ -299,21 +299,24 @@ describe("fencing", () => {
 });
 
 describe("backlog counting", () => {
-  /** Snapshot time of the last count step, in ms. */
+  /** Snapshot time of the last count step that consumed every receipt, in ms. */
   const countedAt = async () => {
-    const through = (await tables(t)).exporter[0]?.countedThrough;
-    return through === undefined ? undefined : Number(through / 1_000_000n);
+    const from = (await tables(t)).counter[0]?.countedFrom;
+    return from === undefined ? undefined : Number(from / 1_000_000n);
   };
 
   /**
-   * Asserts a count step at least every minute between `from` and `to`. The
-   * tolerance covers the commit clock, which moves 1 ms per transaction.
+   * Asserts a count step at least every minute and one loop poll between
+   * `from` and `to`. A chain starts at the first `dispatch` at least a minute
+   * after the last one started, and the loop polls 2 s after a start. The
+   * remaining 100 ms cover the commit clock, which moves 1 ms per
+   * transaction.
    */
   function expectEveryMinute(samples: number[], from: number, to: number) {
     const points = [from, ...new Set(samples), to];
     for (let i = 1; i < points.length; i++) {
       expect(points[i]! - points[i - 1]!).toBeLessThanOrEqual(
-        MEASURE_INTERVAL_MS + 100,
+        MEASURE_INTERVAL_MS + 2_000 + 100,
       );
     }
   }

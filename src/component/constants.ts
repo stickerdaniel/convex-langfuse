@@ -37,9 +37,16 @@ export const CONFIG_BACKOFF_CAP_MS = 30 * MINUTE;
 /** Consecutive dead-lettered spans after which a rejection counts as config. */
 export const BREAKER_REJECTED_SPANS = 20;
 
-/** Longest gap between two scheduled count steps while rows are pending. */
+/**
+ * Shortest time between the starts of two count chains. While the exporter
+ * loop runs, the first `dispatch` after this interval starts the next chain.
+ */
 export const MEASURE_INTERVAL_MS = MINUTE;
-/** Outbox rows one count step reads. */
+/**
+ * Receipts one count step consumes. One receipt stands for the rows of one
+ * enqueue, up to `MAX_CALL_RECORDS` rows or `RETRY_DEAD_LETTERS_MAX` moved
+ * dead letters.
+ */
 export const COUNT_BATCH = 1_000;
 /** Most dead letters one `retryDeadLetters` call moves back to the outbox. */
 export const RETRY_DEAD_LETTERS_MAX = 500;

@@ -33,12 +33,13 @@ import {
 import {
   getExporter,
   getOrCreateExporter,
-  moveGate,
   pingExporter,
-  resetCountersIfEmpty,
+  removeRows,
+  resetIfEmpty,
   scheduleCount,
-  withoutRows,
-  type Counters,
+  staleAdded,
+  type Amount,
+  type Removed,
 } from "./outbox.js";
 import { exportConfig, type ExportConfig } from "./settings.js";
 import { buildExportBody } from "../shared/otlp.js";
@@ -135,21 +136,20 @@ export const claimable = internalQuery({
 });
 
 /**
- * The worker mutation of the batch-worker loop. Re-reads the exporter state,
- * because `nextWork` saw a stale snapshot. It reads no outbox range, so
- * enqueues do not conflict with the loop. Always returns a `debounceMs`, so
- * the loop stays `running` and an enqueue `ping` stays read-only.
+ * The worker mutation of the batch-worker loop. Starts a count chain when
+ * none stepped within `MEASURE_INTERVAL_MS`, then re-reads the exporter
+ * state, because `nextWork` saw a stale snapshot. It reads no outbox range,
+ * so enqueues do not conflict with the loop. Always returns a `debounceMs`,
+ * so the loop stays `running` and an enqueue `ping` stays read-only.
  */
 export const dispatch = internalMutation({
   args: vMutationArgs,
   returns: vMutationReturns,
   handler: async (ctx, { op, ms }) => {
     const now = Date.now();
+    await scheduleCount(ctx, now);
+    if (op === "wait") return { debounceMs: ms ?? LEASE_POLL_MS };
     const exporter = await getOrCreateExporter(ctx);
-    if (op === "wait") {
-      await scheduleCount(ctx, exporter, now);
-      return { debounceMs: ms ?? LEASE_POLL_MS };
-    }
     if (leaseActive(exporter, now)) return { debounceMs: LEASE_POLL_MS };
     const backoff = backoffRemaining(exporter, now);
     if (backoff > 0) {
@@ -211,21 +211,24 @@ export const advance = internalMutation({
     const exporter = await getExporter(ctx);
     if (!exporter || exporter.generation !== generation) return { done: true };
     const now = Date.now();
-    // Outbox rows this call deletes; counted ones leave the pending counters.
+    // The added totals, read once and only when needed, from a stale snapshot,
+    // so this mutation never conflicts with a count step.
+    let added: Amount | undefined;
+    const addedTotals = async () => (added ??= await staleAdded(ctx));
+    // Outbox rows this call deletes; each one adds to the removed totals.
     const removed: Doc<"outbox">[] = [];
-    const settle = async (): Promise<Partial<Counters>> => {
-      if (removed.length === 0) return {};
-      const counters = withoutRows(exporter, removed);
-      await moveGate(ctx, counters);
-      return counters;
+    const settle = async (): Promise<Removed> => {
+      const { removedRows, removedBytes } = exporter;
+      if (removed.length === 0) return { removedRows, removedBytes };
+      return await removeRows(ctx, exporter, removed, await addedTotals());
     };
     const endRun = async (
       patch: Partial<Doc<"exporter">>,
-      counters?: Partial<Counters>,
+      totals?: Removed,
     ) => {
       await ctx.db.patch("exporter", exporter._id, {
         ...patch,
-        ...(counters ?? (await settle())),
+        ...(totals ?? (await settle())),
         leaseExpiresAt: undefined,
         runStartedAt: undefined,
         claimed: [],
@@ -346,16 +349,10 @@ export const advance = internalMutation({
       spans.push(payload.data);
       bytes += row.bytes;
     }
-    if (window.length === CLAIM_WINDOW) {
-      await scheduleCount(ctx, exporter, now);
-    }
     if (claimed.length === 0) {
-      const counters = await settle();
-      const reset = await resetCountersIfEmpty(ctx, {
-        ...exporter,
-        ...counters,
-      });
-      return await endRun(patch, reset ?? counters);
+      const totals = await settle();
+      const reset = await resetIfEmpty(ctx, await addedTotals(), totals);
+      return await endRun(patch, reset ?? totals);
     }
 
     await ctx.db.patch("exporter", exporter._id, {

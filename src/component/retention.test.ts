@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { internal } from "./_generated/api.js";
 import { DEAD_LETTER_RETENTION_MS, MAX_PENDING_AGE_MS } from "./constants.js";
 import {
+  countStep,
   enableExport,
   insertRows,
   ownerlessPayloads,
@@ -27,19 +28,22 @@ afterEach(() => {
 });
 
 describe("retention sweep", () => {
-  test("an expired row leaves the counters only when it was counted", async () => {
+  test("an expired row lowers the pending count by one, counted before or after, never below zero", async () => {
+    // "aa" is counted before it expires, "bbb" only after.
     await insertRows(t, [{ data: "aa" }]);
-    await t.mutation(internal.outbox.count, {});
+    await countStep(t);
     await insertRows(t, [{ data: "bbb" }]);
     expect(await pendingCounted(t)).toEqual({ rows: 1, bytes: 2 });
 
     vi.setSystemTime(Date.now() + MAX_PENDING_AGE_MS + 1_000);
-    // A fresh row keeps the outbox non-empty, so no counter reset applies.
+    // A fresh row keeps the outbox non-empty, so no drift reset applies.
     await insertRows(t, [{ data: "c" }]);
     await t.mutation(internal.retention.sweep, {});
-    expect((await tables(t)).outbox).toHaveLength(1);
+    const state = await tables(t);
+    expect(state.outbox).toHaveLength(1);
+    expect(state.exporter[0]!.expired).toBe(2);
     expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
-    await t.mutation(internal.outbox.count, {});
+    await countStep(t);
     expect(await pendingCounted(t)).toEqual({ rows: 1, bytes: 1 });
   });
 
@@ -99,6 +103,8 @@ describe("retention sweep", () => {
       outbox: [],
       payloads: [],
       deadLetters: [],
+      receipts: [],
+      counter: [],
       exporter: [],
       gate: [],
     });

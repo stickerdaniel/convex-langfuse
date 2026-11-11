@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api.js";
-import { PENDING_ROWS_THRESHOLD } from "./constants.js";
+import { COUNT_BATCH, PENDING_ROWS_THRESHOLD } from "./constants.js";
 import {
+  countStep,
   drive,
   enableExport,
   exporterDoc,
   installFakeLangfuse,
   insertRows,
   observations,
+  oneByteRows,
   pendingCounted,
+  pendingScheduled,
   startRunByHand,
   tables,
   TRACE,
@@ -28,8 +31,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const count = (t: TestConvex) => t.mutation(internal.outbox.count, {});
 const outboxSize = async (t: TestConvex) => (await tables(t)).outbox.length;
+const accepted = { outcome: "accepted" as const, status: 200 };
+
+/** Runs `advance` of generation 1 until the run ends. */
+async function drain(t: TestConvex) {
+  await t.mutation(internal.exporter.advance, { generation: 1 });
+  for (;;) {
+    const step = await t.mutation(internal.exporter.advance, {
+      generation: 1,
+      report: accepted,
+    });
+    if (step.done) return;
+  }
+}
 
 describe("admission gate", () => {
   test("closes from counted rows and reopens as they drain, with no transaction scanning the outbox", async () => {
@@ -62,7 +77,7 @@ describe("admission gate", () => {
           (
             await ctx.db
               .query("outbox")
-              .withIndex("by_seq")
+              .withIndex("by_creation_time")
               .order("desc")
               .first()
           )?._id,
@@ -79,19 +94,14 @@ describe("admission gate", () => {
     // sampled as each request arrives.
     let reopenedAt: { rows: number } | undefined;
     fake.fallback = async () => {
-      const state = await t.run(async (ctx) => ({
-        gate: await ctx.db.query("gate").first(),
-        exporter: await ctx.db.query("exporter").first(),
-      }));
-      if (state.gate?.accepting) {
-        reopenedAt ??= { rows: state.exporter!.pendingRows };
-      }
+      const { accepting, pendingCounted } = await health();
+      if (accepting) reopenedAt ??= { rows: pendingCounted.rows };
       return { status: 200 };
     };
     await t.mutation(internal.exporter.kick, {});
     await drive(t, fake, {
       until: async () =>
-        (await newest()) === undefined || Date.now() > deadline,
+        (await health()).pendingAtLeast === 0 || Date.now() > deadline,
     });
     // Reopened by the deletions themselves, long before the outbox is empty.
     expect(reopenedAt?.rows).toBeLessThan(PENDING_ROWS_THRESHOLD / 2);
@@ -104,12 +114,8 @@ describe("admission gate", () => {
 describe("counting", () => {
   test("counts exactly the rows that still exist, around exports and new rows", async () => {
     const t = initConvexTest();
-    await insertRows(
-      t,
-      Array.from({ length: 300 }, () => ({ data: "x" })),
-    );
+    await insertRows(t, oneByteRows(300));
     await startRunByHand(t);
-    const accepted = { outcome: "accepted" as const, status: 200 };
     await t.mutation(internal.exporter.advance, { generation: 1 });
     await t.mutation(internal.exporter.advance, {
       generation: 1,
@@ -120,7 +126,7 @@ describe("counting", () => {
       generation: 1,
       report: accepted,
     });
-    await count(t);
+    await countStep(t);
     expect(await pendingCounted(t)).toEqual({ rows: 200, bytes: 200 });
     expect(await outboxSize(t)).toBe(200);
 
@@ -134,7 +140,7 @@ describe("counting", () => {
       report: accepted,
     });
     expect(await pendingCounted(t)).toEqual({ rows: 150, bytes: 150 });
-    await count(t);
+    await countStep(t);
     expect(await pendingCounted(t)).toEqual({ rows: 180, bytes: 210 });
     expect(await outboxSize(t)).toBe(180);
 
@@ -149,63 +155,64 @@ describe("counting", () => {
     expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
   });
 
-  test("a commit larger than a batch is counted in steps of at most 1,000 rows", async () => {
-    // Rows of one transaction share a seq. Reading that whole commit in one
-    // step would exceed the read limit.
-    const t = initConvexTest({ transactionLimits: { documentsRead: 1_100 } });
-    await insertRows(
-      t,
-      Array.from({ length: 1_500 }, () => ({ data: "x" })),
-    );
-    await count(t);
-    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
-    await count(t);
-    await count(t);
-    expect(await pendingCounted(t)).toEqual({ rows: 1_500, bytes: 1_500 });
+  test("rows exported before their receipt is consumed count as zero, before and after the step", async () => {
+    const t = initConvexTest();
+    await insertRows(t, oneByteRows(10));
+    await startRunByHand(t);
+    await drain(t);
+    expect(await outboxSize(t)).toBe(0);
+    expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
+    await countStep(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
+    expect((await t.query(api.outbox.health, {})).accepting).toBe(true);
   });
 
-  test("a step that stops inside a commit subtracts only the rows it counted", async () => {
+  test("more receipts than a batch in one commit are consumed in steps of at most 1,000", async () => {
+    // A step reads each receipt twice, to scan and to delete it. A step that
+    // read the whole commit would exceed the read limit.
+    const t = initConvexTest({ transactionLimits: { documentsRead: 2_100 } });
+    const rows = COUNT_BATCH + 500;
+    await insertRows(t, oneByteRows(rows), { receiptPerRow: true });
+    await countStep(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
+    await countStep(t);
+    await countStep(t);
+    expect(await pendingCounted(t)).toEqual({ rows, bytes: rows });
+    expect(
+      await t.run(async (ctx) => await ctx.db.query("receipts").first()),
+    ).toBeNull();
+  });
+
+  test("a step of a chain that is not the current one changes nothing and schedules nothing", async () => {
     const t = initConvexTest();
-    const now = Date.now();
-    // One commit of 1,200 rows. The last 200 are available earlier, so the
-    // exporter claims them first, while a count step reaches them last.
+    await insertRows(t, oneByteRows(3));
     await t.run(async (ctx) => {
-      for (let i = 0; i < 1_200; i++) {
-        const payloadId = await ctx.db.insert("payloads", { data: "x" });
-        await ctx.db.insert("outbox", {
-          kind: "span",
-          ref: `r${i}`,
-          bytes: 1,
-          availableAt: i < 1_000 ? now : now - 1_000,
-          payloadId,
-          seq: ctx.db.vars.commitTs,
-        });
-      }
+      await ctx.db.insert("counter", { addedRows: 0, addedBytes: 0, chain: 2 });
     });
-    await count(t);
-    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
+    const before = await tables(t);
+    await t.mutation(internal.outbox.count, { chain: 1 });
+    expect(await tables(t)).toEqual(before);
+    expect(await pendingScheduled(t)).toEqual([]);
+  });
 
-    await startRunByHand(t);
-    const accepted = { outcome: "accepted" as const, status: 200 };
-    await t.mutation(internal.exporter.advance, { generation: 1 });
-    // 50 uncounted rows of the same commit are exported.
-    await t.mutation(internal.exporter.advance, {
-      generation: 1,
-      report: accepted,
-    });
-    expect(await outboxSize(t)).toBe(1_150);
-    expect(await pendingCounted(t)).toEqual({ rows: 1_000, bytes: 1_000 });
-
-    // The rest of the commit is counted; the 50 rows in flight still exist.
-    await count(t);
-    await count(t);
-    expect(await pendingCounted(t)).toEqual({ rows: 1_150, bytes: 1_150 });
-    await t.mutation(internal.exporter.advance, {
-      generation: 1,
-      report: accepted,
-    });
-    expect(await outboxSize(t)).toBe(1_100);
-    expect(await pendingCounted(t)).toEqual({ rows: 1_100, bytes: 1_100 });
+  test("while a chain is alive, dispatch starts no second one and no receipt is counted twice", async () => {
+    const t = initConvexTest();
+    const rows = 2 * COUNT_BATCH + 500;
+    await insertRows(t, oneByteRows(rows), { receiptPerRow: true });
+    const counts = async () =>
+      (await pendingScheduled(t)).filter((name) => name.includes("count"));
+    for (let i = 0; i < 5; i++) {
+      // The loop calls dispatch every 2 s while a run holds the lease.
+      await t.mutation(internal.exporter.dispatch, { op: "wait" });
+      expect((await counts()).length).toBeLessThanOrEqual(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await t.finishInProgressScheduledFunctions();
+    }
+    expect(await counts()).toEqual([]);
+    expect(await pendingCounted(t)).toEqual({ rows, bytes: rows });
+    const state = await tables(t);
+    expect(state.receipts).toEqual([]);
+    expect(state.counter.map((counter) => counter.chain)).toEqual([1]);
   });
 
   test("retryDeadLetters moves at most 500 dead letters per call", async () => {
@@ -226,11 +233,14 @@ describe("counting", () => {
     expect(
       await t.mutation(internal.outbox.retryDeadLetters, { limit: 10_000 }),
     ).toEqual({ moved: 500 });
-    expect((await tables(t)).deadLetters).toHaveLength(20);
+    const state = await tables(t);
+    expect(state.deadLetters).toHaveLength(20);
+    expect(state.receipts).toMatchObject([{ rows: 500, bytes: 500 }]);
   });
 
   test("a row committed after the step's snapshot is counted once, by a later step", async () => {
     const t = initConvexTest();
+    await countStep(t);
     await t.run(async (ctx) => {
       const payloadId = await ctx.db.insert("payloads", { data: "x" });
       await ctx.db.insert("outbox", {
@@ -239,20 +249,24 @@ describe("counting", () => {
         bytes: 1,
         availableAt: Date.now(),
         payloadId,
+      });
+      await ctx.db.insert("receipts", {
+        rows: 1,
+        bytes: 1,
         seq: ctx.db.vars.commitTs,
       });
-      // This row commits after the snapshot the nested step reads.
-      await ctx.runMutation(internal.outbox.count, {});
+      // This receipt commits after the snapshot the nested step reads.
+      await ctx.runMutation(internal.outbox.count, { chain: 0 });
     });
-    await count(t);
-    await count(t);
+    await countStep(t);
+    await countStep(t);
     expect(await pendingCounted(t)).toEqual({ rows: 1, bytes: 1 });
   });
 
-  test("a dead letter moved back gets a new seq and is counted once", async () => {
+  test("a dead letter moved back is counted once", async () => {
     const t = initConvexTest();
     await insertRows(t, [{ data: "x" }]);
-    await count(t);
+    await countStep(t);
     await startRunByHand(t);
     await t.mutation(internal.exporter.advance, { generation: 1 });
     await t.mutation(internal.exporter.advance, {
@@ -260,34 +274,39 @@ describe("counting", () => {
       report: { outcome: "rejected", status: 400 },
     });
     expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
-    const countedThrough = (await tables(t)).exporter[0]!.countedThrough!;
 
     expect(await t.mutation(internal.outbox.retryDeadLetters, {})).toEqual({
       moved: 1,
     });
-    const [moved] = (await tables(t)).outbox;
-    expect(moved!.seq).toBeGreaterThan(countedThrough);
-    await count(t);
-    await count(t);
+    await countStep(t);
+    await countStep(t);
     expect(await pendingCounted(t)).toEqual({ rows: 1, bytes: 1 });
   });
 
-  test("stale counters over an empty outbox return to zero and open the gate", async () => {
+  /** Totals of 30,000 counted rows that no longer exist, and a closed gate. */
+  async function drift(t: TestConvex) {
+    await t.run(async (ctx) => {
+      await ctx.db.insert(
+        "exporter",
+        exporterDoc({
+          generation: 1,
+          leaseExpiresAt: Date.now() + 120_000,
+          runStartedAt: Date.now(),
+        }),
+      );
+      await ctx.db.insert("counter", {
+        addedRows: 30_000,
+        addedBytes: 5_000,
+        chain: 0,
+      });
+      await ctx.db.insert("gate", { accepting: false, changedAt: 0 });
+    });
+  }
+
+  test("stale totals over an empty outbox return to zero and open the gate", async () => {
     for (const run of ["sweep", "advance"] as const) {
       const t = initConvexTest();
-      await t.run(async (ctx) => {
-        await ctx.db.insert(
-          "exporter",
-          exporterDoc({
-            generation: 1,
-            leaseExpiresAt: Date.now() + 120_000,
-            runStartedAt: Date.now(),
-            pendingRows: 30_000,
-            pendingBytes: 5_000,
-          }),
-        );
-        await ctx.db.insert("gate", { accepting: false, changedAt: 0 });
-      });
+      await drift(t);
       if (run === "sweep") {
         await t.mutation(internal.retention.sweep, {});
       } else {
@@ -298,13 +317,26 @@ describe("counting", () => {
       expect(health.accepting).toBe(true);
     }
   });
+
+  test("stale totals stay while the outbox holds a row", async () => {
+    const t = initConvexTest();
+    await drift(t);
+    // The row is not available yet, so the run claims nothing and ends.
+    await insertRows(t, [{ data: "x" }], { availableAt: Date.now() + 60_000 });
+    expect(
+      await t.mutation(internal.exporter.advance, { generation: 1 }),
+    ).toEqual({ done: true });
+    const health = await t.query(api.outbox.health, {});
+    expect(health.pendingCounted).toEqual({ rows: 30_000, bytes: 5_000 });
+    expect(health.accepting).toBe(false);
+  });
 });
 
 describe("health", () => {
   test("reports pending rows, dead letters, the gate and an active backoff", async () => {
     const t = initConvexTest();
     await insertRows(t, [{ data: "a" }, { data: "b" }, { data: "c" }]);
-    await count(t);
+    await countStep(t);
     const now = Date.now();
     await t.run(async (ctx) => {
       const payloadId = await ctx.db.insert("payloads", { data: "d" });
@@ -317,17 +349,19 @@ describe("health", () => {
         status: 422,
         failedAt: now,
       });
-      const exporter = (await ctx.db.query("exporter").first())!;
-      await ctx.db.patch("exporter", exporter._id, {
-        generation: 4,
-        backoffUntil: now + 30_000,
-        consecutiveFailures: 2,
-        consecutiveRejected: 1,
-        lastAcceptedAt: now - 60_000,
-        lastError: { at: now - 1_000, class: "transient", status: 503 },
-        accepted: 7,
-        deadLettered: 1,
-      });
+      await ctx.db.insert(
+        "exporter",
+        exporterDoc({
+          generation: 4,
+          backoffUntil: now + 30_000,
+          consecutiveFailures: 2,
+          consecutiveRejected: 1,
+          lastAcceptedAt: now - 60_000,
+          lastError: { at: now - 1_000, class: "transient", status: 503 },
+          accepted: 7,
+          deadLettered: 1,
+        }),
+      );
     });
 
     const oldest = (await tables(t)).outbox[0]!._creationTime;

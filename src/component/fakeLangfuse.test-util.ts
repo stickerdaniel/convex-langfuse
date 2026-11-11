@@ -2,7 +2,7 @@
 // loop under fake timers, and fixtures. Not part of the build.
 
 import { vi } from "vitest";
-import { api } from "./_generated/api.js";
+import { api, internal } from "./_generated/api.js";
 import type { Doc, Id } from "./_generated/dataModel.js";
 import type { initConvexTest } from "./setup.test.js";
 import { byteLength, encodeSpan } from "../shared/otlp.js";
@@ -179,37 +179,70 @@ export function spanOfBytes(n: number, bytes: number): string {
 }
 
 /**
- * Inserts outbox rows with their payloads directly, without waking the
- * exporter. Returns the outbox ids in insertion order.
+ * Inserts outbox rows with their payloads directly in one commit, without
+ * waking the exporter, and writes one receipt for them, as an enqueue does.
+ * With `receiptPerRow`, every row gets a receipt of its own. Rows are
+ * available at `availableAt`, by default now. Returns the outbox ids in
+ * insertion order.
  */
 export async function insertRows(
   t: TestConvex,
   rows: { data: string; ref?: string }[],
+  {
+    receiptPerRow = false,
+    availableAt = Date.now(),
+  }: { receiptPerRow?: boolean; availableAt?: number } = {},
 ): Promise<Id<"outbox">[]> {
   return await t.run(async (ctx) => {
     const ids: Id<"outbox">[] = [];
-    const availableAt = Date.now();
+    const receipt = (rows: number, bytes: number) =>
+      ctx.db.insert("receipts", { rows, bytes, seq: ctx.db.vars.commitTs });
+    let total = 0;
     for (const [i, { data, ref }] of rows.entries()) {
       const payloadId = await ctx.db.insert("payloads", { data });
+      const bytes = byteLength(data);
       ids.push(
         await ctx.db.insert("outbox", {
           kind: "span",
           ref: ref ?? `${TRACE.traceId}:${spanId(i)}`,
-          bytes: byteLength(data),
+          bytes,
           availableAt,
           payloadId,
-          seq: ctx.db.vars.commitTs,
         }),
       );
+      if (receiptPerRow) await receipt(1, bytes);
+      total += bytes;
     }
+    if (!receiptPerRow && rows.length > 0) await receipt(rows.length, total);
     return ids;
   });
+}
+
+/** `count` rows of one byte each. */
+export function oneByteRows(count: number): { data: string }[] {
+  return Array.from({ length: count }, () => ({ data: "x" }));
+}
+
+/**
+ * Runs one step of the current count chain, as the scheduler would. Creates
+ * the counter at chain 0 when it is missing.
+ */
+export async function countStep(t: TestConvex): Promise<void> {
+  const chain = await t.run(async (ctx) => {
+    const counter = await ctx.db.query("counter").first();
+    if (counter) return counter.chain;
+    await ctx.db.insert("counter", { addedRows: 0, addedBytes: 0, chain: 0 });
+    return 0;
+  });
+  await t.mutation(internal.outbox.count, { chain });
 }
 
 export type Tables = {
   outbox: Doc<"outbox">[];
   payloads: Doc<"payloads">[];
   deadLetters: Doc<"deadLetters">[];
+  receipts: Doc<"receipts">[];
+  counter: Doc<"counter">[];
   exporter: Doc<"exporter">[];
   gate: Doc<"gate">[];
 };
@@ -220,6 +253,8 @@ export async function tables(t: TestConvex): Promise<Tables> {
     outbox: await ctx.db.query("outbox").collect(),
     payloads: await ctx.db.query("payloads").collect(),
     deadLetters: await ctx.db.query("deadLetters").collect(),
+    receipts: await ctx.db.query("receipts").collect(),
+    counter: await ctx.db.query("counter").collect(),
     exporter: await ctx.db.query("exporter").collect(),
     gate: await ctx.db.query("gate").collect(),
   }));
@@ -246,7 +281,7 @@ export async function pendingScheduled(t: TestConvex): Promise<string[]> {
 
 type ExporterFields = Omit<Doc<"exporter">, "_id" | "_creationTime">;
 
-/** An exporter document with zero counters, changed by `fields`. */
+/** An exporter document with zero totals, changed by `fields`. */
 export function exporterDoc(
   fields: Partial<ExporterFields> = {},
 ): ExporterFields {
@@ -259,8 +294,8 @@ export function exporterDoc(
     accepted: 0,
     deadLettered: 0,
     expired: 0,
-    pendingRows: 0,
-    pendingBytes: 0,
+    removedRows: 0,
+    removedBytes: 0,
     ...fields,
   };
 }
@@ -283,7 +318,7 @@ export async function startRunByHand(t: TestConvex): Promise<void> {
   });
 }
 
-/** The pending counters as `health` reports them. */
+/** The pending backlog as `health` reports it. */
 export async function pendingCounted(
   t: TestConvex,
 ): Promise<{ rows: number; bytes: number }> {

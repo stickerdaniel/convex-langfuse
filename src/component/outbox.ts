@@ -1,9 +1,10 @@
 import { ping } from "@convex-dev/batch-worker";
-import { v } from "convex/values";
+import { v, type Infer } from "convex/values";
 import { components, internal } from "./_generated/api.js";
 import type { Doc } from "./_generated/dataModel.js";
 import {
   internalMutation,
+  internalQuery,
   query,
   type MutationCtx,
   type QueryCtx,
@@ -40,18 +41,10 @@ export async function getOrCreateExporter(
     accepted: 0,
     deadLettered: 0,
     expired: 0,
-    pendingRows: 0,
-    pendingBytes: 0,
+    removedRows: 0,
+    removedBytes: 0,
   });
   return (await ctx.db.get("exporter", id))!;
-}
-
-/** Whether a count step scheduled at `measuredAt` is due again. */
-export function measurementDue(
-  measuredAt: number | undefined,
-  now: number,
-): boolean {
-  return measuredAt === undefined || now - measuredAt >= MEASURE_INTERVAL_MS;
 }
 
 /**
@@ -68,48 +61,97 @@ export async function pingExporter(ctx: MutationCtx): Promise<void> {
   });
 }
 
-/** The pending counters of the exporter document. */
-export type Counters = Pick<Doc<"exporter">, "pendingRows" | "pendingBytes">;
+/** The pending backlog the admission gate decides on. */
+export type Pending = { pendingRows: number; pendingBytes: number };
+
+/** The removed totals of the exporter document. */
+export type Removed = Pick<Doc<"exporter">, "removedRows" | "removedBytes">;
+
+const vAmount = v.object({ rows: v.number(), bytes: v.number() });
+/** A number of span rows and their summed payload bytes. */
+export type Amount = Infer<typeof vAmount>;
+const vTotals = v.object({ added: vAmount, removed: vAmount });
 
 /**
- * Whether a count step has already added this row. The cursor is
- * `countedThrough`, a commit timestamp, plus `countedTime` while a step
- * stopped inside one commit: rows of that commit are counted up to that
- * `_creationTime`, which every insert of a transaction advances.
+ * The added totals of the counter and the removed totals of the exporter,
+ * zeros for a missing document. Mutations read it only through
+ * `staleTotals`, so these documents stay out of their read set.
  */
-function isCounted(
-  row: Doc<"outbox">,
-  { countedThrough, countedTime }: Doc<"exporter">,
-): boolean {
-  if (typeof row.seq !== "bigint" || countedThrough === undefined) return false;
-  if (row.seq !== countedThrough) return row.seq < countedThrough;
-  return countedTime === undefined || row._creationTime <= countedTime;
+export const totals = internalQuery({
+  args: {},
+  returns: vTotals,
+  handler: async (ctx) => {
+    const counter = await ctx.db.query("counter").first();
+    const exporter = await getExporter(ctx);
+    return {
+      added: { rows: counter?.addedRows ?? 0, bytes: counter?.addedBytes ?? 0 },
+      removed: {
+        rows: exporter?.removedRows ?? 0,
+        bytes: exporter?.removedBytes ?? 0,
+      },
+    };
+  },
+});
+
+/**
+ * `totals` at this mutation's snapshot, without a read dependency. The count
+ * chain reads the exporter document and the exporter reads the counter only
+ * this way, so neither conflicts with the other.
+ */
+async function staleTotals(ctx: MutationCtx): Promise<Infer<typeof vTotals>> {
+  return await ctx.runQuery(
+    internal.outbox.totals,
+    {},
+    { useStaleSnapshot: true },
+  );
+}
+
+/** The added totals at this mutation's snapshot, for row deletions. */
+export async function staleAdded(ctx: MutationCtx): Promise<Amount> {
+  return (await staleTotals(ctx)).added;
+}
+
+function pendingOf(
+  added: Amount,
+  { removedRows, removedBytes }: Removed,
+): Pending {
+  return {
+    pendingRows: added.rows - removedRows,
+    pendingBytes: added.bytes - removedBytes,
+  };
 }
 
 /**
- * The pending counters after `removed` left the outbox. A row deleted before
- * a count step reached it was never added, so it is not subtracted.
+ * Adds `rows`, which this mutation deleted from the outbox, to the removed
+ * totals `removed`, moves the gate, and returns the new totals for the caller
+ * to store on the exporter. Every deleted span row counts, whether a count
+ * step has consumed its receipt or not. `added` comes from `staleAdded`.
  */
-export function withoutRows(
-  exporter: Doc<"exporter">,
-  removed: Doc<"outbox">[],
-): Counters {
-  let { pendingRows, pendingBytes } = exporter;
-  for (const row of removed) {
-    if (row.kind !== "span" || !isCounted(row, exporter)) continue;
-    pendingRows -= 1;
-    pendingBytes -= row.bytes;
+export async function removeRows(
+  ctx: MutationCtx,
+  removed: Removed,
+  rows: Doc<"outbox">[],
+  added: Amount,
+): Promise<Removed> {
+  let { removedRows, removedBytes } = removed;
+  for (const row of rows) {
+    if (row.kind !== "span") continue;
+    removedRows += 1;
+    removedBytes += row.bytes;
   }
-  return { pendingRows, pendingBytes };
+  const next = { removedRows, removedBytes };
+  await moveGate(ctx, pendingOf(added, next));
+  return next;
 }
 
 /**
- * Moves the admission gate from the counters: closed above either threshold,
- * open again below half of both. Writes the gate only when its value changes.
+ * Moves the admission gate from the pending backlog: closed above either
+ * threshold, open again below half of both. Writes the gate only when its
+ * value changes.
  */
 export async function moveGate(
   ctx: MutationCtx,
-  { pendingRows, pendingBytes }: Counters,
+  { pendingRows, pendingBytes }: Pending,
 ): Promise<void> {
   const gate = await ctx.db.query("gate").first();
   const accepting = gate?.accepting ?? true;
@@ -141,98 +183,108 @@ export async function gateClosed(ctx: QueryCtx): Promise<boolean> {
 }
 
 /**
- * Schedules a count step unless one was scheduled less than
- * `MEASURE_INTERVAL_MS` ago. The step runs in a mutation of its own, so the
- * caller stays short.
+ * Starts a new count chain unless the current chain scheduled a step less
+ * than `MEASURE_INTERVAL_MS` ago. A running chain refreshes `steppedAt` with
+ * every step it schedules, so at most one chain is alive; a step of an older
+ * chain stops. The steps run in mutations of their own, so the caller stays
+ * short.
  */
 export async function scheduleCount(
   ctx: MutationCtx,
-  exporter: Doc<"exporter">,
   now: number,
 ): Promise<void> {
-  if (!measurementDue(exporter.measuredAt, now)) return;
-  await ctx.db.patch("exporter", exporter._id, { measuredAt: now });
-  await ctx.scheduler.runAfter(0, internal.outbox.count, {});
+  let counter = await ctx.db.query("counter").first();
+  if (!counter) {
+    const id = await ctx.db.insert("counter", {
+      addedRows: 0,
+      addedBytes: 0,
+      chain: 0,
+    });
+    counter = (await ctx.db.get("counter", id))!;
+  }
+  const { steppedAt } = counter;
+  if (steppedAt !== undefined && now - steppedAt < MEASURE_INTERVAL_MS) return;
+  const chain = counter.chain + 1;
+  await ctx.db.patch("counter", counter._id, { chain, steppedAt: now });
+  await ctx.scheduler.runAfter(0, internal.outbox.count, { chain });
 }
 
 /**
- * Safety net for drifted counters, for example after rows were deleted by
- * hand: when the counters are not zero or the gate is closed although the
- * outbox is empty, opens the gate and returns zero counters for the caller to
- * store. Returns `null` when nothing changes. Reads the outbox only when a
- * reset is possible, so the usual end of a run takes no read dependency on it.
+ * Safety net for drifted totals, for example after rows were deleted by
+ * hand. `added` comes from `staleAdded`, `removed` holds the caller's new
+ * removed totals. When the pending backlog is positive or the gate is closed
+ * although the outbox is empty, opens the gate. For a positive backlog it
+ * returns removed totals equal to the added ones, for the caller to store;
+ * otherwise `null`. A negative backlog stays, because its receipts are still
+ * to be consumed. Reads the outbox only when a reset is possible, so the
+ * usual end of a run takes no read dependency on it.
  */
-export async function resetCountersIfEmpty(
+export async function resetIfEmpty(
   ctx: MutationCtx,
-  exporter: Doc<"exporter">,
-): Promise<Counters | null> {
-  const drifted = exporter.pendingRows !== 0 || exporter.pendingBytes !== 0;
-  if (!drifted && !(await gateClosed(ctx))) return null;
+  added: Amount,
+  removed: Removed,
+): Promise<Removed | null> {
+  const { pendingRows, pendingBytes } = pendingOf(added, removed);
+  const positive = pendingRows > 0 || pendingBytes > 0;
+  if (!positive && !(await gateClosed(ctx))) return null;
   if (await ctx.db.query("outbox").first()) return null;
-  const zero = { pendingRows: 0, pendingBytes: 0 };
-  await moveGate(ctx, zero);
-  return zero;
+  await moveGate(ctx, { pendingRows: 0, pendingBytes: 0 });
+  if (!positive) return null;
+  return { removedRows: added.rows, removedBytes: added.bytes };
 }
 
 /**
- * One count step. Adds at most `COUNT_BATCH` outbox rows committed after the
- * cursor to the pending counters and moves the gate. Rows are read in commit
- * order. A step that fills its batch stops at its last row, also inside a
- * commit, and the next step continues after that row. Rows that commit after
- * this transaction's snapshot lie outside the read range, so concurrent
- * enqueues do not conflict with it. Deletions subtract counted rows and write
- * the exporter document too, so they serialize with this step. A step that
- * may have left rows behind schedules the next one at once.
+ * One step of count chain `chain`. Consumes at most `COUNT_BATCH` receipts in
+ * commit order: adds them to the added totals, deletes them and moves the
+ * gate. The scan ends at this transaction's snapshot, so receipts that
+ * enqueues commit later lie outside its read range. The step reads the
+ * removed totals through `staleTotals` and writes only the counter, its
+ * receipts and the gate, so it does not conflict with the exporter. A full
+ * step continues at the `seq` of its last receipt, inclusive, because one
+ * commit can hold more receipts than a step, and schedules the next step at
+ * once. A step of a superseded chain does nothing.
  */
 export const count = internalMutation({
-  args: {},
+  args: { chain: v.number() },
   returns: v.null(),
-  handler: async (ctx) => {
-    const exporter = await getOrCreateExporter(ctx);
-    const { countedThrough, countedTime } = exporter;
-    const insideCommit =
-      countedThrough !== undefined && countedTime !== undefined;
+  handler: async (ctx, { chain }) => {
+    const counter = await ctx.db.query("counter").first();
+    if (!counter || counter.chain !== chain) return null;
+    const { countedFrom } = counter;
     const snapshot = ctx.meta.getSnapshotTs();
-    const rows = insideCommit
-      ? await ctx.db
-          .query("outbox")
-          .withIndex("by_seq", (q) =>
-            q.eq("seq", countedThrough).gt("_creationTime", countedTime),
-          )
-          .take(COUNT_BATCH)
-      : await ctx.db
-          .query("outbox")
-          .withIndex("by_seq", (q) =>
-            q.gt("seq", countedThrough ?? 0n).lte("seq", snapshot),
-          )
-          .take(COUNT_BATCH);
-    const last = rows.at(-1);
-    const full = rows.length === COUNT_BATCH && last !== undefined;
-    let cursor: Pick<Doc<"exporter">, "countedThrough" | "countedTime">;
+    const receipts = await ctx.db
+      .query("receipts")
+      .withIndex("by_seq", (q) =>
+        countedFrom === undefined
+          ? q.lte("seq", snapshot)
+          : q.gte("seq", countedFrom).lte("seq", snapshot),
+      )
+      .take(COUNT_BATCH);
+    let { addedRows, addedBytes } = counter;
+    for (const receipt of receipts) {
+      addedRows += receipt.rows;
+      addedBytes += receipt.bytes;
+      await ctx.db.delete("receipts", receipt._id);
+    }
+    const last = receipts.at(-1);
+    const full = receipts.length === COUNT_BATCH && last !== undefined;
+    let next = snapshot;
     if (full) {
       if (typeof last.seq !== "bigint") throw new Error("count: uncommitted");
-      cursor = { countedThrough: last.seq, countedTime: last._creationTime };
-    } else if (insideCommit) {
-      // The rest of that commit is counted.
-      cursor = { countedThrough, countedTime: undefined };
-    } else {
-      cursor = { countedThrough: snapshot, countedTime: undefined };
+      next = last.seq;
     }
-    const counters: Counters = {
-      pendingRows: exporter.pendingRows,
-      pendingBytes: exporter.pendingBytes,
-    };
-    for (const row of rows) {
-      if (row.kind !== "span") continue;
-      counters.pendingRows += 1;
-      counters.pendingBytes += row.bytes;
-    }
-    await ctx.db.patch("exporter", exporter._id, { ...counters, ...cursor });
-    await moveGate(ctx, counters);
-    // After a commit was finished, later commits may still be uncounted.
-    if (full || insideCommit) {
-      await ctx.scheduler.runAfter(0, internal.outbox.count, {});
-    }
+    const { removed } = await staleTotals(ctx);
+    await moveGate(ctx, {
+      pendingRows: addedRows - removed.rows,
+      pendingBytes: addedBytes - removed.bytes,
+    });
+    await ctx.db.patch("counter", counter._id, {
+      addedRows,
+      addedBytes,
+      countedFrom: next,
+      ...(full ? { steppedAt: Date.now() } : {}),
+    });
+    if (full) await ctx.scheduler.runAfter(0, internal.outbox.count, { chain });
     return null;
   },
 });
@@ -246,9 +298,11 @@ const vLastError = v.object({
 /**
  * Export state for dashboards and alerts. `pendingAtLeast` and
  * `deadLettersAtLeast` are lower bounds capped at `HEALTH_COUNT_CAP`.
- * `pendingCounted` holds the counters the gate uses; they trail new rows
- * until the next count step. `oldestPendingAt` is the creation time of the
- * oldest pending row. `backoffUntil` is set only while a backoff is active.
+ * `pendingCounted` is the backlog the gate uses: rows and bytes of consumed
+ * receipts minus those of removed rows, never below zero. It trails new rows
+ * until a count step consumes their receipts. `oldestPendingAt` is the
+ * creation time of the oldest pending row. `backoffUntil` is set only while a
+ * backoff is active.
  */
 export const health = query({
   args: {},
@@ -256,7 +310,7 @@ export const health = query({
     enabled: v.boolean(),
     accepting: v.boolean(),
     pendingAtLeast: v.number(),
-    pendingCounted: v.object({ rows: v.number(), bytes: v.number() }),
+    pendingCounted: vAmount,
     oldestPendingAt: v.optional(v.number()),
     deadLettersAtLeast: v.number(),
     exporter: v.object({
@@ -273,6 +327,7 @@ export const health = query({
   handler: async (ctx) => {
     const now = Date.now();
     const exporter = await getExporter(ctx);
+    const counter = await ctx.db.query("counter").first();
     const pending = await ctx.db.query("outbox").take(HEALTH_COUNT_CAP);
     const deadLetters = await ctx.db
       .query("deadLetters")
@@ -283,8 +338,14 @@ export const health = query({
       accepting: !(await gateClosed(ctx)),
       pendingAtLeast: pending.length,
       pendingCounted: {
-        rows: exporter?.pendingRows ?? 0,
-        bytes: exporter?.pendingBytes ?? 0,
+        rows: Math.max(
+          0,
+          (counter?.addedRows ?? 0) - (exporter?.removedRows ?? 0),
+        ),
+        bytes: Math.max(
+          0,
+          (counter?.addedBytes ?? 0) - (exporter?.removedBytes ?? 0),
+        ),
       },
       oldestPendingAt: pending[0]?._creationTime,
       deadLettersAtLeast: deadLetters.length,
@@ -307,9 +368,10 @@ export const health = query({
 
 /**
  * Moves up to `limit` (default 100, at most `RETRY_DEAD_LETTERS_MAX`) dead
- * letters, oldest first, back to the outbox and wakes the exporter. A moved row gets a new `seq`, so the next
- * count step counts it. Does nothing while the gate is closed. Run it from the
- * dashboard or CLI after fixing what made Langfuse reject them.
+ * letters, oldest first, back to the outbox and wakes the exporter. Writes
+ * one receipt for the moved rows, so the next count step counts them once.
+ * Does nothing while the gate is closed. Run it from the dashboard or CLI
+ * after fixing what made Langfuse reject them.
  */
 export const retryDeadLetters = internalMutation({
   args: { limit: v.optional(v.number()) },
@@ -328,11 +390,17 @@ export const retryDeadLetters = internalMutation({
         bytes,
         payloadId,
         availableAt: now,
-        seq: ctx.db.vars.commitTs,
       });
       await ctx.db.delete("deadLetters", _id);
     }
-    if (deadLetters.length > 0) await pingExporter(ctx);
+    if (deadLetters.length > 0) {
+      await ctx.db.insert("receipts", {
+        rows: deadLetters.length,
+        bytes: deadLetters.reduce((sum, row) => sum + row.bytes, 0),
+        seq: ctx.db.vars.commitTs,
+      });
+      await pingExporter(ctx);
+    }
     return { moved: deadLetters.length };
   },
 });

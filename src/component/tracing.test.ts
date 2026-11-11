@@ -149,6 +149,8 @@ describe("disabled", () => {
       outbox: [],
       payloads: [],
       deadLetters: [],
+      receipts: [],
+      counter: [],
       exporter: [],
       gate: [],
     });

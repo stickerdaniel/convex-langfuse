@@ -9,19 +9,20 @@ import {
 import {
   getExporter,
   getOrCreateExporter,
-  moveGate,
-  resetCountersIfEmpty,
+  removeRows,
+  resetIfEmpty,
   scheduleCount,
-  withoutRows,
+  staleAdded,
 } from "./outbox.js";
 
 /**
  * Hourly sweep. Expires outbox rows older than `MAX_PENDING_AGE_MS`, except
  * the batch in flight, and deletes dead letters older than
  * `DEAD_LETTER_RETENTION_MS`, at most `RETENTION_BATCH` of each per run; a
- * run that reaches a limit schedules the next one at once. Schedules a count
- * step while rows are pending, and resets drifted counters once the outbox is
- * empty. A run that finds nothing to do writes and schedules nothing.
+ * run that reaches a limit schedules the next one at once. Expired rows add
+ * to the removed totals. Starts a count chain while rows are pending, and
+ * resets drifted totals once the outbox is empty. A run that finds nothing
+ * to do writes and schedules nothing.
  */
 export const sweep = internalMutation({
   args: {},
@@ -44,13 +45,17 @@ export const sweep = internalMutation({
     }
     if (expired.length > 0) {
       exporter ??= await getOrCreateExporter(ctx);
-      const counters = withoutRows(exporter, expired);
+      const removed = await removeRows(
+        ctx,
+        exporter,
+        expired,
+        await staleAdded(ctx),
+      );
       await ctx.db.patch("exporter", exporter._id, {
-        ...counters,
+        ...removed,
         expired: exporter.expired + expired.length,
       });
-      await moveGate(ctx, counters);
-      exporter = { ...exporter, ...counters };
+      exporter = { ...exporter, ...removed };
     }
 
     const deadLetters = await ctx.db
@@ -65,13 +70,9 @@ export const sweep = internalMutation({
     }
 
     if (await ctx.db.query("outbox").first()) {
-      await scheduleCount(
-        ctx,
-        exporter ?? (await getOrCreateExporter(ctx)),
-        now,
-      );
+      await scheduleCount(ctx, now);
     } else if (exporter) {
-      const reset = await resetCountersIfEmpty(ctx, exporter);
+      const reset = await resetIfEmpty(ctx, await staleAdded(ctx), exporter);
       if (reset) await ctx.db.patch("exporter", exporter._id, reset);
     }
 

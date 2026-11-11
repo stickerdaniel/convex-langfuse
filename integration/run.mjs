@@ -19,6 +19,7 @@ import {
   openSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -188,12 +189,28 @@ class Backend {
     await exited;
   }
 
+  get logPath() {
+    return join(this.stateDir, "backend.log");
+  }
+
+  /** Bytes in the backend log so far, an offset for `logLinesSince`. */
+  logSize() {
+    return existsSync(this.logPath) ? statSync(this.logPath).size : 0;
+  }
+
+  /** Lines of the backend log written after byte `offset`, without colors. */
+  logLinesSince(offset) {
+    if (!existsSync(this.logPath)) return [];
+    return stripVTControlCharacters(
+      readFileSync(this.logPath).subarray(offset).toString("utf8"),
+    )
+      .split("\n")
+      .filter((line) => line.length > 0);
+  }
+
   /** The last warnings and errors of the backend log, without colors. */
   logProblems(lines = 30) {
-    const path = join(this.stateDir, "backend.log");
-    if (!existsSync(path)) return "";
-    return stripVTControlCharacters(readFileSync(path, "utf8"))
-      .split("\n")
+    return this.logLinesSince(0)
       .filter((line) => / (WARN|ERROR) /.test(line))
       .slice(-lines)
       .map((line) => line.slice(0, 400))
@@ -723,6 +740,7 @@ async function main() {
     });
 
     await runCase("6 progress under sustained enqueue", async ({ finish }) => {
+      const logOffset = backend.logSize();
       await fake.control({ mode: "healthy" });
       // Start from an empty outbox: with few rows waiting, a claim reads up
       // to the newest row, which is where enqueues write.
@@ -737,41 +755,109 @@ async function main() {
       );
       const acceptedAt = async () =>
         (await client.query(api.backlog, {})).accepted;
-      // Enqueues never pause, so the exporter always claims next to a live
-      // insert range. It must keep accepting rows in every window.
-      const load = startLoad(client, 6, { size: 10, concurrency: 8 });
-      const windows = [];
-      let last = await acceptedAt();
-      for (let i = 0; i < 6; i++) {
-        await sleep(5_000);
-        const now = await acceptedAt();
-        windows.push(now - last);
-        last = now;
-      }
-      const commits = await load.stop();
-      if (windows.some((accepted) => accepted === 0)) {
-        throw new Error(`rows accepted per 5 s window: ${windows.join(", ")}`);
-      }
-      const total = commits.length * 10;
-      await waitFor(
-        "every span id",
-        async () => received(await fake.stats(), 6, total) === total,
-        180_000,
-      );
-      const conflicts = (await finish()).filter(
-        (log) =>
-          log.error &&
-          /exporter(\.js)?:(advance|dispatch)/.test(log.identifier),
-      );
-      if (conflicts.length > 0) {
-        throw new Error(
-          `${conflicts.length} failed exporter mutations: ${String(conflicts[0].error).split("\n")[0].slice(0, 120)}`,
+      const requestsAt = async () => (await fake.stats()).requests;
+      const load6 = { commits: () => 0, windows: [] };
+      let drainedAt;
+
+      // Diagnostics for the detail and for the error message.
+      const diagnostics = async () => {
+        const executions = await finish();
+        const during = (pattern, from, to) =>
+          executions.filter(
+            (log) =>
+              pattern.test(log.identifier) &&
+              log.timestamp * 1_000 >= from &&
+              log.timestamp * 1_000 <= to,
+          );
+        const medianMs = (logs) => {
+          const ms = logs.map((log) => log.executionTime * 1_000);
+          ms.sort((a, b) => a - b);
+          return ms.length === 0 ? "n/a" : ms[ms.length >> 1].toFixed(0);
+        };
+        const advance = /exporter(\.js)?:advance/;
+        const { loadStart, loadEnd, requestsStart, requestsEnd } = load6;
+        const counts = executions.filter((log) =>
+          /outbox(\.js)?:count/.test(log.identifier),
         );
+        const longestCount = Math.max(
+          0,
+          ...counts.map((log) => log.executionTime * 1_000),
+        );
+        const occ = backend
+          .logLinesSince(logOffset)
+          .filter((line) => /occ error|Optimistic concurrency/i.test(line));
+        const rate =
+          loadEnd === undefined
+            ? "n/a"
+            : (
+                (requestsEnd - requestsStart) /
+                ((loadEnd - loadStart) / 1_000)
+              ).toFixed(1);
+        const drain =
+          drainedAt === undefined
+            ? "not all arrived"
+            : `${((drainedAt - loadEnd) / 1_000).toFixed(1)} s`;
+        return {
+          executions,
+          text:
+            `${load6.commits()} mutations in 30 s, ${rate} requests/s during ` +
+            `the load, every span id ${drain} after the load; ` +
+            `advance median ${medianMs(during(advance, loadStart, loadStart + 5_000))} ms ` +
+            `in the first 5 s, ${medianMs(during(advance, loadEnd - 5_000, loadEnd))} ms ` +
+            `in the last 5 s; ${counts.length} count steps, longest ` +
+            `${longestCount.toFixed(0)} ms; ${occ.length} OCC log lines`,
+        };
+      };
+
+      try {
+        // Enqueues never pause, so the exporter always claims next to a live
+        // insert range. It must keep accepting rows in every window.
+        load6.requestsStart = await requestsAt();
+        load6.loadStart = Date.now();
+        const load = startLoad(client, 6, { size: 10, concurrency: 8 });
+        load6.commits = load.commits;
+        let last = await acceptedAt();
+        for (let i = 0; i < 6; i++) {
+          await sleep(5_000);
+          const now = await acceptedAt();
+          load6.windows.push(now - last);
+          last = now;
+        }
+        const commits = await load.stop();
+        load6.loadEnd = Date.now();
+        load6.requestsEnd = await requestsAt();
+        if (load6.windows.some((accepted) => accepted === 0)) {
+          throw new Error(
+            `rows accepted per 5 s window: ${load6.windows.join(", ")}`,
+          );
+        }
+        const total = commits.length * 10;
+        await waitFor(
+          "every span id",
+          async () => received(await fake.stats(), 6, total) === total,
+          180_000,
+        );
+        drainedAt = Date.now();
+        const { executions, text } = await diagnostics();
+        const failed = executions.filter(
+          (log) =>
+            log.error &&
+            /exporter(\.js)?:(advance|dispatch|run)$/.test(log.identifier),
+        );
+        if (failed.length > 0) {
+          throw new Error(
+            `${failed.length} failed exporter executions, first ` +
+              `${failed[0].identifier}: ${String(failed[0].error).split("\n")[0].slice(0, 120)}`,
+          );
+        }
+        return (
+          `${text}; accepted per 5 s window: ${load6.windows.join(", ")}; ` +
+          `${total} distinct span ids`
+        );
+      } catch (error) {
+        const { text } = await diagnostics();
+        throw new Error(`${error?.message ?? error}; ${text}`);
       }
-      return (
-        `${commits.length} mutations in 30 s, accepted per 5 s window: ` +
-        `${windows.join(", ")}; ${total} distinct span ids`
-      );
     });
 
     const diverging = divergent(await fake.stats());

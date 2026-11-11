@@ -65,7 +65,8 @@ function withDefaults(trace: TraceContext): TraceContext {
 /**
  * Enqueues observations of one trace for export, in the caller's transaction.
  * Each observation is encoded once into an OTLP span and stored with one
- * outbox row; the exporter later sends exactly these bytes.
+ * outbox row; the exporter later sends exactly these bytes. One receipt
+ * holds the number of rows and their bytes for the backlog count.
  *
  * Returns `reason: "disabled"` without writing when the component has no
  * export configuration, and `reason: "backlog"` without writing while the
@@ -116,9 +117,13 @@ export const record = mutation({
         bytes,
         availableAt,
         payloadId,
-        seq: ctx.db.vars.commitTs,
       });
     }
+    await ctx.db.insert("receipts", {
+      rows: spans.length,
+      bytes: total,
+      seq: ctx.db.vars.commitTs,
+    });
     await pingExporter(ctx);
     return { enqueued: spans.length };
   },
