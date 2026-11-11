@@ -30,6 +30,11 @@ import type { DataModel } from "./dataModel.js";
 type Env = {
   readonly CONVEX_CLOUD_URL: string;
   readonly CONVEX_SITE_URL: string;
+  readonly LANGFUSE_BASE_URL: string | undefined;
+  readonly LANGFUSE_PUBLIC_KEY: string | undefined;
+  readonly LANGFUSE_RELEASE: string | undefined;
+  readonly LANGFUSE_SECRET_KEY: string | undefined;
+  readonly LANGFUSE_TRACING_ENVIRONMENT: string | undefined;
 };
 
 /**

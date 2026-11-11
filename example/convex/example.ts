@@ -1,57 +1,63 @@
-import { query, action } from "./_generated/server.js";
-import { components } from "./_generated/api.js";
-import { Langfuse } from "../../src/client/index.js";
 import { v } from "convex/values";
+import { components } from "./_generated/api.js";
+import { env, mutation, query } from "./_generated/server.js";
+import { Langfuse } from "../../src/client/index.js";
 
-const langfuse = new Langfuse(components.convexLangfuse, {
-  // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
-  publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
-  // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
-  secretKey: process.env.LANGFUSE_SECRET_KEY!,
-  // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
-  baseUrl: process.env.LANGFUSE_BASE_URL,
-});
+const langfuse = new Langfuse(components.convexLangfuse, { content: "full" });
 
-export const logChatCompletion = action({
+/** One trace per conversation: every completion and step lands in it. */
+const conversation = (conversationId: string, userId?: string) =>
+  langfuse.trace({
+    seed: `conversation:${conversationId}`,
+    name: "chat",
+    sessionId: conversationId,
+    userId,
+  });
+
+const vRecorded = v.object({ traceId: v.string(), observationId: v.string() });
+
+// Saves the completion as a note and records it as a generation in the same
+// transaction: the generation is exported only if the note commits.
+export const recordChatCompletion = mutation({
   args: {
+    conversationId: v.string(),
     userId: v.string(),
-    sessionId: v.optional(v.string()),
     prompt: v.string(),
     completion: v.string(),
     model: v.string(),
     inputTokens: v.number(),
     outputTokens: v.number(),
-    tags: v.optional(v.array(v.string())),
   },
+  returns: vRecorded,
   handler: async (ctx, args) => {
-    return await langfuse.logGeneration(ctx, {
-      traceName: "chat-completion",
+    const noteId = await ctx.db.insert("notes", { body: args.completion });
+    const trace = conversation(args.conversationId, args.userId);
+    return await trace.generation(ctx, {
+      key: `completion:${noteId}`,
       name: "chat-completion",
-      userId: args.userId,
-      sessionId: args.sessionId,
-      tags: args.tags,
       model: args.model,
       input: args.prompt,
       output: args.completion,
-      inputTokens: args.inputTokens,
-      outputTokens: args.outputTokens,
+      usage: { input: args.inputTokens, output: args.outputTokens },
     });
   },
 });
 
-// Adds a non-LLM step (a retrieval, a tool call, a guardrail check) to an
-// existing trace, to demonstrate grouping multiple observations together —
-// see the README's "Continuing a Trace" section.
-export const logStep = action({
+// Adds a non-LLM step, such as a retrieval or a tool call, to the
+// conversation's trace, nested under a generation.
+export const recordStep = mutation({
   args: {
-    traceId: v.string(),
+    conversationId: v.string(),
+    parentObservationId: v.string(),
     name: v.string(),
     input: v.optional(v.string()),
     output: v.optional(v.string()),
   },
+  returns: vRecorded,
   handler: async (ctx, args) => {
-    return await langfuse.logSpan(ctx, {
-      traceId: args.traceId,
+    return await conversation(args.conversationId).span(ctx, {
+      key: `step:${args.parentObservationId}:${args.name}:${Date.now()}`,
+      parent: { id: args.parentObservationId },
       name: args.name,
       input: args.input,
       output: args.output,
@@ -59,71 +65,13 @@ export const logStep = action({
   },
 });
 
-export const rateResponse = action({
-  args: { traceId: v.string(), value: v.number(), comment: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    return await langfuse.recordScore(ctx, {
-      traceId: args.traceId,
-      name: "user-rating",
-      value: args.value,
-      comment: args.comment,
-    });
-  },
-});
-
-export const getTrace = query({
-  args: { traceId: v.string() },
-  handler: async (ctx, args) => {
-    return await langfuse.getTrace(ctx, args);
-  },
-});
-
-export const listObservations = query({
-  args: { traceId: v.string() },
-  handler: async (ctx, args) => {
-    return await langfuse.listObservations(ctx, args);
-  },
-});
-
-export const listScores = query({
-  args: { traceId: v.string() },
-  handler: async (ctx, args) => {
-    return await langfuse.listScores(ctx, args);
-  },
-});
-
-export const listTracesByUser = query({
-  args: { userId: v.string() },
-  handler: async (ctx, args) => {
-    return await langfuse.listTracesByUser(ctx, args);
-  },
-});
-
-export const listTracesBySession = query({
-  args: { sessionId: v.string() },
-  handler: async (ctx, args) => {
-    return await langfuse.listTracesBySession(ctx, args);
-  },
+export const health = query({
+  args: {},
+  handler: async (ctx) => await langfuse.health(ctx),
 });
 
 export const getDashboardUrl = query({
   args: {},
-  handler: async () => {
-    // eslint-disable-next-line @convex-dev/no-process-env -- typed env declarations would make these variables required at deploy time
-    return process.env.LANGFUSE_BASE_URL ?? "https://cloud.langfuse.com";
-  },
-});
-
-export const getStats = query({
-  args: {},
-  handler: async (ctx) => {
-    return await langfuse.getStats(ctx);
-  },
-});
-
-export const listRecentTraces = query({
-  args: { limit: v.optional(v.number()) },
-  handler: async (ctx, args) => {
-    return await langfuse.listRecentTraces(ctx, args);
-  },
+  returns: v.union(v.string(), v.null()),
+  handler: async () => env.LANGFUSE_BASE_URL ?? null,
 });

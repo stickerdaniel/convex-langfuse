@@ -6,12 +6,11 @@ const SECOND = 1_000;
 const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 
-/** Encoded span bytes per outbox row. A document holds at most 1 MiB. */
-export const MAX_ROW_BYTES = 900 * KIB;
-/** Encoded span bytes per `tracing.record` call, a quarter of a transaction. */
-export const MAX_CALL_BYTES = 4 * MIB;
-/** Observations per `tracing.record` call. */
-export const MAX_CALL_RECORDS = 50;
+export {
+  MAX_CALL_BYTES,
+  MAX_CALL_RECORDS,
+  MAX_ROW_BYTES,
+} from "../shared/limits.js";
 /** UTF-8 bytes of an outbox `ref`. */
 export const MAX_REF_BYTES = 128;
 

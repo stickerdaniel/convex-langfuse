@@ -11,7 +11,6 @@
 import type * as constants from "../constants.js";
 import type * as crons from "../crons.js";
 import type * as exporter from "../exporter.js";
-import type * as lib from "../lib.js";
 import type * as outbox from "../outbox.js";
 import type * as retention from "../retention.js";
 import type * as settings from "../settings.js";
@@ -28,7 +27,6 @@ const fullApi: ApiFromModules<{
   constants: typeof constants;
   crons: typeof crons;
   exporter: typeof exporter;
-  lib: typeof lib;
   outbox: typeof outbox;
   retention: typeof retention;
   settings: typeof settings;

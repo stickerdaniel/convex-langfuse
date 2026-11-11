@@ -1,332 +1,602 @@
-import type { GenericActionCtx, GenericDataModel } from "convex/server";
+import type {
+  FunctionReturnType,
+  GenericActionCtx,
+  GenericDataModel,
+} from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
+import {
+  isEnvironmentName,
+  isObservationId,
+  isTraceId,
+  observationIdFromKey,
+  traceIdFromSeed,
+} from "../shared/ids.js";
+import {
+  CLIENT_CALL_BYTES,
+  MAX_CALL_RECORDS,
+  MAX_ROW_BYTES,
+} from "../shared/limits.js";
+import { byteLength, encodeSpan } from "../shared/otlp.js";
+import type {
+  Level,
+  Observation,
+  ObservationType,
+  TraceContext,
+} from "../shared/validators.js";
+
+export { observationIdFromKey, traceIdFromSeed } from "../shared/ids.js";
+export type { Level, ObservationType } from "../shared/validators.js";
 
 export type LangfuseOptions = {
-  publicKey: string;
-  secretKey: string;
-  /** Defaults to the EU Langfuse Cloud region. */
-  baseUrl?: string;
+  /** "full" exports input, output and status messages. "none" removes them. Required: there is no default. */
+  content: "full" | "none";
+  /** Sees every record before it leaves the app. Returns the record to export, or null to drop it. */
+  redact?: (record: ExportRecord) => ExportRecord | null;
+  /** Limit for a serialized input or output in UTF-8 bytes. Default 131072. */
+  maxFieldBytes?: number;
+  /** "log" (default) never throws from a recording method. "throw" rethrows. */
+  onError?: "log" | "throw";
 };
 
-export type ObservationLevel = "DEBUG" | "DEFAULT" | "WARNING" | "ERROR";
+/** An observation named by a key, hashed together with the trace id, or by its id. */
+export type ObservationRef =
+  | { key: string; id?: never }
+  | { id: string; key?: never };
 
-export type LogObservationArgs = {
-  /** Continue an existing trace, or omit to start a new one. */
-  traceId?: string;
-  traceName?: string;
+/** Trace-level fields, written on every observation of the trace. */
+export type TraceFields = {
+  name?: string;
   userId?: string;
   sessionId?: string;
   tags?: string[];
+  metadata?: Record<string, unknown>;
+  environment?: string;
   release?: string;
-  traceMetadata?: Record<string, unknown>;
+  experiment?: {
+    id: string;
+    name: string;
+    datasetId?: string;
+    itemId?: string;
+    rootObservation?: ObservationRef;
+    metadata?: Record<string, unknown>;
+  };
+};
 
+/** A trace named by a seed, hashed like `createTraceId` of the Langfuse SDK, or by its id. */
+export type TraceInit = (
+  | { seed: string; traceId?: never }
+  | { traceId: string; seed?: never }
+) &
+  TraceFields;
+
+/** Observation fields other than its identity. Times are epoch milliseconds. */
+export type ObservationFields = {
   name: string;
+  /** Default `Date.now()`. */
+  startTime?: number;
+  /** Default `startTime`. An event always ends at its start time. */
+  endTime?: number;
+  completionStartTime?: number;
   input?: unknown;
   output?: unknown;
-  model?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  level?: ObservationLevel;
-  statusMessage?: string;
   metadata?: Record<string, unknown>;
-  startTime?: number;
-  endTime?: number;
+  level?: Level;
+  statusMessage?: string;
+  version?: string;
+  model?: string;
+  modelParameters?: Record<string, unknown>;
+  usage?: Record<string, number>;
+  cost?: Record<string, number>;
+  prompt?: { name: string; version?: number };
 };
 
-export type LogObservationResult = {
+export type ObservationInit = ObservationRef & {
+  parent?: ObservationRef;
+} & ObservationFields;
+
+/**
+ * What `redact` sees: one observation with its trace fields, before
+ * serialization. Changes to the ids are ignored.
+ */
+export type ExportRecord = {
+  kind: "observation";
   traceId: string;
   observationId: string;
+  parentObservationId?: string;
+  trace: TraceFields;
+  observation: ObservationFields & { type: ObservationType };
 };
 
-function randomHex(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+/**
+ * Fixed codes a recording method logs, or throws as the `Error` message with
+ * `onError: "throw"`. A record dropped by `redact` is not logged.
+ */
+export type ErrorCode =
+  | "invalid_id"
+  | "invalid_environment"
+  | "invalid_metadata"
+  | "unserializable"
+  | "invalid_usage"
+  | "row_too_large"
+  | "redact_failed"
+  | "backlog"
+  | "enqueue_failed";
+
+/** The component's export state, as `outbox.health` returns it. */
+export type Health = FunctionReturnType<ComponentApi["outbox"]["health"]>;
+
+/** Ids of one recorded observation. */
+export type Recorded = { traceId: string; observationId: string };
+
+/**
+ * One trace. Its recording methods enqueue in the caller's transaction and
+ * return the ids, also for a record that was not sent. With `onError: "log"`
+ * they never throw. The same key recorded twice gives two rows in Langfuse;
+ * make the recording mutation idempotent or put the attempt in the key.
+ */
+export interface Trace {
+  /** The trace id, derived from the seed or given. */
+  id(): Promise<string>;
+  /** The observation id for a key in this trace. */
+  observationId(key: string): Promise<string>;
+  /** Records an LLM call. Only a generation exports its `prompt` link. */
+  generation(ctx: RunMutationCtx, init: ObservationInit): Promise<Recorded>;
+  /** Records a unit of work with a duration. */
+  span(ctx: RunMutationCtx, init: ObservationInit): Promise<Recorded>;
+  /** Records a point in time; `endTime` is ignored. */
+  event(ctx: RunMutationCtx, init: ObservationInit): Promise<Recorded>;
+  /** Records several observations of any of the ten types with as few component calls as possible. */
+  record(
+    ctx: RunMutationCtx,
+    observations: Array<ObservationInit & { type: ObservationType }>,
+  ): Promise<{ traceId: string; observationIds: string[] }>;
 }
 
-type OtlpAttribute = { key: string; value: Record<string, unknown> };
+const DEFAULT_MAX_FIELD_BYTES = 131_072;
+const DROPPED_METADATA = '{"dropped":"too_large"}';
 
-function attr(key: string, value: unknown): OtlpAttribute | null {
-  if (value === undefined || value === null) return null;
-  if (typeof value === "string") return { key, value: { stringValue: value } };
-  if (typeof value === "number") {
-    return Number.isInteger(value)
-      ? { key, value: { intValue: String(value) } }
-      : { key, value: { doubleValue: value } };
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/** Thrown with `onError: "throw"`; its message is the code. */
+class CodeError extends Error {
+  constructor(readonly code: ErrorCode) {
+    super(code);
   }
-  if (typeof value === "boolean") return { key, value: { boolValue: value } };
-  if (Array.isArray(value)) {
-    return {
-      key,
-      value: {
-        arrayValue: {
-          values: value.map((v) => ({ stringValue: String(v) })),
-        },
-      },
-    };
-  }
-  return { key, value: { stringValue: JSON.stringify(value) } };
 }
 
-function flattenMetadata(prefix: string, metadata: Record<string, unknown> | undefined): OtlpAttribute[] {
-  if (!metadata) return [];
-  return Object.entries(metadata)
-    .map(([k, v]) => attr(`${prefix}.${k}`, typeof v === "object" ? JSON.stringify(v) : v))
-    .filter((a): a is OtlpAttribute => a !== null);
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** A copy with object keys sorted at every depth. Throws on a cycle. */
+function sortKeys(value: unknown, ancestors: Set<object>): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (ancestors.has(value)) throw new TypeError("cycle");
+  ancestors.add(value);
+  try {
+    if ("toJSON" in value && typeof value.toJSON === "function") {
+      const json: unknown = value.toJSON();
+      if (json !== value) return sortKeys(json, ancestors);
+    }
+    if (Array.isArray(value)) {
+      return value.map((item: unknown) => sortKeys(item, ancestors));
+    }
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, item]: [string, unknown]) => [
+          key,
+          sortKeys(item, ancestors),
+        ]),
+    );
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 /**
- * Send LLM traces, generations, and scores to Langfuse over its OpenTelemetry
- * ingestion endpoint (the legacy `/api/public/ingestion` batch API sunsets on
- * Langfuse Cloud in November 2026), while keeping a reactive local copy in Convex.
+ * JSON with object keys sorted recursively, so equal values give equal
+ * strings. `undefined` when JSON has no representation for the value. Throws
+ * on a cycle or a bigint.
+ */
+function stableJson(value: unknown): string | undefined {
+  return JSON.stringify(sortKeys(value, new Set())) as string | undefined;
+}
+
+/**
+ * Cuts `text` to at most `limit` UTF-8 bytes on a character boundary and
+ * appends a marker with the number of bytes removed.
+ */
+function truncate(text: string, limit: number): string {
+  const bytes = encoder.encode(text);
+  if (bytes.byteLength <= limit) return text;
+  let cut = Math.max(0, limit);
+  // Back off over continuation bytes (0b10xxxxxx) to a character start.
+  while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut -= 1;
+  const kept = decoder.decode(bytes.subarray(0, cut));
+  return `${kept}…[truncated ${bytes.byteLength - cut} bytes]`;
+}
+
+async function resolveTraceId(init: TraceInit): Promise<string> {
+  return init.traceId ?? (await traceIdFromSeed(init.seed));
+}
+
+async function resolveRef(traceId: string, ref: ObservationRef) {
+  return ref.id ?? (await observationIdFromKey(traceId, ref.key));
+}
+
+/** The id a ref names: `undefined` without a ref, "" for an empty key. */
+async function tryResolveRef(
+  traceId: string,
+  ref: ObservationRef | undefined,
+): Promise<string | undefined> {
+  if (ref === undefined) return undefined;
+  return await resolveRef(traceId, ref).catch(() => "");
+}
+
+/** One observation ready for the component, with its encoded size. */
+type Prepared = {
+  trace: TraceContext;
+  observation: Observation;
+  /** The serialized trace context; observations of one call share it. */
+  context: string;
+  bytes: number;
+};
+
+/**
+ * Exports LLM traces to Langfuse through the component's transactional
+ * outbox. A recording method enqueues in the caller's transaction: in a
+ * mutation, the observation commits or rolls back with the caller's writes.
+ *
+ * ```ts
+ * const langfuse = new Langfuse(components.convexLangfuse, { content: "full" });
+ * const trace = langfuse.trace({ seed: `chat:${chatId}`, userId });
+ * await trace.generation(ctx, { key: "llm", name: "answer", model, input, output });
+ * ```
  */
 export class Langfuse {
-  constructor(
-    private component: ComponentApi,
-    private options: LangfuseOptions,
-  ) {}
+  readonly #component: ComponentApi;
+  readonly #options: LangfuseOptions;
 
-  private authHeader(): string {
-    return `Basic ${btoa(`${this.options.publicKey}:${this.options.secretKey}`)}`;
+  constructor(component: ComponentApi, options: LangfuseOptions) {
+    this.#component = component;
+    this.#options = options;
   }
 
-  private baseUrl(): string {
-    return this.options.baseUrl ?? "https://cloud.langfuse.com";
+  /**
+   * A handle for one trace, named by `seed` or `traceId`. Creating it does no
+   * work; every observation recorded through it carries these trace fields.
+   */
+  trace(init: TraceInit): Trace {
+    let traceId: Promise<string> | undefined;
+    const id = () => (traceId ??= resolveTraceId(init));
+    const one = async (
+      ctx: RunMutationCtx,
+      type: ObservationType,
+      observation: ObservationInit,
+    ): Promise<Recorded> => {
+      const recorded = await this.#record(ctx, init, id, [
+        { ...observation, type },
+      ]);
+      return {
+        traceId: recorded.traceId,
+        observationId: recorded.observationIds[0] ?? "",
+      };
+    };
+    return {
+      id,
+      observationId: async (key) => await observationIdFromKey(await id(), key),
+      generation: (ctx, observation) => one(ctx, "generation", observation),
+      span: (ctx, observation) => one(ctx, "span", observation),
+      event: (ctx, observation) => one(ctx, "event", observation),
+      record: (ctx, observations) => this.#record(ctx, init, id, observations),
+    };
   }
 
-  private async exportSpan(args: {
-    traceId: string;
-    spanId: string;
-    name: string;
-    startTimeUnixNano: string;
-    endTimeUnixNano: string;
-    attributes: OtlpAttribute[];
-  }): Promise<void> {
-    const body = {
-      resourceSpans: [
-        {
-          resource: {
-            attributes: [{ key: "service.name", value: { stringValue: "convex-langfuse" } }],
-          },
-          scopeSpans: [
-            {
-              scope: { name: "convex-langfuse" },
-              spans: [
-                {
-                  traceId: args.traceId,
-                  spanId: args.spanId,
-                  name: args.name,
-                  kind: 1,
-                  startTimeUnixNano: args.startTimeUnixNano,
-                  endTimeUnixNano: args.endTimeUnixNano,
-                  attributes: args.attributes,
-                },
-              ],
-            },
-          ],
-        },
-      ],
+  /** The component's export state: gate, backlog, exporter and dead letters. */
+  async health(ctx: RunQueryCtx): Promise<Health> {
+    return await ctx.runQuery(this.#component.outbox.health, {});
+  }
+
+  /**
+   * Logs `code` with ids only, or throws it with `onError: "throw"`. Never
+   * logs field content or error messages, which can carry user data.
+   */
+  #fail(code: ErrorCode, ids: Recorded): void {
+    if (this.#options.onError === "throw") throw new CodeError(code);
+    console.error(`[convex-langfuse] ${code}`, {
+      traceId: ids.traceId,
+      observationId: ids.observationId,
+    });
+  }
+
+  /**
+   * Prepares every observation, then sends the survivors in as few component
+   * calls as the call bounds allow. Returns the ids of every observation,
+   * also of those that were not sent.
+   */
+  async #record(
+    ctx: RunMutationCtx,
+    init: TraceInit,
+    id: () => Promise<string>,
+    items: Array<ObservationInit & { type: ObservationType }>,
+  ): Promise<{ traceId: string; observationIds: string[] }> {
+    const traceId = await id().catch(() => "");
+    const observationIds: string[] = [];
+    const prepared: Prepared[] = [];
+    for (const item of items) {
+      const ids: Recorded = {
+        traceId,
+        observationId: (await tryResolveRef(traceId, item)) ?? "",
+      };
+      observationIds.push(ids.observationId);
+      try {
+        const ready = await this.#prepare(init, item, ids);
+        if (ready) prepared.push(ready);
+      } catch (error) {
+        if (error instanceof CodeError) throw error;
+        this.#fail("enqueue_failed", ids);
+      }
+    }
+    for (const call of groupCalls(prepared)) {
+      const first = call[0]!;
+      const ids = { traceId, observationId: first.observation.id };
+      let result;
+      try {
+        result = await ctx.runMutation(this.#component.tracing.record, {
+          trace: first.trace,
+          observations: call.map(({ observation }) => observation),
+        });
+      } catch {
+        this.#fail("enqueue_failed", ids);
+        continue;
+      }
+      if (result.reason === "backlog") this.#fail("backlog", ids);
+    }
+    return { traceId, observationIds };
+  }
+
+  /**
+   * Runs one observation through the processing steps in order: ids,
+   * defaults, `redact`, content mode, serialization, truncation, usage,
+   * validation and size. Returns `null` for a record that is not sent.
+   * Throws only with `onError: "throw"`.
+   */
+  async #prepare(
+    init: TraceInit,
+    item: ObservationInit & { type: ObservationType },
+    ids: Recorded,
+  ): Promise<Prepared | null> {
+    const { traceId, observationId } = ids;
+    const maxFieldBytes =
+      this.#options.maxFieldBytes ?? DEFAULT_MAX_FIELD_BYTES;
+    const problems = new Set<ErrorCode>();
+
+    // 1. Ids. An empty seed or key resolves to "", which fails validation.
+    const parentId = await tryResolveRef(traceId, item.parent);
+    const rootObservationId = await tryResolveRef(
+      traceId,
+      init.experiment?.rootObservation,
+    );
+
+    // 2. Defaults.
+    const { key: _key, id: _id, parent: _parent, type, ...fields } = item;
+    const startTime = fields.startTime ?? Date.now();
+    const endTime =
+      type === "event" ? startTime : (fields.endTime ?? startTime);
+
+    // 3. redact on a copy, so a hook that edits in place leaves the caller's
+    // values alone.
+    const { seed: _seed, traceId: _traceId, ...traceFields } = init;
+    const record: ExportRecord = {
+      kind: "observation",
+      traceId,
+      observationId,
+      ...(parentId === undefined ? {} : { parentObservationId: parentId }),
+      trace: {
+        ...traceFields,
+        ...(traceFields.experiment
+          ? { experiment: { ...traceFields.experiment } }
+          : {}),
+      },
+      observation: { ...fields, type, startTime, endTime },
+    };
+    let redacted: ExportRecord | null;
+    try {
+      redacted = this.#options.redact ? this.#options.redact(record) : record;
+    } catch {
+      this.#fail("redact_failed", ids);
+      return null;
+    }
+    if (redacted === null) return null;
+    const { trace: fieldsOfTrace } = redacted;
+    let observation = redacted.observation;
+
+    // 4. Content mode. Anything but "full" removes content.
+    if (this.#options.content !== "full") {
+      const {
+        input: _input,
+        output: _output,
+        statusMessage: _statusMessage,
+        ...rest
+      } = observation;
+      observation = rest;
+    }
+
+    // 5. and 6. Serialization and truncation.
+    const content = (value: unknown): string | undefined => {
+      if (value === undefined) return undefined;
+      let text: string | undefined;
+      try {
+        text = typeof value === "string" ? value : stableJson(value);
+      } catch {
+        text = undefined;
+      }
+      if (text === undefined) {
+        problems.add("unserializable");
+        return undefined;
+      }
+      return truncate(text, maxFieldBytes);
+    };
+    const jsonObject = (value: unknown): string | undefined => {
+      if (value === undefined) return undefined;
+      if (!isPlainObject(value)) {
+        problems.add("invalid_metadata");
+        return undefined;
+      }
+      let text: string | undefined;
+      try {
+        text = stableJson(value);
+      } catch {
+        problems.add("unserializable");
+        return undefined;
+      }
+      return text !== undefined && byteLength(text) > maxFieldBytes
+        ? DROPPED_METADATA
+        : text;
     };
 
-    const res = await fetch(`${this.baseUrl()}/api/public/otel/v1/traces`, {
-      method: "POST",
-      headers: {
-        Authorization: this.authHeader(),
-        "Content-Type": "application/json",
-        "x-langfuse-ingestion-version": "4",
+    const { experiment } = fieldsOfTrace;
+    const trace: TraceContext = {
+      traceId,
+      name: fieldsOfTrace.name,
+      userId: fieldsOfTrace.userId,
+      sessionId: fieldsOfTrace.sessionId,
+      tags: fieldsOfTrace.tags,
+      metadata: jsonObject(fieldsOfTrace.metadata),
+      environment: fieldsOfTrace.environment,
+      release: fieldsOfTrace.release,
+      experiment: experiment && {
+        id: experiment.id,
+        name: experiment.name,
+        datasetId: experiment.datasetId,
+        itemId: experiment.itemId,
+        rootObservationId,
+        metadata: jsonObject(experiment.metadata),
       },
-      body: JSON.stringify(body),
-    });
+    };
 
-    if (!res.ok) {
-      throw new Error(`Failed to export span to Langfuse: ${res.status} ${await res.text()}`);
-    }
-  }
+    const input = content(observation.input);
+    const output = content(observation.output);
+    const metadata = jsonObject(observation.metadata);
+    const modelParameters = jsonObject(observation.modelParameters);
 
-  private async logObservation(
-    ctx: RunMutationCtx,
-    type:
-      | "span"
-      | "generation"
-      | "event"
-      | "embedding"
-      | "agent"
-      | "tool"
-      | "chain"
-      | "retriever"
-      | "guardrail"
-      | "evaluator",
-    args: LogObservationArgs,
-  ): Promise<LogObservationResult> {
-    const traceId = args.traceId ?? randomHex(16);
-    const spanId = randomHex(8);
-    const startTime = args.startTime ?? Date.now();
-    const endTime = args.endTime ?? startTime;
-
-    const attributes: OtlpAttribute[] = [
-      attr("langfuse.trace.name", args.traceName ?? args.name),
-      attr("langfuse.user.id", args.userId),
-      attr("langfuse.session.id", args.sessionId),
-      attr("langfuse.trace.tags", args.tags),
-      attr("langfuse.release", args.release),
-      attr("langfuse.observation.type", type),
-      attr("langfuse.observation.input", args.input !== undefined ? JSON.stringify(args.input) : undefined),
-      attr("langfuse.observation.output", args.output !== undefined ? JSON.stringify(args.output) : undefined),
-      attr("langfuse.observation.model.name", args.model),
-      attr("langfuse.observation.level", args.level ?? "DEFAULT"),
-      attr("langfuse.observation.status_message", args.statusMessage),
-      ...(args.inputTokens !== undefined || args.outputTokens !== undefined
-        ? [
-            attr(
-              "langfuse.observation.usage_details",
-              // Langfuse's usage details object uses "input"/"output"/"total",
-              // not "input_tokens"/"output_tokens" — the latter is silently
-              // ignored, so the generation shows no token usage or cost.
-              JSON.stringify({
-                input: args.inputTokens ?? 0,
-                output: args.outputTokens ?? 0,
-                total: (args.inputTokens ?? 0) + (args.outputTokens ?? 0),
-              }),
-            ),
-          ]
-        : []),
-      ...flattenMetadata("langfuse.trace.metadata", args.traceMetadata),
-      ...flattenMetadata("langfuse.observation.metadata", args.metadata),
-    ].filter((a): a is OtlpAttribute => a !== null);
-
-    await this.exportSpan({
-      traceId,
-      spanId,
-      name: args.name,
-      startTimeUnixNano: String(startTime * 1_000_000),
-      endTimeUnixNano: String(endTime * 1_000_000),
-      attributes,
-    });
-
-    await ctx.runMutation(this.component.lib.recordTrace, {
-      traceId,
-      name: args.traceName ?? args.name,
-      userId: args.userId,
-      sessionId: args.sessionId,
-      tags: args.tags,
-      metadata: args.traceMetadata ? JSON.stringify(args.traceMetadata) : undefined,
-      release: args.release,
-    });
-
-    await ctx.runMutation(this.component.lib.recordObservation, {
-      observationId: spanId,
-      traceId,
-      type,
-      name: args.name,
-      input: args.input !== undefined ? JSON.stringify(args.input) : undefined,
-      output: args.output !== undefined ? JSON.stringify(args.output) : undefined,
-      model: args.model,
-      inputTokens: args.inputTokens,
-      outputTokens: args.outputTokens,
-      level: args.level ?? "DEFAULT",
-      statusMessage: args.statusMessage,
-      metadata: args.metadata ? JSON.stringify(args.metadata) : undefined,
-      startedAt: startTime,
-      endedAt: endTime,
-    });
-
-    return { traceId, observationId: spanId };
-  }
-
-  /** Log a completed LLM call (model, input, output, token usage) as a Langfuse generation. */
-  async logGeneration(
-    ctx: RunMutationCtx,
-    args: LogObservationArgs,
-  ): Promise<LogObservationResult> {
-    return await this.logObservation(ctx, "generation", args);
-  }
-
-  /** Log a non-LLM step (a tool call, a retrieval, a chain step) as a Langfuse span. */
-  async logSpan(
-    ctx: RunMutationCtx,
-    args: LogObservationArgs,
-  ): Promise<LogObservationResult> {
-    return await this.logObservation(ctx, "span", args);
-  }
-
-  /** Attach an evaluation score to a trace, via Langfuse's Scores API. */
-  async recordScore(
-    ctx: RunMutationCtx,
-    args: { traceId: string; name: string; value: number; comment?: string },
-  ): Promise<{ scoreId: string }> {
-    const scoreId = randomHex(16);
-
-    const res = await fetch(`${this.baseUrl()}/api/public/scores`, {
-      method: "POST",
-      headers: {
-        Authorization: this.authHeader(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        id: scoreId,
-        traceId: args.traceId,
-        name: args.name,
-        value: args.value,
-        comment: args.comment,
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Failed to record Langfuse score: ${res.status} ${await res.text()}`);
+    // 7. Usage: non-negative safe integers only.
+    let usage: Record<string, number> | undefined;
+    if (observation.usage !== undefined) {
+      const entries = isPlainObject(observation.usage)
+        ? Object.entries(observation.usage)
+        : [];
+      const kept = entries.filter(
+        ([, value]) => Number.isSafeInteger(value) && value >= 0,
+      );
+      if (!isPlainObject(observation.usage) || kept.length < entries.length) {
+        problems.add("invalid_usage");
+      }
+      usage = kept.length > 0 ? Object.fromEntries(kept) : undefined;
     }
 
-    await ctx.runMutation(this.component.lib.recordScore, {
-      scoreId,
-      traceId: args.traceId,
-      name: args.name,
-      value: args.value,
-      comment: args.comment,
-    });
+    const encoded: Observation = {
+      id: observationId,
+      parentId,
+      type: observation.type,
+      name: observation.name,
+      startTime: observation.startTime ?? startTime,
+      endTime:
+        observation.type === "event"
+          ? (observation.startTime ?? startTime)
+          : (observation.endTime ?? endTime),
+      completionStartTime: observation.completionStartTime,
+      input,
+      output,
+      metadata,
+      level: observation.level,
+      statusMessage: observation.statusMessage,
+      version: observation.version,
+      model: observation.model,
+      modelParameters,
+      usage,
+      cost: observation.cost,
+      prompt: observation.prompt,
+    };
+    for (const code of problems) this.#fail(code, ids);
 
-    return { scoreId };
-  }
+    // 8. Validation.
+    const ownIds = [observationId, parentId, rootObservationId];
+    if (
+      !isTraceId(traceId) ||
+      ownIds.some((value) => value !== undefined && !isObservationId(value))
+    ) {
+      this.#fail("invalid_id", ids);
+      return null;
+    }
+    if (
+      trace.environment !== undefined &&
+      !isEnvironmentName(trace.environment)
+    ) {
+      this.#fail("invalid_environment", ids);
+      return null;
+    }
 
-  async getTrace(ctx: RunQueryCtx, args: { traceId: string }) {
-    return await ctx.runQuery(this.component.lib.getTrace, args);
-  }
-
-  async listTracesByUser(ctx: RunQueryCtx, args: { userId: string; limit?: number }) {
-    return await ctx.runQuery(this.component.lib.listTracesByUser, args);
-  }
-
-  async listTracesBySession(ctx: RunQueryCtx, args: { sessionId: string; limit?: number }) {
-    return await ctx.runQuery(this.component.lib.listTracesBySession, args);
-  }
-
-  async listObservations(ctx: RunQueryCtx, args: { traceId: string }) {
-    return await ctx.runQuery(this.component.lib.listObservations, args);
-  }
-
-  async listScores(ctx: RunQueryCtx, args: { traceId: string }) {
-    return await ctx.runQuery(this.component.lib.listScores, args);
-  }
-
-  async getStats(ctx: RunQueryCtx) {
-    return await ctx.runQuery(this.component.lib.getStats, {});
-  }
-
-  async listRecentTraces(ctx: RunQueryCtx, args: { limit?: number } = {}) {
-    return await ctx.runQuery(this.component.lib.listRecentTraces, args);
+    // 9. Size, with the encoder the component uses.
+    let bytes: number;
+    try {
+      bytes = byteLength(encodeSpan(trace, encoded));
+    } catch {
+      // A time that is not a finite number cannot be encoded.
+      this.#fail("unserializable", ids);
+      return null;
+    }
+    if (bytes > MAX_ROW_BYTES) {
+      this.#fail("row_too_large", ids);
+      return null;
+    }
+    return {
+      trace,
+      observation: encoded,
+      context: JSON.stringify(trace),
+      bytes,
+    };
   }
 }
 
-type RunQueryCtx = {
+/**
+ * Splits observations, in order, into component calls: one call holds
+ * observations with the same trace context, at most `MAX_CALL_RECORDS` of
+ * them and at most `CLIENT_CALL_BYTES` of encoded spans.
+ */
+function groupCalls(prepared: Prepared[]): Prepared[][] {
+  const calls: Prepared[][] = [];
+  let call: Prepared[] = [];
+  let bytes = 0;
+  for (const item of prepared) {
+    const first = call[0];
+    if (
+      first &&
+      (first.context !== item.context ||
+        call.length === MAX_CALL_RECORDS ||
+        bytes + item.bytes > CLIENT_CALL_BYTES)
+    ) {
+      calls.push(call);
+      call = [];
+      bytes = 0;
+    }
+    call.push(item);
+    bytes += item.bytes;
+  }
+  if (call.length > 0) calls.push(call);
+  return calls;
+}
+
+// Structural ctx types: they accept the mutation and action ctx of any app,
+// whose data model is a concrete set of tables and so not assignable to
+// `GenericActionCtx<GenericDataModel>` itself.
+export type RunQueryCtx = {
   runQuery: GenericActionCtx<GenericDataModel>["runQuery"];
 };
-
-// logObservation, logGeneration, logSpan, and recordScore only ever call
-// ctx.runMutation. Typing them against this minimal structural type instead
-// of the full GenericActionCtx<GenericDataModel> means they accept any real
-// app's ActionCtx, whose DataModel is a concrete set of tables (not
-// assignable to the generic GenericDataModel once an app defines any tables
-// of its own).
-type RunMutationCtx = {
+export type RunMutationCtx = {
   runMutation: GenericActionCtx<GenericDataModel>["runMutation"];
 };

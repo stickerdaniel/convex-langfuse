@@ -38,11 +38,8 @@ export function updateLog(id: string, status: LogEntry["status"], detail?: strin
 }
 
 /**
- * Wraps a Convex action call, logging its attempt and outcome to the local
- * console panel. Since this component has no incoming webhooks (Langfuse
- * ingestion is one-way, client -> Langfuse), this is the only "live activity"
- * signal the example app has — every call this app makes to the langfuse
- * client shows up here, success or failure.
+ * Wraps a Convex function call and logs its attempt and outcome to the
+ * activity panel.
  */
 export async function withLog<T>(title: string, fn: () => Promise<T>): Promise<T> {
   const id = pushLog(title, "pending");
