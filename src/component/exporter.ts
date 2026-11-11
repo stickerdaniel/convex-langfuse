@@ -33,12 +33,11 @@ import {
 import {
   getExporter,
   getOrCreateExporter,
+  gateClosed,
   pingExporter,
-  removeRows,
-  resetIfEmpty,
   scheduleCount,
-  staleAdded,
-  type Amount,
+  scheduleReconcile,
+  withRemoved,
   type Removed,
 } from "./outbox.js";
 import { exportConfig, type ExportConfig } from "./settings.js";
@@ -211,24 +210,25 @@ export const advance = internalMutation({
     const exporter = await getExporter(ctx);
     if (!exporter || exporter.generation !== generation) return { done: true };
     const now = Date.now();
-    // The added totals, read once and only when needed, from a stale snapshot,
-    // so this mutation never conflicts with a count step.
-    let added: Amount | undefined;
-    const addedTotals = async () => (added ??= await staleAdded(ctx));
     // Outbox rows this call deletes; each one adds to the removed totals.
     const removed: Doc<"outbox">[] = [];
-    const settle = async (): Promise<Removed> => {
-      const { removedRows, removedBytes } = exporter;
-      if (removed.length === 0) return { removedRows, removedBytes };
-      return await removeRows(ctx, exporter, removed, await addedTotals());
+    // Only a closed gate can change through a deletion or the end of a run.
+    // `reconcileGate` then decides from both totals; this mutation never
+    // reads the counter, so it does not conflict with a count step.
+    let reconciling = false;
+    const reopen = async () => {
+      if (reconciling || !(await gateClosed(ctx))) return;
+      reconciling = true;
+      await scheduleReconcile(ctx);
     };
-    const endRun = async (
-      patch: Partial<Doc<"exporter">>,
-      totals?: Removed,
-    ) => {
+    const settle = async (): Promise<Removed> => {
+      if (removed.length > 0) await reopen();
+      return withRemoved(exporter, removed);
+    };
+    const endRun = async (patch: Partial<Doc<"exporter">>) => {
       await ctx.db.patch("exporter", exporter._id, {
         ...patch,
-        ...(totals ?? (await settle())),
+        ...(await settle()),
         leaseExpiresAt: undefined,
         runStartedAt: undefined,
         claimed: [],
@@ -350,9 +350,10 @@ export const advance = internalMutation({
       bytes += row.bytes;
     }
     if (claimed.length === 0) {
-      const totals = await settle();
-      const reset = await resetIfEmpty(ctx, await addedTotals(), totals);
-      return await endRun(patch, reset ?? totals);
+      // A gate that is closed over an empty outbox has no deletion left to
+      // reopen it.
+      await reopen();
+      return await endRun(patch);
     }
 
     await ctx.db.patch("exporter", exporter._id, {

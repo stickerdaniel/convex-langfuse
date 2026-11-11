@@ -842,10 +842,14 @@ async function main() {
         const commits = await load.stop();
         load6.loadEnd = Date.now();
         load6.requestsEnd = await requestsAt();
+        // A load shorter than one window still has to show progress.
+        if (load6.windows.length === 0) {
+          load6.windows.push((await acceptedAt()) - last);
+        }
         // The exporter must keep accepting rows while the load runs.
         if (load6.windows.some((accepted) => accepted === 0)) {
           throw new Error(
-            `rows accepted per 5 s window: ${load6.windows.join(", ")}`,
+            `rows accepted per window: ${load6.windows.join(", ")}`,
           );
         }
         const total = commits.length * 10;
@@ -855,6 +859,14 @@ async function main() {
           300_000,
         );
         drainedAt = Date.now();
+        // The last answers must be applied before the log is read: an
+        // exporter execution that fails after the last request counts too.
+        await waitFor(
+          "an empty outbox",
+          async () =>
+            (await client.query(api.backlog, {})).pendingAtLeast === 0,
+          60_000,
+        );
         const { executions, text } = await diagnostics();
         const failed = executions.filter(
           (log) =>
@@ -868,7 +880,7 @@ async function main() {
           );
         }
         return (
-          `${text}; accepted per 5 s window: ${load6.windows.join(", ")}; ` +
+          `${text}; accepted per window: ${load6.windows.join(", ")}; ` +
           `${total} distinct span ids`
         );
       } catch (error) {

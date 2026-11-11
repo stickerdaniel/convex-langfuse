@@ -1,6 +1,7 @@
 // Writes the package version into src/shared/version.ts. Runs in the npm
-// `version` lifecycle, after npm has bumped package.json, so the OTLP scope
-// version a release sends matches the release.
+// `version` lifecycle, after npm has bumped package.json, and in `prepack`
+// before the build, so the OTLP scope version in a packed `dist` matches the
+// release.
 import { readFileSync, writeFileSync } from "node:fs";
 
 const { version } = JSON.parse(

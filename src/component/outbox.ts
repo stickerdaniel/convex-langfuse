@@ -1,10 +1,9 @@
 import { ping } from "@convex-dev/batch-worker";
-import { v, type Infer } from "convex/values";
+import { v } from "convex/values";
 import { components, internal } from "./_generated/api.js";
 import type { Doc } from "./_generated/dataModel.js";
 import {
   internalMutation,
-  internalQuery,
   query,
   type MutationCtx,
   type QueryCtx,
@@ -68,80 +67,20 @@ export type Pending = { pendingRows: number; pendingBytes: number };
 export type Removed = Pick<Doc<"exporter">, "removedRows" | "removedBytes">;
 
 const vAmount = v.object({ rows: v.number(), bytes: v.number() });
-/** A number of span rows and their summed payload bytes. */
-export type Amount = Infer<typeof vAmount>;
-const vTotals = v.object({ added: vAmount, removed: vAmount });
 
 /**
- * The added totals of the counter and the removed totals of the exporter,
- * zeros for a missing document. Mutations read it only through
- * `staleTotals`, so these documents stay out of their read set.
+ * The removed totals after `rows` left the outbox. Every deleted span row
+ * counts, whether a count step has consumed its receipt or not. The caller
+ * stores the result on the exporter document.
  */
-export const totals = internalQuery({
-  args: {},
-  returns: vTotals,
-  handler: async (ctx) => {
-    const counter = await ctx.db.query("counter").first();
-    const exporter = await getExporter(ctx);
-    return {
-      added: { rows: counter?.addedRows ?? 0, bytes: counter?.addedBytes ?? 0 },
-      removed: {
-        rows: exporter?.removedRows ?? 0,
-        bytes: exporter?.removedBytes ?? 0,
-      },
-    };
-  },
-});
-
-/**
- * `totals` at this mutation's snapshot, without a read dependency. The count
- * chain reads the exporter document and the exporter reads the counter only
- * this way, so neither conflicts with the other.
- */
-async function staleTotals(ctx: MutationCtx): Promise<Infer<typeof vTotals>> {
-  return await ctx.runQuery(
-    internal.outbox.totals,
-    {},
-    { useStaleSnapshot: true },
-  );
-}
-
-/** The added totals at this mutation's snapshot, for row deletions. */
-export async function staleAdded(ctx: MutationCtx): Promise<Amount> {
-  return (await staleTotals(ctx)).added;
-}
-
-function pendingOf(
-  added: Amount,
-  { removedRows, removedBytes }: Removed,
-): Pending {
-  return {
-    pendingRows: added.rows - removedRows,
-    pendingBytes: added.bytes - removedBytes,
-  };
-}
-
-/**
- * Adds `rows`, which this mutation deleted from the outbox, to the removed
- * totals `removed`, moves the gate, and returns the new totals for the caller
- * to store on the exporter. Every deleted span row counts, whether a count
- * step has consumed its receipt or not. `added` comes from `staleAdded`.
- */
-export async function removeRows(
-  ctx: MutationCtx,
-  removed: Removed,
-  rows: Doc<"outbox">[],
-  added: Amount,
-): Promise<Removed> {
+export function withRemoved(removed: Removed, rows: Doc<"outbox">[]): Removed {
   let { removedRows, removedBytes } = removed;
   for (const row of rows) {
     if (row.kind !== "span") continue;
     removedRows += 1;
     removedBytes += row.bytes;
   }
-  const next = { removedRows, removedBytes };
-  await moveGate(ctx, pendingOf(added, next));
-  return next;
+  return { removedRows, removedBytes };
 }
 
 /**
@@ -210,39 +149,76 @@ export async function scheduleCount(
 }
 
 /**
- * Safety net for drifted totals, for example after rows were deleted by
- * hand. `added` comes from `staleAdded`, `removed` holds the caller's new
- * removed totals. When the pending backlog is positive or the gate is closed
- * although the outbox is empty, opens the gate. For a positive backlog it
- * returns removed totals equal to the added ones, for the caller to store;
- * otherwise `null`. A negative backlog stays, because its receipts are still
- * to be consumed. Reads the outbox only when a reset is possible, so the
- * usual end of a run takes no read dependency on it.
+ * Sets the gate from the pending backlog, `counter.added*` minus
+ * `exporter.removed*`. It reads both totals and the gate in this transaction,
+ * so every gate move follows from one consistent state. It is also the
+ * safety net for drift, for example after rows were deleted by hand: when the
+ * backlog is positive or the gate is closed although the outbox is empty, it
+ * opens the gate and sets the removed totals to the added ones. A negative
+ * backlog stays, because its receipts are still to be consumed. It reads the
+ * outbox only in that case.
+ *
+ * It reads the counter and the exporter document, so it runs in the sweep or
+ * in `reconcileGate`, never inside a count step or `advance`.
  */
-export async function resetIfEmpty(
-  ctx: MutationCtx,
-  added: Amount,
-  removed: Removed,
-): Promise<Removed | null> {
-  const { pendingRows, pendingBytes } = pendingOf(added, removed);
-  const positive = pendingRows > 0 || pendingBytes > 0;
-  if (!positive && !(await gateClosed(ctx))) return null;
-  if (await ctx.db.query("outbox").first()) return null;
-  await moveGate(ctx, { pendingRows: 0, pendingBytes: 0 });
-  if (!positive) return null;
-  return { removedRows: added.rows, removedBytes: added.bytes };
+export async function reconcile(ctx: MutationCtx): Promise<void> {
+  const counter = await ctx.db.query("counter").first();
+  const exporter = await getExporter(ctx);
+  const added = {
+    rows: counter?.addedRows ?? 0,
+    bytes: counter?.addedBytes ?? 0,
+  };
+  let pending: Pending = {
+    pendingRows: added.rows - (exporter?.removedRows ?? 0),
+    pendingBytes: added.bytes - (exporter?.removedBytes ?? 0),
+  };
+  const positive = pending.pendingRows > 0 || pending.pendingBytes > 0;
+  if (
+    (positive || (await gateClosed(ctx))) &&
+    !(await ctx.db.query("outbox").first())
+  ) {
+    if (positive) {
+      const { _id } = exporter ?? (await getOrCreateExporter(ctx));
+      await ctx.db.patch("exporter", _id, {
+        removedRows: added.rows,
+        removedBytes: added.bytes,
+      });
+    }
+    pending = { pendingRows: 0, pendingBytes: 0 };
+  }
+  await moveGate(ctx, pending);
+}
+
+/**
+ * `reconcile` in a mutation of its own. A count step schedules it after it
+ * raised the added totals, and a deletion schedules it while the gate is
+ * closed. The count chain and `advance` therefore never read each other's
+ * totals, and a gate move never mixes totals of two points in time.
+ */
+export const reconcileGate = internalMutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    await reconcile(ctx);
+    return null;
+  },
+});
+
+/** Schedules `reconcileGate` to run at once. */
+export async function scheduleReconcile(ctx: MutationCtx): Promise<void> {
+  await ctx.scheduler.runAfter(0, internal.outbox.reconcileGate, {});
 }
 
 /**
  * One step of count chain `chain`. Consumes at most `COUNT_BATCH` receipts in
- * commit order: adds them to the added totals, deletes them and moves the
- * gate. The scan ends at this transaction's snapshot, so receipts that
- * enqueues commit later lie outside its read range. The step reads the
- * removed totals through `staleTotals` and writes only the counter, its
- * receipts and the gate, so it does not conflict with the exporter. A full
- * step continues at the `seq` of its last receipt, inclusive, because one
- * commit can hold more receipts than a step, and schedules the next step at
- * once. A step of a superseded chain does nothing.
+ * commit order: adds them to the added totals, deletes them and schedules
+ * `reconcileGate`. The scan ends at this transaction's snapshot, so receipts
+ * that enqueues commit later lie outside its read range. The step reads and
+ * writes only the counter and its receipts, so it does not conflict with the
+ * exporter. A full step continues at the `seq` of its last receipt,
+ * inclusive, because one commit can hold more receipts than a step, and
+ * schedules the next step at once. A step of a superseded chain does
+ * nothing.
  */
 export const count = internalMutation({
   args: { chain: v.number() },
@@ -273,17 +249,13 @@ export const count = internalMutation({
       if (typeof last.seq !== "bigint") throw new Error("count: uncommitted");
       next = last.seq;
     }
-    const { removed } = await staleTotals(ctx);
-    await moveGate(ctx, {
-      pendingRows: addedRows - removed.rows,
-      pendingBytes: addedBytes - removed.bytes,
-    });
     await ctx.db.patch("counter", counter._id, {
       addedRows,
       addedBytes,
       countedFrom: next,
       ...(full ? { steppedAt: Date.now() } : {}),
     });
+    if (receipts.length > 0) await scheduleReconcile(ctx);
     if (full) await ctx.scheduler.runAfter(0, internal.outbox.count, { chain });
     return null;
   },

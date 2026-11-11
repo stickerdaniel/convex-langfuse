@@ -9,10 +9,9 @@ import {
 import {
   getExporter,
   getOrCreateExporter,
-  removeRows,
-  resetIfEmpty,
+  reconcile,
   scheduleCount,
-  staleAdded,
+  withRemoved,
 } from "./outbox.js";
 
 /**
@@ -20,9 +19,10 @@ import {
  * the batch in flight, and deletes dead letters older than
  * `DEAD_LETTER_RETENTION_MS`, at most `RETENTION_BATCH` of each per run; a
  * run that reaches a limit schedules the next one at once. Expired rows add
- * to the removed totals. Starts a count chain while rows are pending, and
- * resets drifted totals once the outbox is empty. A run that finds nothing
- * to do writes and schedules nothing.
+ * to the removed totals. Starts a count chain while rows are pending or
+ * receipts are left, then sets the gate from both totals and resets drifted
+ * totals once the outbox is empty. A run that finds nothing to do writes and
+ * schedules nothing.
  */
 export const sweep = internalMutation({
   args: {},
@@ -45,17 +45,10 @@ export const sweep = internalMutation({
     }
     if (expired.length > 0) {
       exporter ??= await getOrCreateExporter(ctx);
-      const removed = await removeRows(
-        ctx,
-        exporter,
-        expired,
-        await staleAdded(ctx),
-      );
       await ctx.db.patch("exporter", exporter._id, {
-        ...removed,
+        ...withRemoved(exporter, expired),
         expired: exporter.expired + expired.length,
       });
-      exporter = { ...exporter, ...removed };
     }
 
     const deadLetters = await ctx.db
@@ -69,12 +62,14 @@ export const sweep = internalMutation({
       await ctx.db.delete("deadLetters", deadLetter._id);
     }
 
-    if (await ctx.db.query("outbox").first()) {
+    // Receipts stay behind when traffic stops before the next chain is due.
+    if (
+      (await ctx.db.query("outbox").first()) ||
+      (await ctx.db.query("receipts").first())
+    ) {
       await scheduleCount(ctx, now);
-    } else if (exporter) {
-      const reset = await resetIfEmpty(ctx, await staleAdded(ctx), exporter);
-      if (reset) await ctx.db.patch("exporter", exporter._id, reset);
     }
+    await reconcile(ctx);
 
     if (
       stale.length === RETENTION_BATCH ||

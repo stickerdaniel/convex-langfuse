@@ -12,7 +12,9 @@ import {
   oneByteRows,
   pendingCounted,
   pendingScheduled,
+  runScheduledNow,
   startRunByHand,
+  startScheduledNow,
   tables,
   TRACE,
   type TestConvex,
@@ -90,10 +92,13 @@ describe("admission gate", () => {
     });
     expect(await newest()).toBe(before);
 
-    // One run drains the outbox without the fake clock moving, so the gate is
-    // sampled as each request arrives.
+    // One run drains the outbox, and the gate is sampled as each request
+    // arrives.
     let reopenedAt: { rows: number } | undefined;
     fake.fallback = async () => {
+      // On a real backend the gate reconciliation that a batch schedules runs
+      // while the next request is in flight.
+      await startScheduledNow();
       const { accepting, pendingCounted } = await health();
       if (accepting) reopenedAt ??= { rows: pendingCounted.rows };
       return { status: 200 };
@@ -103,12 +108,92 @@ describe("admission gate", () => {
       until: async () =>
         (await health()).pendingAtLeast === 0 || Date.now() > deadline,
     });
-    // Reopened by the deletions themselves, long before the outbox is empty.
+    // Reopened while the deletions run, long before the outbox is empty.
     expect(reopenedAt?.rows).toBeLessThan(PENDING_ROWS_THRESHOLD / 2);
     expect(reopenedAt?.rows).toBeGreaterThan(
       PENDING_ROWS_THRESHOLD / 2 - 1_000,
     );
   }, 120_000);
+
+  /**
+   * Totals of `added` counted and `removed` removed rows, with 50 counted
+   * rows and 60 rows whose receipt is not consumed in the outbox, and a run
+   * of generation 1. A counted row that is not available yet keeps the
+   * outbox from becoming empty.
+   */
+  async function nearThreshold(
+    t: TestConvex,
+    totals: { added: number; removed: number; accepting: boolean },
+  ) {
+    await insertRows(t, oneByteRows(1), { availableAt: Date.now() + 60_000 });
+    await insertRows(t, oneByteRows(50));
+    await t.run(async (ctx) => {
+      for (const receipt of await ctx.db.query("receipts").collect()) {
+        await ctx.db.delete("receipts", receipt._id);
+      }
+      await ctx.db.insert("counter", {
+        addedRows: totals.added,
+        addedBytes: totals.added,
+        chain: 0,
+      });
+      await ctx.db.insert(
+        "exporter",
+        exporterDoc({
+          generation: 1,
+          leaseExpiresAt: Date.now() + 120_000,
+          runStartedAt: Date.now(),
+          removedRows: totals.removed,
+          removedBytes: totals.removed,
+        }),
+      );
+      if (!totals.accepting) {
+        await ctx.db.insert("gate", { accepting: false, changedAt: 0 });
+      }
+    });
+    await insertRows(t, oneByteRows(60));
+  }
+  const advance = (t: TestConvex, report?: typeof accepted) =>
+    t.mutation(internal.exporter.advance, { generation: 1, report });
+
+  test("a count step next to a deletion leaves an open gate open below the threshold", async () => {
+    const t = initConvexTest();
+    await nearThreshold(t, { added: 30_000, removed: 5_050, accepting: true });
+    // The count step starts from 5,050 removed rows and adds 60. The deletion
+    // starts from 30,000 added rows and removes 50. Neither view alone is
+    // the backlog: 30,060 - 5,100 = 24,960.
+    await advance(t);
+    await countStep(t);
+    await advance(t, accepted);
+    await runScheduledNow(t);
+    const health = await t.query(api.outbox.health, {});
+    expect(health.pendingCounted.rows).toBe(24_960);
+    expect(health.accepting).toBe(true);
+  });
+
+  test("a count step next to a deletion keeps a closed gate closed above half the threshold", async () => {
+    const t = initConvexTest();
+    await nearThreshold(t, {
+      added: 30_000,
+      removed: 17_460,
+      accepting: false,
+    });
+    const health = () => t.query(api.outbox.health, {});
+    // 30,000 - 17,510 would be below 12,500. With the 60 counted rows the
+    // backlog is 12,550.
+    await advance(t);
+    await countStep(t);
+    await advance(t, accepted);
+    await runScheduledNow(t);
+    expect((await health()).pendingCounted.rows).toBe(12_550);
+    expect((await health()).accepting).toBe(false);
+
+    // 60 more accepted rows bring it to 12,490.
+    await advance(t, accepted);
+    await advance(t, accepted);
+    await runScheduledNow(t);
+    expect((await health()).pendingCounted.rows).toBe(12_490);
+    expect((await health()).accepting).toBe(true);
+  });
 });
 
 describe("counting", () => {
@@ -283,6 +368,30 @@ describe("counting", () => {
     expect(await pendingCounted(t)).toEqual({ rows: 1, bytes: 1 });
   });
 
+  test("a receipt left behind when traffic stops is consumed after the next sweep", async () => {
+    const fake = installFakeLangfuse();
+    const t = initConvexTest();
+    // A chain has just run, so the record below starts no new one.
+    await t.mutation(internal.exporter.dispatch, { op: "wait" });
+    await runScheduledNow(t);
+    await t.mutation(api.tracing.record, {
+      trace: TRACE,
+      observations: observations(0, 1),
+    });
+    await drive(t, fake);
+    expect(fake.requests).toHaveLength(1);
+    let state = await tables(t);
+    expect(state.outbox).toEqual([]);
+    expect(state.receipts).toHaveLength(1);
+
+    vi.setSystemTime(Date.now() + 3_600_000);
+    await t.mutation(internal.retention.sweep, {});
+    await runScheduledNow(t);
+    state = await tables(t);
+    expect(state.receipts).toEqual([]);
+    expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
+  });
+
   /** Totals of 30,000 counted rows that no longer exist, and a closed gate. */
   async function drift(t: TestConvex) {
     await t.run(async (ctx) => {
@@ -311,6 +420,7 @@ describe("counting", () => {
         await t.mutation(internal.retention.sweep, {});
       } else {
         await t.mutation(internal.exporter.advance, { generation: 1 });
+        await runScheduledNow(t);
       }
       const health = await t.query(api.outbox.health, {});
       expect(health.pendingCounted).toEqual({ rows: 0, bytes: 0 });
@@ -326,6 +436,7 @@ describe("counting", () => {
     expect(
       await t.mutation(internal.exporter.advance, { generation: 1 }),
     ).toEqual({ done: true });
+    await runScheduledNow(t);
     const health = await t.query(api.outbox.health, {});
     expect(health.pendingCounted).toEqual({ rows: 30_000, bytes: 5_000 });
     expect(health.accepting).toBe(false);

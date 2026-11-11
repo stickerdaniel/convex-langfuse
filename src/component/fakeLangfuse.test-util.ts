@@ -127,6 +127,27 @@ export async function drive(
   throw new Error("drive: too many steps");
 }
 
+/**
+ * Runs the functions that are scheduled for now, such as `reconcileGate`.
+ * It moves the fake clock by 1 ms, because the transaction clock of
+ * convex-test can run up to 1 ms ahead of it.
+ */
+export async function runScheduledNow(t: TestConvex): Promise<void> {
+  await vi.advanceTimersByTimeAsync(1);
+  await t.finishInProgressScheduledFunctions();
+}
+
+/**
+ * Starts the functions that are scheduled for now, like `runScheduledNow`,
+ * and gives them real time to finish. For use while an action is in flight,
+ * where `runScheduledNow` would wait for that action.
+ */
+export async function startScheduledNow(): Promise<void> {
+  await vi.advanceTimersByTimeAsync(1);
+  await realTick();
+  await realTick();
+}
+
 export const PUBLIC_KEY = "pk-lf-test";
 export const SECRET_KEY = "sk-lf-test";
 export const ENDPOINT = "https://langfuse.test/api/public/otel/v1/traces";
