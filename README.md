@@ -1,336 +1,383 @@
 # convex-langfuse
 
-**Send LLM traces, generations, and scores from your Convex app to Langfuse.** Reactive local queries, OpenTelemetry-native ingestion.
+**Export LLM traces from a Convex app to Langfuse through a transactional
+outbox.** An observation commits with your mutation and reaches Langfuse at
+least once.
 
-[![npm version](https://img.shields.io/npm/v/convex-langfuse)](https://www.npmjs.com/package/convex-langfuse)
-[![Convex Component](https://www.convex.dev/components/badge/convex-langfuse)](https://www.convex.dev/components/convex-langfuse)
-[![npm downloads](https://img.shields.io/npm/dw/convex-langfuse)](https://www.npmjs.com/package/convex-langfuse)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
-![convex-langfuse demo](./demo.png)
-
 ```ts
-const langfuse = new Langfuse(components.convexLangfuse, {
-  publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
-  secretKey: process.env.LANGFUSE_SECRET_KEY!,
-});
+const langfuse = new Langfuse(components.convexLangfuse, { content: "full" });
 
-// Log a completed LLM call
-const { traceId } = await langfuse.logGeneration(ctx, {
-  name: "chat-completion",
-  userId: "user_123",
-  model: "gpt-5",
-  input: prompt,
-  output: completion,
-  inputTokens: 120,
-  outputTokens: 340,
+export const saveAnswer = mutation({
+  args: { chatId: v.id("chats"), prompt: v.string(), answer: v.string() },
+  handler: async (ctx, args) => {
+    const messageId = await ctx.db.insert("messages", {
+      chatId: args.chatId,
+      body: args.answer,
+    });
+    // Enqueued in this transaction: exported only if the message commits.
+    await langfuse.trace({ seed: `chat:${args.chatId}` }).generation(ctx, {
+      key: `answer:${messageId}`,
+      name: "answer",
+      model: "gpt-5",
+      input: args.prompt,
+      output: args.answer,
+      usage: { input: 120, output: 340 },
+    });
+  },
 });
-
-// Attach a user rating or eval score to it
-await langfuse.recordScore(ctx, { traceId, name: "user-rating", value: 1 });
 ```
 
-## What this does
+This repository is a fork of
+[sholajegede/convex-langfuse](https://github.com/sholajegede/convex-langfuse)
+with a new architecture and a new API. Version 0.1.0 covers tracing. Scores,
+trace deletion and prompt management are in progress.
 
-Most Langfuse integrations assume a long-lived Node process that can hold an OpenTelemetry span open for the duration of an LLM call. Convex actions are short, stateless, request/response functions — there's no "open a span, await a stream, close it later." This component is built for that shape: you call it once, with the finished input/output/timing/usage already in hand, and it does the rest.
+## How it works
 
-Under the hood it exports a single completed [OpenTelemetry span](https://langfuse.com/integrations/native/opentelemetry) per call, using Langfuse's documented span attribute conventions (`langfuse.observation.*`, `langfuse.trace.*`) — no OpenTelemetry SDK dependency, just `fetch`. This matters more than it sounds: Langfuse's older `/api/public/ingestion` batch endpoint is **deprecated and sunsets on Langfuse Cloud on November 16, 2026**. Building against the OTLP endpoint from day one means this component doesn't need a rewrite in a few months.
+1. A recording call encodes the observation once as an OTLP span and writes it
+   to an outbox table. The write happens in the caller's transaction. In a
+   mutation, the observation commits or rolls back with your own writes.
+2. One exporter per deployment drains the outbox to
+   `POST /api/public/otel/v1/traces` of your Langfuse project, at most 50 spans
+   or 512 KiB per request.
+3. A request that fails stays in the outbox. The exporter backs off, honours
+   `Retry-After`, and sends the same bytes again.
+4. A span that Langfuse rejects moves to a dead-letter table after the exporter
+   isolated it from its batch. The rest of the batch is delivered.
 
-Alongside the export, every trace, generation, and score is mirrored into Convex tables so you can query them reactively — build a live "recent generations" or "token usage" view without a separate call to Langfuse's API.
-
-- **One-shot logging** — `logGeneration()` / `logSpan()` take a finished call and export it as a proper Langfuse trace + observation
-- **Scoring** — `recordScore()` attaches an evaluation or user-rating score to any trace
-- **Reactive local queries** — traces, observations, and scores are all queryable live from Convex
-- **No SDK dependency** — talks to Langfuse's OTLP/HTTP and Scores REST endpoints directly over `fetch`
+Your functions never wait for Langfuse and never fail because Langfuse is down.
 
 ## Table of Contents
 
-- [Install](#install)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Continuing a Trace](#continuing-a-trace)
-- [API Reference](#api-reference)
-- [Type Reference](#type-reference)
-- [Database Schema](#database-schema)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Recording](#recording)
+- [Ids](#ids)
+- [Content and privacy](#content-and-privacy)
+- [Errors](#errors)
+- [Delivery](#delivery)
+- [Limits](#limits)
+- [Operations](#operations)
 - [Testing](#testing)
-- [Example App](#example-app)
-- [Limitations](#limitations)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [Changelog](#changelog)
+- [Example app](#example-app)
+- [License](#license)
 
-## Install
+## Requirements
 
-```bash
-npm install convex-langfuse
-```
+- Convex 1.47 or later.
+- A Langfuse project on Langfuse Cloud or on a self-hosted Langfuse v4. The
+  component sends OTLP/HTTP JSON with `x-langfuse-ingestion-version: 4`.
 
-**Requirements:** Convex v1.33.1 or later, Node.js 18+, a [Langfuse](https://langfuse.com) project (Cloud or self-hosted, OTel-compatible)
+## Setup
 
-## Quick Start
+This fork has no npm release yet. The npm package `convex-langfuse` is the
+upstream project and has a different API.
 
-Three steps to send traces from your Convex app to Langfuse.
-
-### 1. Add the component
-
-In `convex/convex.config.ts`:
+Add the component in `convex/convex.config.ts` and bind its settings to your
+app's environment variables:
 
 ```ts
 import { defineApp } from "convex/server";
+import { v } from "convex/values";
 import convexLangfuse from "convex-langfuse/convex.config";
 
-const app = defineApp();
-app.use(convexLangfuse);
+const app = defineApp({
+  env: {
+    LANGFUSE_PUBLIC_KEY: v.optional(v.string()),
+    LANGFUSE_SECRET_KEY: v.optional(v.string()),
+    LANGFUSE_BASE_URL: v.optional(v.string()),
+    LANGFUSE_TRACING_ENVIRONMENT: v.optional(v.string()),
+    LANGFUSE_RELEASE: v.optional(v.string()),
+  },
+});
+app.use(convexLangfuse, {
+  env: {
+    LANGFUSE_PUBLIC_KEY: app.env.LANGFUSE_PUBLIC_KEY,
+    LANGFUSE_SECRET_KEY: app.env.LANGFUSE_SECRET_KEY,
+    LANGFUSE_BASE_URL: app.env.LANGFUSE_BASE_URL,
+    LANGFUSE_TRACING_ENVIRONMENT: app.env.LANGFUSE_TRACING_ENVIRONMENT,
+    LANGFUSE_RELEASE: app.env.LANGFUSE_RELEASE,
+  },
+});
 
 export default app;
 ```
 
-### 2. Set environment variables
-
 ```bash
-npx convex env set LANGFUSE_PUBLIC_KEY pk-lf-xxxxxxxxxxxx
-npx convex env set LANGFUSE_SECRET_KEY sk-lf-xxxxxxxxxxxx
+npx convex env set LANGFUSE_PUBLIC_KEY pk-lf-...
+npx convex env set LANGFUSE_SECRET_KEY sk-lf-...
+npx convex env set LANGFUSE_BASE_URL https://cloud.langfuse.com
 ```
 
-### 3. Initialize the client
+| Variable                                     | Meaning                                                                                                            |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Project API keys. They stay inside the component.                                                                  |
+| `LANGFUSE_BASE_URL`                          | Your region or your own host, for example `https://us.cloud.langfuse.com`. There is no default.                    |
+| `LANGFUSE_TRACING_ENVIRONMENT`               | Environment for traces that set none: 1 to 40 lowercase letters, digits, `-` or `_`, not starting with `langfuse`. |
+| `LANGFUSE_RELEASE`                           | Release for traces that set none.                                                                                  |
 
-In `convex/observability.ts`:
+The component exports only when both keys and the base URL are set. Without them
+a recording call writes nothing and returns, so a preview or test deployment
+needs no Langfuse project.
+
+Create the client once, for example in `convex/langfuse.ts`:
 
 ```ts
-import { components } from "./_generated/api";
 import { Langfuse } from "convex-langfuse";
+import { components } from "./_generated/api";
 
 export const langfuse = new Langfuse(components.convexLangfuse, {
-  publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
-  secretKey: process.env.LANGFUSE_SECRET_KEY!,
-  // baseUrl defaults to the EU Langfuse Cloud region — set it for US/JP/self-hosted
+  content: "full",
 });
 ```
 
-Import `langfuse` from this file in any Convex action that calls an LLM.
+`content` is required. See [Content and privacy](#content-and-privacy).
 
-## Usage
+## Recording
 
-### Log a generation
+`langfuse.trace(init)` returns a handle for one trace. Creating it does no work.
+Every observation recorded through it carries the trace fields, because Langfuse
+reads them from each span.
 
 ```ts
-export const chat = action({
-  args: { userId: v.string(), prompt: v.string() },
-  handler: async (ctx, args) => {
-    const completion = await callYourModel(args.prompt);
-
-    const { traceId } = await langfuse.logGeneration(ctx, {
-      name: "chat-completion",
-      userId: args.userId,
-      model: "gpt-5",
-      input: args.prompt,
-      output: completion,
-      inputTokens: completion.usage.inputTokens,
-      outputTokens: completion.usage.outputTokens,
-    });
-
-    return { completion, traceId };
-  },
+const trace = langfuse.trace({
+  seed: `chat:${chatId}:turn:${turnId}`, // or traceId
+  name: "chat-turn",
+  userId,
+  sessionId: chatId,
+  tags: ["voice"],
+  metadata: { plan: "pro" },
 });
-// Returns: { traceId, observationId }
 ```
 
-### Log a non-LLM step
+Record a finished LLM call, a unit of work, or a point in time. All three run in
+mutations and in actions.
 
 ```ts
-await langfuse.logSpan(ctx, {
-  traceId,
+await trace.generation(ctx, {
+  key: "llm",
+  name: "answer",
+  startTime,
+  endTime,
+  completionStartTime, // time to first token
+  model: "gpt-5",
+  modelParameters: { temperature: 0.2 },
+  input: messages,
+  output: completion,
+  usage: { input: 120, output: 340, cache_read_input_tokens: 80 },
+  cost: { input: 0.0003, output: 0.0034 },
+  prompt: { name: "support-agent", version: 7 },
+});
+
+await trace.span(ctx, {
+  key: "retrieval",
+  parent: { key: "llm" },
   name: "vector-search",
   input: { query },
   output: { matches },
 });
+
+await trace.event(ctx, { key: "barge-in", name: "user interrupted" });
 ```
 
-### Record a score
+`trace.record` takes several observations of any Langfuse type (`span`,
+`generation`, `event`, `embedding`, `agent`, `tool`, `chain`, `retriever`,
+`guardrail`, `evaluator`) and sends them in as few component calls as the limits
+allow:
 
 ```ts
-export const rate = action({
-  args: { traceId: v.string(), value: v.number() },
-  handler: async (ctx, args) => {
-    await langfuse.recordScore(ctx, {
-      traceId: args.traceId,
-      name: "user-rating",
-      value: args.value, // e.g. 1 for thumbs up, 0 for thumbs down
-    });
-    return null;
-  },
+await trace.record(ctx, [
+  { type: "agent", key: "agent", name: "planner" },
+  { type: "tool", key: "tool:1", parent: { key: "agent" }, name: "search" },
+]);
+```
+
+Every method returns the ids: `{ traceId, observationId }`, or
+`{ traceId, observationIds }` for `record`.
+
+Notes on the fields:
+
+- Times are epoch milliseconds. `startTime` defaults to now, `endTime` to
+  `startTime`.
+- `usage` keys are passed through. Values must be non-negative integers.
+- With `cost` set, Langfuse uses your numbers and infers nothing from the model
+  name. Without it, Langfuse prices the usage from its model table.
+- `prompt` links a generation to a prompt version in Langfuse.
+- `environment` and `release` on the trace override the component's defaults.
+- `experiment` on the trace attaches its observations to a Langfuse experiment
+  run.
+
+## Ids
+
+Seeds and keys make ids deterministic, so a retry or a second writer names the
+same trace and the same observation without a lookup:
+
+- `seed` gives the trace id: the first 32 hex characters of SHA-256 over the
+  seed. This equals `createTraceId(seed)` of the Langfuse SDK, so another
+  service that uses the SDK with the same seed writes into the same trace.
+- `key` gives the observation id: the first 16 hex characters of SHA-256 over
+  `<traceId>:<key>`.
+
+Pass `traceId` or `id` instead when you already hold ids, for example W3C trace
+context from another service. `convex-langfuse/ids` exports `traceIdFromSeed`
+and `observationIdFromKey` without the client, for a service outside Convex.
+
+A key recorded twice gives two rows in Langfuse. Record from an idempotent
+mutation, or put the attempt into the key.
+
+## Content and privacy
+
+```ts
+new Langfuse(components.convexLangfuse, {
+  content: "none",
+  redact: (record) => ({
+    ...record,
+    trace: { ...record.trace, userId: undefined },
+  }),
+  maxFieldBytes: 32_768,
 });
 ```
 
-### Read a trace reactively
+- `content: "full"` exports `input`, `output` and `statusMessage`.
+  `content: "none"` removes them before anything is stored. There is no default:
+  every deployment states its choice.
+- `redact` sees each record before it is serialized. It returns the record to
+  export, or `null` to drop it. Names, tags, metadata and model parameters are
+  yours to project here.
+- `input` and `output` are serialized with sorted keys and cut to
+  `maxFieldBytes` UTF-8 bytes (default 131,072) on a character boundary. A cut
+  value ends with `…[truncated <n> bytes]`.
+- Log lines of the client carry a code and ids, never field content or error
+  text.
+
+The order is fixed: `redact`, content mode, serialization, truncation. Content
+that `redact` or `content: "none"` removes never reaches the outbox, the dead
+letters or Langfuse.
+
+## Errors
+
+With `onError: "log"`, the default, a recording method never throws. It logs
+`[convex-langfuse] <code>` and returns the ids. With `onError: "throw"` it
+throws an `Error` whose message is the code, which rolls back a mutation.
+
+| Code                  | Meaning                                                   | Record sent        |
+| --------------------- | --------------------------------------------------------- | ------------------ |
+| `invalid_id`          | A trace id, observation id, seed or key is invalid        | no                 |
+| `invalid_environment` | The environment name breaks Langfuse's rule               | no                 |
+| `row_too_large`       | The encoded observation exceeds 900 KiB                   | no                 |
+| `redact_failed`       | `redact` threw                                            | no                 |
+| `backlog`             | The outbox is full, see [Delivery](#delivery)             | no                 |
+| `enqueue_failed`      | The component call failed                                 | no                 |
+| `unserializable`      | `input`, `output` or a JSON field cannot be serialized    | without that field |
+| `invalid_metadata`    | A metadata or model-parameter value is not a plain object | without that field |
+| `invalid_usage`       | A usage value is not a non-negative integer               | without that value |
+
+## Delivery
+
+- **At least once.** Langfuse answers 2xx when it queued a batch. An accepted
+  row leaves the outbox. A batch whose answer got lost is sent again with
+  identical bytes and identical ids.
+- **Order.** The exporter sends the oldest rows first. Langfuse places an
+  observation by its ids and timestamps, not by its arrival.
+- **Backoff.** Network errors, timeouts after 20 s, 408, 425, 429 and 5xx back
+  off exponentially up to 5 minutes, or for the `Retry-After` time. 401, 403,
+  404, 405 and redirects count as a configuration problem and back off up to 30
+  minutes.
+- **Rejections.** A 4xx for a batch makes the exporter send its rows one by one.
+  A row rejected alone becomes a dead letter. After 20 consecutive dead letters
+  the exporter treats the rejection as a configuration problem and stops
+  discarding.
+- **Backlog.** Above 25,000 pending observations or 256 MiB of pending payload
+  the component stops accepting. Recording calls then log `backlog` and drop the
+  record. It accepts again below half of both.
+- **Retention.** A pending row older than 72 hours expires. A dead letter is
+  deleted after 7 days.
+
+## Limits
+
+| Limit                                | Value                                  |
+| ------------------------------------ | -------------------------------------- |
+| Encoded observation                  | 900 KiB                                |
+| Observations per component call      | 50, split by the client                |
+| Encoded bytes per component call     | 3 MiB, split by the client             |
+| `input` or `output` after truncation | `maxFieldBytes`, default 131,072 bytes |
+| Spans per export request             | 50                                     |
+| Bytes per export request             | 512 KiB, a larger span goes alone      |
+
+## Operations
+
+`langfuse.health(ctx)` returns the export state for a dashboard or an alert:
 
 ```ts
-export const getTrace = query({
-  args: { traceId: v.string() },
-  handler: async (ctx, args) => langfuse.getTrace(ctx, args),
+export const langfuseHealth = query({
+  args: {},
+  handler: async (ctx) => await langfuse.health(ctx),
 });
-
-export const getObservations = query({
-  args: { traceId: v.string() },
-  handler: async (ctx, args) => langfuse.listObservations(ctx, args),
-});
 ```
 
-## Continuing a Trace
+| Field                                                                                       | Meaning                                                            |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `enabled`                                                                                   | Keys and base URL are set                                          |
+| `accepting`                                                                                 | The backlog gate is open                                           |
+| `pendingAtLeast`, `oldestPendingAt`                                                         | Rows in the outbox, counted up to 1,000, and the age of the oldest |
+| `pendingCounted`                                                                            | Pending rows and bytes as the gate counts them                     |
+| `deadLettersAtLeast`                                                                        | Dead letters, counted up to 1,000                                  |
+| `exporter.backoffUntil`, `exporter.consecutiveFailures`, `exporter.lastError`               | Present while Langfuse fails                                       |
+| `exporter.lastAcceptedAt`, `exporter.accepted`, `exporter.deadLettered`, `exporter.expired` | Progress counters                                                  |
 
-Pass the `traceId` returned from the first call into subsequent `logGeneration()`/`logSpan()` calls to group multiple observations (a retrieval step, then a generation, then a tool call) under one trace in the Langfuse UI:
+Two internal functions help after an incident. Run them from the dashboard or
+the CLI:
 
-```ts
-const { traceId } = await langfuse.logSpan(ctx, { name: "retrieve-context", ... });
-await langfuse.logGeneration(ctx, { traceId, name: "generate-answer", ... });
+```bash
+# Clear a backoff and start the exporter now, for example after fixing the keys.
+npx convex run --component convexLangfuse exporter:kick
+
+# Move up to 500 dead letters back to the outbox.
+npx convex run --component convexLangfuse outbox:retryDeadLetters '{"limit": 100}'
 ```
-
-## API Reference
-
-| Method | Kind | Description |
-| --- | --- | --- |
-| `logGeneration(ctx, args)` | action | Exports a completed LLM call as a Langfuse generation |
-| `logSpan(ctx, args)` | action | Exports a completed non-LLM step as a Langfuse span |
-| `recordScore(ctx, args)` | action | Attaches an evaluation/rating score to a trace |
-| `getTrace(ctx, args)` | query | Fetch one trace by id |
-| `listTracesByUser(ctx, args)` | query | List a user's traces, newest first |
-| `listTracesBySession(ctx, args)` | query | List a session's traces, newest first |
-| `listObservations(ctx, args)` | query | List a trace's observations, oldest first |
-| `listScores(ctx, args)` | query | List a trace's scores |
-| `listRecentTraces(ctx, args?)` | query | Every trace, newest first, regardless of user/session — for a history view or dashboard |
-| `getStats(ctx)` | query | Aggregate trace/observation/score counts for a small dashboard |
-
-## Type Reference
-
-```ts
-type LogObservationArgs = {
-  traceId?: string;       // omit to start a new trace
-  traceName?: string;
-  userId?: string;
-  sessionId?: string;
-  tags?: string[];
-  release?: string;
-  traceMetadata?: Record<string, unknown>;
-
-  name: string;
-  input?: unknown;
-  output?: unknown;
-  model?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  level?: "DEBUG" | "DEFAULT" | "WARNING" | "ERROR";
-  statusMessage?: string;
-  metadata?: Record<string, unknown>;
-  startTime?: number;      // ms epoch, defaults to now
-  endTime?: number;        // ms epoch, defaults to startTime
-};
-
-type Trace = {
-  traceId: string;
-  name: string;
-  userId?: string;
-  sessionId?: string;
-  tags?: string[];
-  metadata?: string;
-  release?: string;
-};
-
-type Observation = {
-  observationId: string;
-  traceId: string;
-  type: "span" | "generation" | "event" | "embedding" | "agent" | "tool"
-      | "chain" | "retriever" | "guardrail" | "evaluator";
-  name: string;
-  input?: string;
-  output?: string;
-  model?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  level: "DEBUG" | "DEFAULT" | "WARNING" | "ERROR";
-  statusMessage?: string;
-  metadata?: string;
-  startedAt: number;
-  endedAt: number;
-};
-
-type Score = {
-  scoreId: string;
-  traceId: string;
-  name: string;
-  value: number;
-  comment?: string;
-};
-```
-
-## Database Schema
-
-```ts
-traces: {
-  traceId, name, userId?, sessionId?, tags?, metadata?, release?,
-  createdAt, updatedAt,
-}
-
-observations: {
-  observationId, traceId, type, name, input?, output?, model?,
-  inputTokens?, outputTokens?, level, statusMessage?, metadata?,
-  startedAt, endedAt, createdAt,
-}
-
-scores: {
-  scoreId, traceId, name, value, comment?, createdAt,
-}
-```
-
-`listRecentTraces()` and `getStats()` read across these tables directly with a full scan — fine for a history view or small dashboard, not intended as a high-volume production query path.
 
 ## Testing
 
-```bash
-npm run test
+With [`convex-test`](https://www.npmjs.com/package/convex-test), register the
+component and its child component in one call:
+
+```ts
+import { convexTest } from "convex-test";
+import { register } from "convex-langfuse/test";
+import schema from "./schema";
+
+const modules = import.meta.glob("./**/*.ts");
+
+test("saves the answer and enqueues a generation", async () => {
+  const t = convexTest(schema, modules);
+  register(t);
+  // ...
+});
 ```
 
-Component logic is tested with [`convex-test`](https://www.npmjs.com/package/convex-test) in `src/component/lib.test.ts`. Import `convex-langfuse/test` in your own app to register this component's schema against your test instance.
+Without Langfuse settings in the test environment, recording calls write
+nothing.
 
-## Example App
+## Example app
 
-`example/` is a full Vite + React demo that exercises the entire component end to end against your own Langfuse account:
-
-- **Log a generation** — simulate a finished chat completion (model, prompt, completion, token counts, tags) and export it as a Langfuse generation.
-- **Continue the trace** — attach a non-LLM step (a retrieval, a tool call, a guardrail check) to the same trace via `logSpan()`.
-- **Rate the response** — attach a 👍/👎 `recordScore()` call, with an optional comment.
-- **Trace explorer** — look up any trace by id, or browse the traces recorded for a given user/session, all reactive.
-- **History** — every trace ever recorded in the deployment, newest first, independent of the browser-local demo identity that resets on reload. Expand a trace to see its full generation/step/score detail, and hit **Replay this** to recreate the whole scenario as a brand-new trace live, without retyping anything — useful for anyone poking at the demo who wants to see the flow without filling out forms themselves.
-- **Activity console** — a side-docked live log of every call this app makes into the Langfuse client. Since Langfuse ingestion is one-way (no webhooks call back into Convex), this is the closest thing to a live feed the example has.
-
-Run it from the repo root:
+`example/` is a Vite and React app that records into your own Langfuse project.
+It saves a chat completion and its generation in one mutation, nests a step
+under it, and shows the outbox state live.
 
 ```bash
-npm install --legacy-peer-deps
-npx convex env set LANGFUSE_PUBLIC_KEY pk-lf-xxxxxxxxxxxx
-npx convex env set LANGFUSE_SECRET_KEY sk-lf-xxxxxxxxxxxx
+npm install
+npx convex env set LANGFUSE_PUBLIC_KEY pk-lf-...
+npx convex env set LANGFUSE_SECRET_KEY sk-lf-...
+npx convex env set LANGFUSE_BASE_URL https://cloud.langfuse.com
 npm run dev
 ```
 
-`npm run dev` starts the Convex backend and the Vite frontend together — there's no need to `cd example` or run either one separately.
+## License
 
-## Limitations
+Apache-2.0. Based on
+[convex-langfuse](https://github.com/sholajegede/convex-langfuse) by Shola
+Jegede. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
 
-- No live/streaming spans — each call exports one already-finished observation. For a call you want to see "in progress," log it once it completes rather than trying to open and later close a span.
-- Trace-level fields (`userId`, `sessionId`, `tags`, `metadata`) are attached to every span you log under that trace, per Langfuse's own OTel guidance for filterable trace attributes — there's no separate "create trace" call.
-- This component does not vendor the Langfuse SDK or an OpenTelemetry SDK; it constructs minimal OTLP/HTTP JSON payloads directly, which keeps it dependency-free but means it only covers the attributes this README documents.
-
-## Troubleshooting
-
-**Nothing shows up in the Langfuse UI** — confirm `baseUrl` matches your project's region (EU, US, JP, HIPAA, or your self-hosted URL) and that the OTLP endpoint isn't blocked by a firewall between Convex and Langfuse.
-
-**401 from Langfuse** — `publicKey`/`secretKey` are combined into a Basic auth header; confirm both are set and belong to the same project.
-
-**Generation shows no cost/usage** — cost is computed by Langfuse from `inputTokens`/`outputTokens` and the model's pricing table; confirm `model` matches a model name Langfuse recognizes for your provider.
-
-## Contributing
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
-
-## Changelog
-
-See [CHANGELOG.md](./CHANGELOG.md).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and [CHANGELOG.md](./CHANGELOG.md).
