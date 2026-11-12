@@ -29,11 +29,12 @@
 // spans as observations (`GET /v2/observations?traceId=`) and experiment items
 // (`GET /experiment-items?fromStartTime=`), and prompts (`POST /v2/prompts`,
 // `GET /v2/prompts?name=`, `GET /v2/prompts/{name}?label=|version=`, `DELETE
-// /v2/prompts/{name}`, without references). `POST /control/prompts` with `{
-// name, prompt, labels }` adds the next text version of a prompt and moves the
-// labels to it. After `POST /control/webhook` with `{ url, secret }`, every
-// created prompt version is posted to `url` as a signed `prompt-version`
-// event.
+// /v2/prompts/{name}`, without references). Every prompt `GET` is logged in
+// `stats.promptRequests` with its route, prompt name and arrival time. `POST
+// /control/prompts` with `{ name, prompt, labels }` adds the next text version
+// of a prompt, moves the labels to it and answers `{ version, createdAt }`.
+// After `POST /control/webhook` with `{ url, secret }`, every created prompt
+// version is posted to `url` as a signed `prompt-version` event.
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -61,6 +62,11 @@ const stats = {
   faults: { 500: 0, 429: 0, delay: 0 },
   /** Public API requests by `<method> <route>`. */
   api: {},
+  /**
+   * Every prompt `GET` in arrival order: `<method> <route>` as in `api`, the
+   * prompt name (`null` for a listing without `name`) and the arrival time.
+   */
+  promptRequests: [],
 };
 
 /** Score id to the stored score. */
@@ -371,6 +377,16 @@ async function publicApi(req, res, url) {
     .replace(/^\/scores\/.+/, "/scores/{id}")
     .replace(/^\/v2\/prompts\/.+/, "/v2/prompts/{name}")}`;
   stats.api[key] = (stats.api[key] ?? 0) + 1;
+  if (req.method === "GET" && route.startsWith("/v2/prompts")) {
+    stats.promptRequests.push({
+      route: key,
+      name:
+        route === "/v2/prompts"
+          ? url.searchParams.get("name")
+          : decodeURIComponent(route.slice("/v2/prompts/".length)),
+      at: Date.now(),
+    });
+  }
   if (req.method === "POST" && route === "/scores") {
     const body = JSON.parse(await readBody(req));
     if (!validScore(body)) return json(res, 400, { message: "invalid" });
@@ -569,7 +585,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/control/prompts") {
       const { version } = addPrompt(JSON.parse(await readBody(req)));
-      return json(res, 200, { version });
+      return json(res, 200, { version, createdAt: Date.now() });
     }
     if (req.method === "POST" && url.pathname === "/control/webhook") {
       webhook = JSON.parse(await readBody(req));

@@ -255,13 +255,18 @@ export async function startFake() {
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
     },
-    /** Adds the next text version of a prompt with `labels`. */
+    /**
+     * Adds the next text version of a prompt with `labels`. Returns `{
+     * version, createdAt }`, the version's number and the fake's time once
+     * the version exists.
+     */
     async addPrompt(prompt) {
       const response = await fetch(`${url}/control/prompts`, {
         method: "POST",
         body: JSON.stringify(prompt),
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
+      return await response.json();
     },
     async stats() {
       return await (await fetch(`${url}/stats`)).json();

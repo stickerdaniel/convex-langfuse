@@ -1,14 +1,16 @@
-// Load, outage and threshold drivers on the pinned local backend.
+// Load, outage, threshold and prompt refresh drivers on the pinned local
+// backend.
 //
 //   npm run build && npm run test:load
-//   node integration/load.mjs [load | outage | threshold [--kill]] [--out results.json]
+//   node integration/load.mjs [load | outage | threshold [--kill] | prompts] [--out results.json]
 //
-// Without a driver name it runs `load`, `outage`, `threshold` and
-// `threshold --kill` in that order. Every driver starts its own backends and
-// fake endpoints on free ports, deploys the host app in `integration/convex`,
-// prints a result table, and stops what it started. `--out` writes every
-// result as JSON. The script exits non-zero when a bound fails. It runs for
-// tens of minutes and is not part of CI or `npm run test:integration`.
+// Without a driver name it runs `load`, `outage`, `threshold`,
+// `threshold --kill` and `prompts` in that order. Every driver starts its own
+// backends and fake endpoints on free ports, deploys the host app in
+// `integration/convex`, prints a result table, and stops what it started.
+// `--out` writes every result as JSON. The script exits non-zero when a bound
+// fails. It runs for tens of minutes and is not part of CI or
+// `npm run test:integration`.
 //
 // - `load`: 53,000 spans in 53 bursts of 1,000 while the fake endpoint
 //   answers 5 % of the export requests with 500, 1 % with 429 and delays 1 %
@@ -26,6 +28,13 @@
 //   backlog must drain and a new record must be enqueued. With `--kill`, the
 //   backend is killed while the first export request is in flight and
 //   restarted before the records are offered.
+// - `prompts`: 500 prompt names, the most the cache tracks, cached at version
+//   1 through `prompts.sync`, then moved to version 2 on the fake endpoint
+//   without a webhook. It waits for real cron ticks, so it runs for about 20
+//   minutes. Every name must return version 2 within 25 minutes after that
+//   version exists, the first and the last refresh of the tick must start 99 s
+//   to 130 s apart, and no `prompts:*` execution may fail. The per-name times
+//   are kept in `prompts.json` of the diagnostics folder.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -734,6 +743,180 @@ async function thresholdDriver(binary, { kill }) {
   }
 }
 
+// ── prompts ────────────────────────────────────────────────────────────────
+
+/** As many names as the cache tracks, `MAX_PROMPT_NAMES`. */
+const PROMPT_NAMES = Array.from(
+  { length: 500 },
+  (_, i) => `load/prompt-${String(i).padStart(3, "0")}`,
+);
+/**
+ * Each name returns version 2 within this time after it exists: 13 min until
+ * the name is due, at most 5 min to the next tick, 99.8 s of spacing, and the
+ * rest for the refreshes themselves.
+ */
+const APPLY_BOUND_MS = 25 * 60_000;
+/** The spacing of 499 × 200 ms plus the scheduler's delay. */
+const START_SPAN_MS = { min: 99_000, max: 130_000 };
+/** Names per `promptVersions` query. */
+const VERSION_QUERY_NAMES = 50;
+/** The listing of one name, the first request of every refresh. */
+const REFRESH_START = "GET /v2/prompts";
+const PROMPT_FUNCTION = /^prompts(\.js)?:/;
+
+/** A text prompt of 300 bytes. */
+const promptText = (name, version) =>
+  `You answer for ${name}, version ${version}. `.padEnd(
+    300,
+    "Cite the context and keep it short. ",
+  );
+
+async function promptsDriver(binary) {
+  const env = await setup(binary);
+  const { client, fake } = env;
+  const chunks = [];
+  for (let i = 0; i < PROMPT_NAMES.length; i += VERSION_QUERY_NAMES) {
+    chunks.push(PROMPT_NAMES.slice(i, i + VERSION_QUERY_NAMES));
+  }
+  /** The cached `production` version of every name, `null` on a miss. */
+  const cachedVersions = async () =>
+    (
+      await Promise.all(
+        chunks.map((names) => client.query(api.promptVersions, { names })),
+      )
+    ).flat();
+  const addVersion = (name, version) =>
+    fake.addPrompt({
+      name,
+      prompt: promptText(name, version),
+      labels: ["production"],
+    });
+  /** Per name: when version 2 existed, its refresh started and it applied. */
+  const records = PROMPT_NAMES.map((name) => ({ name }));
+  try {
+    await pool(PROMPT_NAMES.length, 10, (i) => addVersion(PROMPT_NAMES[i], 1));
+    const syncedFrom = Date.now();
+    const sync = await client.action(api.syncPrompts, {});
+    if (sync.status !== "ok" || sync.tracked !== PROMPT_NAMES.length) {
+      throw new Error(`prompts.sync returned ${JSON.stringify(sync)}`);
+    }
+    await waitFor(
+      "every name cached at version 1",
+      async () =>
+        (await client.query(api.promptHealth, {})).tracked ===
+          PROMPT_NAMES.length &&
+        (await cachedVersions()).every((version) => version === 1),
+      10 * 60_000,
+      1_000,
+    );
+    const syncedAt = Date.now();
+    const syncRequests = (await fake.stats()).promptRequests.length;
+    console.log(
+      `${PROMPT_NAMES.length} names cached at version 1 after ` +
+        `${seconds(syncedAt - syncedFrom)} s; waiting about 20 min for the tick`,
+    );
+
+    // Version 2 of every name, without a webhook: only the tick refreshes.
+    await pool(PROMPT_NAMES.length, 10, async (i) => {
+      records[i].createdAt = (await addVersion(PROMPT_NAMES[i], 2)).createdAt;
+    });
+    const deadline =
+      Math.max(...records.map((r) => r.createdAt)) + APPLY_BOUND_MS;
+    while (
+      records.some((r) => r.appliedAt === undefined) &&
+      Date.now() <= deadline
+    ) {
+      const versions = await cachedVersions();
+      const at = Date.now();
+      versions.forEach((version, i) => {
+        if (version === 2) records[i].appliedAt ??= at;
+      });
+      await sleep(1_000);
+    }
+    const stoppedAt = Date.now();
+
+    const byName = new Map(records.map((r) => [r.name, r]));
+    let refreshRequests = 0;
+    for (const request of (await fake.stats()).promptRequests) {
+      const record = byName.get(request.name);
+      if (request.route !== REFRESH_START || !record) continue;
+      if (request.at < record.createdAt) continue;
+      refreshRequests += 1;
+      record.refreshAt ??= request.at;
+    }
+    const starts = records.flatMap((r) => r.refreshAt ?? []);
+    const applied = records.flatMap((r) => r.appliedAt ?? []);
+    const firstStart = starts.length > 0 ? Math.min(...starts) : undefined;
+    const span =
+      firstStart === undefined ? undefined : Math.max(...starts) - firstStart;
+    const notApplied = records.filter((r) => r.appliedAt === undefined);
+    // A name not applied reached at least its age when the driver stopped.
+    const maxAge = Math.max(
+      ...records.map((r) => (r.appliedAt ?? stoppedAt) - r.createdAt),
+    );
+    const promptRuns = (await env.executions()).filter((log) =>
+      PROMPT_FUNCTION.test(log.identifier),
+    );
+    const failed = promptRuns
+      .filter((log) => log.error)
+      .map(
+        (log) =>
+          `${log.identifier}: ${String(log.error).split("\n")[0].slice(0, 160)}`,
+      );
+    const refreshRuns = promptRuns.filter((log) =>
+      /:refresh$/.test(log.identifier),
+    ).length;
+    writeFileSync(join(env.stateDir, "prompts.json"), JSON.stringify(records));
+    return {
+      diagnostics: env.stateDir,
+      metrics: {
+        names: PROMPT_NAMES.length,
+        syncSeconds: seconds(syncedAt - syncedFrom),
+        syncRequests,
+        tickAt:
+          firstStart === undefined ? null : new Date(firstStart).toISOString(),
+        tickAfterSyncSeconds:
+          firstStart === undefined ? null : seconds(firstStart - syncedFrom),
+        refreshRequests,
+        startSpanSeconds: span === undefined ? null : seconds(span),
+        lastAppliedSeconds:
+          firstStart === undefined || applied.length === 0
+            ? null
+            : seconds(Math.max(...applied) - firstStart),
+        maxAgeSeconds: seconds(maxAge),
+        notApplied: notApplied.length,
+        failedPromptExecutions: failed.length,
+      },
+      checks: [
+        check(
+          "every name applied within 25 min of version 2",
+          notApplied.length === 0 && maxAge <= APPLY_BOUND_MS,
+          `${notApplied.length} not applied` +
+            (notApplied[0] ? `, first ${notApplied[0].name}` : "") +
+            `, largest age ${seconds(maxAge)} s`,
+        ),
+        check(
+          "refresh starts span 99 s to 130 s",
+          span !== undefined &&
+            span >= START_SPAN_MS.min &&
+            span <= START_SPAN_MS.max,
+          span === undefined
+            ? "no refresh started"
+            : `${seconds(span)} s over ${starts.length} names`,
+        ),
+        check(
+          "no failed prompts:* execution",
+          failed.length === 0 && refreshRuns > 0,
+          failed[0] ??
+            `${promptRuns.length} executions logged, ${refreshRuns} refreshes`,
+        ),
+      ],
+    };
+  } finally {
+    await env.teardown();
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 const { values: options, positionals } = parseArgs({
@@ -749,12 +932,15 @@ const DRIVERS = {
   outage: (binary) => outageDriver(binary),
   threshold: (binary) => thresholdDriver(binary, { kill: false }),
   "threshold --kill": (binary) => thresholdDriver(binary, { kill: true }),
+  prompts: (binary) => promptsDriver(binary),
 };
 
 async function main() {
   const [name] = positionals;
   if (name !== undefined && !(name in DRIVERS)) {
-    throw new Error(`unknown driver ${name}; use load, outage or threshold`);
+    throw new Error(
+      `unknown driver ${name}; use load, outage, threshold or prompts`,
+    );
   }
   const selected =
     name === undefined

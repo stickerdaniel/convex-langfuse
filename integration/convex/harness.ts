@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import { Langfuse } from "convex-langfuse";
 import { components } from "./_generated/api";
-import { mutation, query } from "./_generated/server";
+import { action, mutation, query } from "./_generated/server";
 
 /** Throws on every failure, so a mutation that did not enqueue fails. */
 const strict = new Langfuse(components.convexLangfuse, {
@@ -111,6 +111,47 @@ export const prompt = query({
       text:
         cached.type === "text" ? cached.prompt : JSON.stringify(cached.prompt),
     };
+  },
+});
+
+/** Tracks every prompt the endpoint lists, as `prompts.sync` does. */
+export const syncPrompts = action({
+  args: {},
+  returns: v.object({
+    status: v.union(
+      v.literal("ok"),
+      v.literal("incomplete"),
+      v.literal("disabled"),
+    ),
+    tracked: v.number(),
+    overflow: v.number(),
+  }),
+  handler: async (ctx) => await strict.prompts.sync(ctx),
+});
+
+/**
+ * The cached `production` version of each name, in order, `null` on a miss.
+ * The component calls run one at a time.
+ */
+export const promptVersions = query({
+  args: { names: v.array(v.string()) },
+  returns: v.array(v.union(v.number(), v.null())),
+  handler: async (ctx, { names }) => {
+    const versions: (number | null)[] = [];
+    for (const name of names) {
+      versions.push((await strict.prompts.get(ctx, { name }))?.version ?? null);
+    }
+    return versions;
+  },
+});
+
+/** The prompt part of the component's health. */
+export const promptHealth = query({
+  args: {},
+  returns: v.object({ tracked: v.number(), errors: v.number() }),
+  handler: async (ctx) => {
+    const { tracked, errors } = (await strict.health(ctx)).prompts;
+    return { tracked, errors };
   },
 });
 
