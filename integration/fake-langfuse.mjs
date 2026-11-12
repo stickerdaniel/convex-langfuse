@@ -90,7 +90,10 @@ const stats = {
 /** Score id to the stored score. */
 const scores = new Map();
 const configs = [];
-/** Trace id to its received spans, by span id; the last delivery wins. */
+/**
+ * Trace id to its spans from requests answered with a 2xx, by span id; the
+ * last accepted delivery wins.
+ */
 const observations = new Map();
 /** Prompt name to its versions: `{ version, type, prompt, config, labels }`. */
 const prompts = new Map();
@@ -245,15 +248,18 @@ function logRequest(body) {
 }
 
 /**
- * Records one request and returns its entry in `stats.log`. The hash kept
- * per span id covers the bytes of that span object only. Resource and scope
- * are built per request, so they are not part of it.
+ * Records one request as an attempt. Returns its entry in `stats.log` and
+ * `accept`, which the route calls when it answers with a 2xx: only then the
+ * spans count as accepted and can be read back as observations. The hash
+ * kept per span id covers the bytes of that span object only. Resource and
+ * scope are built per request, so they are not part of it.
  */
 function recordSpans(body) {
   const parsed = JSON.parse(body);
   const raw = rawSpans(body);
   let next = 0;
   const entry = logRequest(body);
+  const received = [];
   for (const resource of parsed.resourceSpans) {
     const resourceAttributes = attributeMap(resource.resource?.attributes);
     for (const scope of resource.scopeSpans) {
@@ -261,16 +267,19 @@ function recordSpans(body) {
         const hash = createHash("sha256").update(raw[next++]).digest("hex");
         (stats.spans[span.spanId] ??= []).push(hash);
         entry.spanIds.push(span.spanId);
-        if (!observations.has(span.traceId)) {
-          observations.set(span.traceId, new Map());
-        }
-        observations
-          .get(span.traceId)
-          .set(span.spanId, { span, scope: scope.scope, resourceAttributes });
+        received.push({ span, scope: scope.scope, resourceAttributes });
       }
     }
   }
-  return entry;
+  const accept = () => {
+    for (const observation of received) {
+      const { traceId, spanId } = observation.span;
+      stats.accepted[spanId] = (stats.accepted[spanId] ?? 0) + 1;
+      if (!observations.has(traceId)) observations.set(traceId, new Map());
+      observations.get(traceId).set(spanId, observation);
+    }
+  };
+  return { entry, accept };
 }
 
 /** OTLP attributes as a plain object of their values. */
@@ -707,14 +716,10 @@ const server = createServer(async (req, res) => {
       logRequest(await readBody(req)).status = 400;
       return json(res, 400, { error: "Invalid content type" });
     }
-    const entry = recordSpans(await readBody(req));
+    const { entry, accept } = recordSpans(await readBody(req));
     const answer = (status, headers) => {
       entry.status = status;
-      if (status >= 200 && status < 300) {
-        for (const id of entry.spanIds) {
-          stats.accepted[id] = (stats.accepted[id] ?? 0) + 1;
-        }
-      }
+      if (status >= 200 && status < 300) accept();
       json(res, status, {}, headers);
     };
     if (mode.mode === "status") return answer(mode.status);
