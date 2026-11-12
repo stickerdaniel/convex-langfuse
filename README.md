@@ -344,9 +344,9 @@ export const supportPrompt = query({
 ```
 
 `get` takes a `label`, `production` by default, or a `version`. A version is
-served while a label or a pin holds it, as the last refresh resolved it. `get`
-returns `null` on a miss. Called from a query it is reactive: the query reruns
-when the label moves.
+served as the last refresh resolved it, while a label or a pin still holds that
+snapshot. `get` returns `null` on a miss. Called from a query it is reactive:
+the query reruns when the label moves.
 
 Pin a prompt for a conversation, so every turn uses the same bytes:
 
@@ -378,8 +378,9 @@ await trace.generation(ctx, {
 - Equal `snapshotId` values mean equal bytes.
 - The component does not compile templates. Fill the variables of `prompt` at
   the call site.
-- A prompt name has at most 256 bytes. `get` returns `null` for a longer one,
-  `pin` and `sync` throw `invalid_prompt_name`. A name, label or scope that
+- A prompt name and a scope have at most 256 bytes each. `get` returns `null`
+  for a longer name, `pin` and `sync` throw `invalid_prompt_name`, and `pin`
+  throws `invalid_prompt_scope` for a longer scope. A name, label or scope that
   holds a lone surrogate throws `invalid_prompt_name`, `invalid_prompt_selector`
   or `invalid_prompt_scope` as a `ConvexError`.
 
@@ -526,9 +527,9 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Trace ids per deletion request                    | 100, split by the client               |
 | Pending deletion requests, rejected ones included | 1,000                                  |
 | Cached prompt names                               | 500                                    |
-| Prompt name                                       | 256 bytes                              |
+| Prompt name, pin scope                            | 256 bytes each                         |
 | Labels per prompt name                            | 50                                     |
-| Prompt snapshot                                   | 900 KiB                                |
+| Prompt snapshot                                   | 900 KiB, from a response of 2 MiB      |
 
 ## Operations
 
