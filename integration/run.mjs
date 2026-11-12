@@ -803,92 +803,64 @@ async function main() {
       return "the span arrived with U+FFFD in place of the lone surrogate";
     });
 
-    await runCase(
-      "11 a listing of several pages while refreshes run",
-      async () => {
-        // Each listing page reserves its 100 names and starts their refreshes.
-        // The backend runs 8 scheduled functions at a time and the fake holds
-        // every prompt for 150 ms, so the refreshes of the first page write
-        // their rows for about 2 s, longer than a mutation retries a write
-        // conflict, while the next pages are reserved.
-        const names = Array.from(
-          { length: 450 },
-          (_, i) => `integration/listed-${String(i).padStart(3, "0")}`,
-        );
-        for (let i = 0; i < names.length; i += 25) {
-          await Promise.all(
-            names.slice(i, i + 25).map((name) =>
-              fake.addPrompt({
-                name,
-                prompt: `Hello ${name}`,
-                labels: ["production"],
-              }),
+    /** Adds a text prompt with the `production` label for each name. */
+    const addPrompts = async (names) => {
+      for (let i = 0; i < names.length; i += 25) {
+        await Promise.all(
+          names
+            .slice(i, i + 25)
+            .map((name) =>
+              fake.addPrompt({ name, prompt: "Hello", labels: ["production"] }),
             ),
-          );
-        }
-        const cachedVersions = async () => {
-          const versions = [];
-          for (let i = 0; i < names.length; i += 50) {
-            versions.push(
-              ...(await client.query(api.promptVersions, {
-                names: names.slice(i, i + 50),
-              })),
-            );
-          }
-          return versions;
-        };
-        await fake.holdPrompts(150);
-        let sync;
-        try {
-          sync = await client.action(api.syncPrompts, {});
-          if (sync.status !== "ok" || sync.tracked < names.length) {
-            throw new Error(`prompts.sync returned ${JSON.stringify(sync)}`);
-          }
-          await waitFor(
-            "every listed name in the cache",
-            async () => (await cachedVersions()).every((v) => v === 1),
-            120_000,
-            1_000,
-          );
-        } finally {
-          await fake.holdPrompts(0);
-        }
-        return `prompts.sync tracked ${sync.tracked} names, each cached at version 1`;
-      },
-    );
+        );
+      }
+    };
+    /** The cached `production` version of each name, `null` on a miss. */
+    const cachedVersions = async (names) => {
+      const versions = [];
+      for (let i = 0; i < names.length; i += 50) {
+        versions.push(
+          ...(await client.query(api.promptVersions, {
+            names: names.slice(i, i + 50),
+          })),
+        );
+      }
+      return versions;
+    };
+    const promptNames = (prefix, count) =>
+      Array.from(
+        { length: count },
+        (_, i) => `integration/${prefix}-${String(i).padStart(3, "0")}`,
+      );
+    /** The first line of each failed execution, without those of `allowed`. */
+    const failedExecutions = (executions, allowed = /^$/) =>
+      executions
+        .filter((log) => log.error && !allowed.test(log.identifier))
+        .map(
+          (log) =>
+            `${log.identifier}: ${String(log.error).split("\n")[0].slice(0, 160)}`,
+        );
 
+    // The cache tracks 500 names. Case 11 ends with 41 and case 12 with 491.
     await runCase(
-      "12 a batch of deleted prompts leaves the cache",
+      "11 deleted prompts leave the cache while names are reserved",
       async ({ finish }) => {
         // The refreshes of 100 names start at once, 8 at a time. Each finds
-        // its prompt gone and stops tracking its name.
-        const names = Array.from(
-          { length: 100 },
-          (_, i) => `integration/gone-${String(i).padStart(3, "0")}`,
-        );
-        await Promise.all(
-          names.map((name) =>
-            fake.addPrompt({ name, prompt: "Hello", labels: ["production"] }),
-          ),
-        );
-        const versions = async () => [
-          ...(await client.query(api.promptVersions, {
-            names: names.slice(0, 50),
-          })),
-          ...(await client.query(api.promptVersions, {
-            names: names.slice(50),
-          })),
-        ];
-        await client.action(api.syncPrompts, { names });
+        // its prompt gone and stops tracking its name, while a reservation of
+        // 40 new names counts the tracked names.
+        const gone = promptNames("gone", 100);
+        const fresh = promptNames("fresh", 40);
+        await addPrompts([...gone, ...fresh]);
+        await client.action(api.syncPrompts, { names: gone });
         await waitFor(
           "every name in the cache",
-          async () => (await versions()).every((v) => v === 1),
+          async () => (await cachedVersions(gone)).every((v) => v === 1),
           60_000,
           500,
         );
         const { tracked } = await client.query(api.promptHealth, {});
         const authorization = `Basic ${btoa("pk-lf-integration:sk-lf-integration")}`;
-        for (const name of names) {
+        for (const name of gone) {
           const response = await fetch(
             `${fake.url}/api/public/v2/prompts/${encodeURIComponent(name)}`,
             { method: "DELETE", headers: { authorization } },
@@ -899,24 +871,97 @@ async function main() {
             );
           }
         }
-        await client.action(api.syncPrompts, { names });
+        const [, added] = await Promise.all([
+          client.action(api.syncPrompts, { names: gone }),
+          client.action(api.syncPrompts, { names: fresh }),
+        ]);
+        if (added.tracked !== fresh.length || added.overflow !== 0) {
+          throw new Error(`prompts.sync returned ${JSON.stringify(added)}`);
+        }
         await waitFor(
-          "every name out of the cache",
+          "the deleted names out of the cache and the new ones in it",
           async () =>
             (await client.query(api.promptHealth, {})).tracked ===
-              tracked - names.length &&
-            (await versions()).every((v) => v === null),
+              tracked - gone.length + fresh.length &&
+            (await cachedVersions(gone)).every((v) => v === null) &&
+            (await cachedVersions(fresh)).every((v) => v === 1),
           60_000,
           500,
         );
-        const failed = (await finish()).filter((log) => log.error);
+        // `sync` runs a reservation again when it lost to the refreshes; that
+        // failed attempt is logged and is no failure of the case.
+        const executions = await finish();
+        const failed = failedExecutions(executions, /^prompts(\.js)?:request$/);
         if (failed.length > 0) {
           throw new Error(
-            `${failed.length} failed executions, first ${failed[0].identifier}: ` +
-              String(failed[0].error).split("\n")[0].slice(0, 160),
+            `${failed.length} failed executions, first ${failed[0]}`,
           );
         }
-        return `${names.length} names tracked, deleted at the endpoint and no longer tracked`;
+        const retried = failedExecutions(executions).length;
+        return (
+          `${gone.length} deleted names no longer tracked, ${fresh.length} new ` +
+          `names cached, ${retried} reservations run again`
+        );
+      },
+    );
+
+    await runCase(
+      "12 new names are reserved while refreshes run",
+      async ({ finish }) => {
+        // 300 refreshes run 8 at a time and the fake holds each prompt for
+        // 80 ms, so they write their `promptNames` rows for 3 s or longer, more
+        // than a mutation retries a write conflict. A reservation of 150 new
+        // names in that time counts the tracked names. It must not read the
+        // rows the refreshes write.
+        const running = promptNames("running", 300);
+        const added = promptNames("added", 150);
+        await addPrompts([...running, ...added]);
+        const fetchedBefore =
+          (await fake.stats()).api["GET /v2/prompts/{name}"] ?? 0;
+        await fake.holdPrompts(80);
+        let stillRunning;
+        try {
+          await client.action(api.syncPrompts, { names: running });
+          await waitFor(
+            "the first refreshes to write",
+            async () =>
+              ((await fake.stats()).api["GET /v2/prompts/{name}"] ?? 0) >=
+              fetchedBefore + 16,
+            30_000,
+            50,
+          );
+          const sync = await client.action(api.syncPrompts, { names: added });
+          if (sync.tracked !== added.length || sync.overflow !== 0) {
+            throw new Error(`prompts.sync returned ${JSON.stringify(sync)}`);
+          }
+          stillRunning = (await cachedVersions(running)).filter(
+            (v) => v === null,
+          ).length;
+          await waitFor(
+            "every name in the cache",
+            async () =>
+              (await cachedVersions([...running, ...added])).every(
+                (v) => v === 1,
+              ),
+            120_000,
+            1_000,
+          );
+        } finally {
+          await fake.holdPrompts(0);
+        }
+        const failed = failedExecutions(await finish());
+        if (failed.length > 0) {
+          throw new Error(
+            `${failed.length} failed executions, first ${failed[0]}`,
+          );
+        }
+        if (stillRunning === 0) {
+          throw new Error("the reservation came after the refreshes had ended");
+        }
+        return (
+          `${added.length} names reserved while ${stillRunning} of ` +
+          `${running.length} refreshes had not published; all cached`
+        );
       },
     );
 
