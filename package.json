@@ -38,11 +38,13 @@
     "test:watch": "vitest --typecheck --clearScreen false",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:coverage": "vitest run --coverage --coverage.reporter=text",
+    "test:integration": "node integration/run.mjs",
     "preversion": "npm install --legacy-peer-deps && npm run build:clean && run-p test lint typecheck",
+    "prepack": "node scripts/sync-version.mjs && npm run build",
     "prepublishOnly": "npm whoami || npm login",
     "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
     "release": "npm version patch && npm publish && git push --follow-tags",
-    "version": "vim -c 'normal o' -c 'normal o## '$npm_package_version CHANGELOG.md && prettier -w CHANGELOG.md && git add CHANGELOG.md"
+    "version": "node scripts/sync-version.mjs && git add src/shared/version.ts && vim -c 'normal o' -c 'normal o## '$npm_package_version CHANGELOG.md && prettier -w CHANGELOG.md && git add CHANGELOG.md"
   },
   "files": [
     "dist",
@@ -76,7 +78,7 @@
     }
   },
   "peerDependencies": {
-    "convex": "^1.43.0"
+    "convex": "^1.47.0"
   },
   "devDependencies": {
     "@convex-dev/eslint-plugin": "^5.0.1",
@@ -110,5 +112,8 @@
     "vitest": "4.1.0"
   },
   "types": "./dist/client/index.d.ts",
-  "module": "./dist/client/index.js"
+  "module": "./dist/client/index.js",
+  "dependencies": {
+    "@convex-dev/batch-worker": "^0.3.6"
+  }
 }

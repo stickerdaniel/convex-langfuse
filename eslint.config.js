@@ -34,6 +34,13 @@ export default [
   },
   pluginJs.configs.recommended,
   ...tseslint.configs.recommended,
+  // Integration harness and maintenance scripts - Node environment
+  {
+    files: ["integration/**/*.mjs", "scripts/**/*.mjs"],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
   // Convex code - Worker environment
   {
     files: ["src/**/*.{ts,tsx}", "example/convex/**/*.{ts,tsx}"],
