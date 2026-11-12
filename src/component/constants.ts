@@ -150,10 +150,10 @@ export const PROMPT_PAGE_SIZES = [100, 10, 1] as const;
 /**
  * Requests one listing sends at most. Each ends within `PROMPT_TIMEOUT_MS`,
  * so 150 requests take at most 25 min of the 30 min an action may run
- * (`PROMPT_REFRESH_MAX_MS`), and 5 min are left for the mutations that
- * request the refreshes and the pauses of `PROMPT_REQUEST_RETRY_MS`, at most
- * 188 s. A listing of `PROMPT_LIST_MAX_NAMES` names in pages of 100 takes 50
- * requests.
+ * (`PROMPT_REFRESH_MAX_MS`). Of the 5 min left, the pauses of
+ * `PROMPT_REQUEST_RETRY_MS` take at most 188 s, when every one of 150 pages
+ * loses its reservation twice, and 112 s remain for the mutations. A listing
+ * of `PROMPT_LIST_MAX_NAMES` names in pages of 100 takes 50 requests.
  */
 export const PROMPT_LIST_MAX_REQUESTS = 150;
 /**

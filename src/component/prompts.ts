@@ -1045,11 +1045,14 @@ export const listed = internalMutation({
 
 /**
  * Runs `request`, and again after each pause of `PROMPT_REQUEST_RETRY_MS`
- * when it throws. A mutation that throws wrote nothing, so the next attempt
- * starts from the same state. A reservation reads `promptSlots` and the rows
- * of its names. Refreshes that start or stop tracking names, or that run for
- * those names, write the same rows, and Convex gives up on a mutation whose
- * reads keep changing under it.
+ * when it throws. A reservation reads `promptSlots` and the rows of its
+ * names. Refreshes that start or stop tracking names, or that run for those
+ * names, write the same rows, and Convex gives up on a mutation whose reads
+ * keep changing under it. That error has no type of its own, so every error
+ * is tried again. A mutation that throws wrote nothing, so the next attempt
+ * starts from the same state. Should an answer be lost after its commit, the
+ * next attempt reserves the same names once more, which fences the refreshes
+ * of the first.
  */
 async function requestRefreshes(
   ctx: ActionCtx,
