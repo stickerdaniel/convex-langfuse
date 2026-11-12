@@ -343,9 +343,10 @@ export const supportPrompt = query({
 // { name, version, type: "text" | "chat", prompt, config, source, snapshotId }
 ```
 
-`get` takes a `label`, `production` by default, or a `version`. It returns
-`null` on a miss. Called from a query it is reactive: the query reruns when the
-label moves.
+`get` takes a `label`, `production` by default, or a `version`. A version is
+served while a label or a pin holds it, as the last refresh resolved it. `get`
+returns `null` on a miss. Called from a query it is reactive: the query reruns
+when the label moves.
 
 Pin a prompt for a conversation, so every turn uses the same bytes:
 
@@ -377,6 +378,10 @@ await trace.generation(ctx, {
 - Equal `snapshotId` values mean equal bytes.
 - The component does not compile templates. Fill the variables of `prompt` at
   the call site.
+- A prompt name has at most 256 bytes. `get` returns `null` for a longer one,
+  `pin` and `sync` throw `invalid_prompt_name`. A name, label or scope that
+  holds a lone surrogate throws `invalid_prompt_name`, `invalid_prompt_selector`
+  or `invalid_prompt_scope` as a `ConvexError`.
 
 Turn the cache on once, from an action:
 
@@ -387,9 +392,14 @@ export const syncPrompts = internalAction({
 });
 ```
 
-After that the cache follows Langfuse in two ways. A rolling refresh revisits
-every prompt within 15 minutes. A webhook refreshes a prompt, and the prompts
-that reference it, when it changes:
+`sync` returns how many prompt names it tracks. Its status is `incomplete` when
+the project lists more than 5,000 prompts, the most one listing reads.
+
+After that the cache follows Langfuse in two ways. Every 5 minutes a rolling
+refresh schedules each prompt whose last attempt is 13 minutes old, 200 ms
+apart. A webhook refreshes a prompt, and the prompts that reference it, when it
+changes. A prompt tracks at most 32 referenced prompts for the webhook; the
+rolling refresh covers the rest. To set up the webhook:
 
 1. Mount the component with an HTTP prefix and bind the webhook secret:
 
@@ -516,6 +526,7 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Trace ids per deletion request                    | 100, split by the client               |
 | Pending deletion requests, rejected ones included | 1,000                                  |
 | Cached prompt names                               | 500                                    |
+| Prompt name                                       | 256 bytes                              |
 | Labels per prompt name                            | 50                                     |
 | Prompt snapshot                                   | 900 KiB                                |
 
