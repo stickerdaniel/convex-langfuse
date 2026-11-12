@@ -1,8 +1,9 @@
 # convex-langfuse
 
 **Export LLM traces from a Convex app to Langfuse through a transactional
-outbox.** An observation commits with your mutation and reaches Langfuse at
-least once.
+outbox.** An observation is enqueued in the transaction of your mutation. The
+exporter sends every enqueued observation until Langfuse accepts or rejects it,
+for up to 72 hours.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
@@ -38,7 +39,8 @@ trace deletion and prompt management are in progress.
 
 1. A recording call encodes the observation once as an OTLP span and writes it
    to an outbox table. The write happens in the caller's transaction. In a
-   mutation, the observation commits or rolls back with your own writes.
+   mutation, the observation commits or rolls back with your own writes. Without
+   the Langfuse keys, or while the outbox is full, the call stores nothing.
 2. One exporter per deployment drains the outbox to
    `POST /api/public/otel/v1/traces` of your Langfuse project, at most 50 spans
    or 512 KiB per request.
@@ -153,7 +155,9 @@ const trace = langfuse.trace({
 ```
 
 Record a finished LLM call, a unit of work, or a point in time. All three run in
-mutations and in actions.
+mutations and in actions. A mutation enqueues in its own transaction. An action
+has no transaction: each component call commits on its own, so a `record` that
+needs several calls can enqueue the first and fail on a later one.
 
 ```ts
 await trace.generation(ctx, {
@@ -202,9 +206,13 @@ Notes on the fields:
 - Times are epoch milliseconds. `startTime` defaults to now, `endTime` to
   `startTime`.
 - `usage` keys are passed through. Values must be non-negative integers.
+- `usage` and `cost` hold at most 1,000 entries each. A key has 1 to 1,024
+  printable ASCII characters and starts with neither `$` nor `_`.
+- `tags` are at most 1,000 strings.
 - With `cost` set, Langfuse uses your numbers and infers nothing from the model
   name. Without it, Langfuse prices the usage from its model table.
-- `prompt` links a generation to a prompt version in Langfuse.
+- `prompt` links a generation to a prompt version in Langfuse. Other observation
+  types ignore it.
 - `environment` and `release` on the trace override the component's defaults.
 - `experiment` on the trace attaches its observations to a Langfuse experiment
   run.
@@ -245,12 +253,15 @@ new Langfuse(components.convexLangfuse, {
   every deployment states its choice.
 - `redact` sees each record before it is serialized. It returns the record to
   export, or `null` to drop it. Names, tags, metadata and model parameters are
-  yours to project here.
-- `input` and `output` are serialized with sorted keys and cut to
-  `maxFieldBytes` UTF-8 bytes (default 131,072) on a character boundary. A cut
-  value ends with `…[truncated <n> bytes]`.
+  yours to project here. The record, its `trace` and its `observation` are
+  shallow copies. Nested values such as `tags`, `input` or `metadata` are your
+  own objects: return new ones instead of changing them in place.
+- `input` and `output` are serialized with sorted keys. A longer value keeps its
+  first `maxFieldBytes` UTF-8 bytes (default 131,072), cut on a character
+  boundary, followed by `…[truncated <n> bytes]`. The marker comes on top of
+  `maxFieldBytes`.
 - Log lines of the client carry a code and ids, never field content or error
-  text.
+  text. An id you passed that is not a valid id is logged as an empty string.
 
 The order is fixed: `redact`, content mode, serialization, truncation. Content
 that `redact` or `content: "none"` removes never reaches the outbox, the dead
@@ -262,23 +273,26 @@ With `onError: "log"`, the default, a recording method never throws. It logs
 `[convex-langfuse] <code>` and returns the ids. With `onError: "throw"` it
 throws an `Error` whose message is the code, which rolls back a mutation.
 
-| Code                  | Meaning                                                   | Record sent        |
-| --------------------- | --------------------------------------------------------- | ------------------ |
-| `invalid_id`          | A trace id, observation id, seed or key is invalid        | no                 |
-| `invalid_environment` | The environment name breaks Langfuse's rule               | no                 |
-| `row_too_large`       | The encoded observation exceeds 900 KiB                   | no                 |
-| `redact_failed`       | `redact` threw                                            | no                 |
-| `backlog`             | The outbox is full, see [Delivery](#delivery)             | no                 |
-| `enqueue_failed`      | The component call failed                                 | no                 |
-| `unserializable`      | `input`, `output` or a JSON field cannot be serialized    | without that field |
-| `invalid_metadata`    | A metadata or model-parameter value is not a plain object | without that field |
-| `invalid_usage`       | A usage value is not a non-negative integer               | without that value |
+| Code                  | Meaning                                                       | Record sent        |
+| --------------------- | ------------------------------------------------------------- | ------------------ |
+| `invalid_id`          | A trace id, observation id, seed or key is invalid            | no                 |
+| `invalid_environment` | The environment name breaks Langfuse's rule                   | no                 |
+| `row_too_large`       | The encoded observation exceeds 900 KiB                       | no                 |
+| `redact_failed`       | `redact` threw                                                | no                 |
+| `backlog`             | The outbox is full, see [Delivery](#delivery)                 | no                 |
+| `enqueue_failed`      | The component call failed                                     | no                 |
+| `unserializable`      | `input`, `output` or a JSON field cannot be serialized        | without that field |
+| `invalid_metadata`    | A metadata or model-parameter value is not a plain object     | without that field |
+| `invalid_tags`        | The tags are not an array of at most 1,000 strings            | without the tags   |
+| `invalid_usage`       | A usage entry has a bad key or value, or there are over 1,000 | without that entry |
+| `invalid_cost`        | A cost entry has a bad key or value, or there are over 1,000  | without that entry |
 
 ## Delivery
 
-- **At least once.** Langfuse answers 2xx when it queued a batch. An accepted
-  row leaves the outbox. A batch whose answer got lost is sent again with
-  identical bytes and identical ids.
+- **At least once.** The exporter sends an enqueued row until Langfuse answers
+  2xx, the row becomes a dead letter, or it expires. Langfuse answers 2xx when
+  it queued a batch. An accepted row leaves the outbox. A batch whose answer got
+  lost is sent again with identical bytes and identical ids.
 - **Order.** The exporter sends the oldest rows first. Langfuse places an
   observation by its ids and timestamps, not by its arrival.
 - **Backoff.** Network errors, timeouts after 20 s, 408, 425, 429 and 5xx back
@@ -297,14 +311,16 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 
 ## Limits
 
-| Limit                                | Value                                  |
-| ------------------------------------ | -------------------------------------- |
-| Encoded observation                  | 900 KiB                                |
-| Observations per component call      | 50, split by the client                |
-| Encoded bytes per component call     | 3 MiB, split by the client             |
-| `input` or `output` after truncation | `maxFieldBytes`, default 131,072 bytes |
-| Spans per export request             | 50                                     |
-| Bytes per export request             | 512 KiB, a larger span goes alone      |
+| Limit                                  | Value                                  |
+| -------------------------------------- | -------------------------------------- |
+| Encoded observation                    | 900 KiB                                |
+| Observations per component call        | 50, split by the client                |
+| Encoded bytes per component call       | 3 MiB, split by the client             |
+| Kept part of a cut `input` or `output` | `maxFieldBytes`, default 131,072 bytes |
+| Tags per trace                         | 1,000                                  |
+| Entries of `usage` or `cost`           | 1,000 each                             |
+| Spans per export request               | 50                                     |
+| Bytes per export request               | 512 KiB, a larger span goes alone      |
 
 ## Operations
 

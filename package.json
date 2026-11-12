@@ -1,6 +1,6 @@
 {
   "name": "convex-langfuse",
-  "description": "Send LLM traces, generations, and scores from your Convex app to Langfuse over OpenTelemetry, with reactive local queries.",
+  "description": "Export LLM traces from a Convex app to Langfuse through a transactional outbox.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/stickerdaniel/convex-langfuse.git"
