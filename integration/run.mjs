@@ -45,6 +45,7 @@ const TRACE_IDS = {
   6: "a0000000000000000000000000000006",
   7: "a0000000000000000000000000000007",
   8: "a0000000000000000000000000000008",
+  10: "a0000000000000000000000000000010",
 };
 
 /** First span id number of a case, so cases never share ids. */
@@ -765,6 +766,36 @@ async function main() {
         `signed deliveries 200 with an empty body, unsigned and wrongly ` +
         `signed 401; versions 1 and 2 cached after ${fetched} prompt fetches`
       );
+    });
+
+    await runCase("10 a name cut inside an emoji", async () => {
+      await client.mutation(api.recordCut, {
+        traceId: TRACE_IDS[10],
+        id: firstId(10),
+      });
+      await waitFor(
+        "the span",
+        async () => received(await fake.stats(), 10, 1) === 1,
+        60_000,
+      );
+      const response = await fetch(
+        `${fake.url}/api/public/v2/observations?traceId=${TRACE_IDS[10]}`,
+        {
+          headers: {
+            authorization: `Basic ${btoa("pk-lf-integration:sk-lf-integration")}`,
+          },
+        },
+      );
+      const [observation] = (await response.json()).data;
+      if (
+        observation?.name !== "cut \ufffd" ||
+        observation.input !== "whole 😀"
+      ) {
+        throw new Error(
+          `received name ${JSON.stringify(observation?.name)}, input ${JSON.stringify(observation?.input)}`,
+        );
+      }
+      return "the span arrived with U+FFFD in place of the lone surrogate";
     });
 
     const diverging = divergent(await fake.stats());

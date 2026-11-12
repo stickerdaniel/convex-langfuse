@@ -72,6 +72,23 @@ export const recordCounted = mutation({
   },
 });
 
+/**
+ * Records one span whose name ends inside an emoji, as `slice` cuts it. The
+ * cut leaves a lone surrogate, which Convex refuses in a function argument.
+ */
+export const recordCut = mutation({
+  args: { traceId: v.string(), id: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { traceId, id }) => {
+    await strict.trace({ traceId, name: "integration" }).span(ctx, {
+      id: spanId(id),
+      name: "cut 😀".slice(0, -1),
+      input: "whole 😀",
+    });
+    return null;
+  },
+});
+
 /** Whether the component sees a complete export configuration. */
 export const enabled = query({
   args: {},
