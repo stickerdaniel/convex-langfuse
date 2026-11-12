@@ -459,11 +459,30 @@ async function reserveRow(
 }
 
 /**
+ * How many names are tracked, with the `promptSync` row that holds the
+ * count. Every `store` and `publish` of a running refresh writes a
+ * `promptNames` row, so a count over that table would conflict with them:
+ * a listing of several pages reserves a page while the refreshes of its
+ * earlier pages run. The table is counted only while the row has no count
+ * yet, or does not exist.
+ */
+async function trackedNames(
+  ctx: MutationCtx,
+): Promise<{ sync: Doc<"promptSync"> | null; count: number }> {
+  const sync = await ctx.db.query("promptSync").first();
+  const count =
+    sync?.names ??
+    (await ctx.db.query("promptNames").take(MAX_PROMPT_NAMES)).length;
+  return { sync, count };
+}
+
+/**
  * Reserves a refresh for each distinct name, creating its `promptNames` row
  * when missing. A name the cache cannot track (`isPromptName`) and a missing
  * name once `MAX_PROMPT_NAMES` are tracked reserve nothing and count as
  * overflow. With `onlyNew`, tracked names are skipped. `sync`, the listing
- * and the webhook all reserve through here.
+ * and the webhook all reserve through here. Only here a `promptNames` row is
+ * created, and the count on `promptSync` follows.
  */
 async function reserveNames(
   ctx: MutationCtx,
@@ -473,7 +492,8 @@ async function reserveNames(
   const now = Date.now();
   const reserved: Reserved[] = [];
   let overflow = 0;
-  let free: number | undefined;
+  // Read at the first missing name.
+  let tracked: Awaited<ReturnType<typeof trackedNames>> | undefined;
   for (const name of new Set(names)) {
     if (!isPromptName(name)) {
       overflow += 1;
@@ -484,14 +504,12 @@ async function reserveNames(
       if (!onlyNew) reserved.push(await reserveRow(ctx, row, now));
       continue;
     }
-    free ??=
-      MAX_PROMPT_NAMES -
-      (await ctx.db.query("promptNames").take(MAX_PROMPT_NAMES)).length;
-    if (free <= 0) {
+    tracked ??= await trackedNames(ctx);
+    if (tracked.count >= MAX_PROMPT_NAMES) {
       overflow += 1;
       continue;
     }
-    free -= 1;
+    tracked.count += 1;
     const token = crypto.randomUUID();
     await ctx.db.insert("promptNames", {
       name,
@@ -500,6 +518,11 @@ async function reserveNames(
       attemptedAt: now,
     });
     reserved.push({ name, token });
+  }
+  if (tracked?.sync && tracked.sync.names !== tracked.count) {
+    await ctx.db.patch("promptSync", tracked.sync._id, {
+      names: tracked.count,
+    });
   }
   return { reserved, overflow };
 }
@@ -911,7 +934,8 @@ async function pointVersion(
  * `staged`. `dependsOn` replaces the stored names only when the refresh
  * is `complete`, every listed label resolved; otherwise it adds to them, so
  * a dependency that is gone for now still reaches this name through the
- * webhook. A name without labels and without an error is no longer tracked.
+ * webhook. A name without labels and without an error is no longer tracked:
+ * its row is deleted and the count on `promptSync` goes down.
  */
 export const publish = internalMutation({
   args: {
@@ -966,6 +990,10 @@ export const publish = internalMutation({
     }
     if (left === 0 && error === undefined) {
       await ctx.db.delete("promptNames", row._id);
+      const sync = await ctx.db.query("promptSync").first();
+      if (sync?.names !== undefined) {
+        await ctx.db.patch("promptSync", sync._id, { names: sync.names - 1 });
+      }
       return null;
     }
     await ctx.db.patch("promptNames", row._id, {

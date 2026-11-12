@@ -277,5 +277,11 @@ export default defineSchema({
   promptSync: defineTable({
     lastListAt: v.optional(v.number()),
     lastWebhookAt: v.optional(v.number()),
+    /**
+     * How many `promptNames` rows exist, once a reservation counted them.
+     * Kept here because a count over `promptNames` reads rows that running
+     * refreshes write.
+     */
+    names: v.optional(v.number()),
   }),
 });
