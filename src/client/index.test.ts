@@ -518,6 +518,19 @@ describe("a component call carries only what the span exports", () => {
     expect(consoleLines).toEqual([]);
   });
 
+  test("a prompt link is sent as it was checked", async () => {
+    let reads = 0;
+    const prompt = {
+      get name() {
+        return reads++ === 0 ? "persona" : (undefined as unknown as string);
+      },
+      version: 2,
+    };
+    const { observations } = await sent("generation", { fields: { prompt } });
+    expect(observations[0]!.prompt).toEqual({ name: "persona", version: 2 });
+    expect(consoleLines).toEqual([]);
+  });
+
   test.each([
     { name: "a fractional version", prompt: { name: "persona", version: 1.5 } },
     { name: "an empty name", prompt: { name: "", version: 2 } },

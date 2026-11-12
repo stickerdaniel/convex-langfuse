@@ -24,7 +24,7 @@ import {
   costDetails,
   encodeSpan,
   isCostValue,
-  isPromptLink,
+  promptLink,
 } from "../shared/otlp.js";
 import type {
   Level,
@@ -588,14 +588,13 @@ export class Langfuse {
     const exported = cost.kept && costDetails(cost.kept) !== undefined;
     if (cost.invalid || (cost.kept && !exported)) problems.add("invalid_cost");
     // Only a generation exports its prompt link, and only a complete one.
-    const { prompt } = observation;
-    let promptLink: Prompt | undefined;
-    if (observation.type === "generation" && prompt !== undefined) {
-      if (isPromptLink(prompt)) {
-        promptLink = { name: prompt.name, version: prompt.version };
-      } else {
-        problems.add("invalid_prompt");
-      }
+    let link: Prompt | undefined;
+    if (
+      observation.type === "generation" &&
+      observation.prompt !== undefined
+    ) {
+      link = promptLink(observation.prompt);
+      if (!link) problems.add("invalid_prompt");
     }
 
     const encoded: Observation = wellFormed({
@@ -619,7 +618,7 @@ export class Langfuse {
       modelParameters,
       usage: usage.kept,
       cost: exported ? cost.kept : undefined,
-      prompt: promptLink,
+      prompt: link,
     });
     for (const code of problems) this.#fail(code, ids);
 

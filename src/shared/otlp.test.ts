@@ -335,6 +335,21 @@ describe("prompt", () => {
     expect(attribute(span, ATTR.promptVersion)).toEqual({ intValue: "4" });
   });
 
+  test("exports the values it checked when a field reads differently later", () => {
+    let reads = 0;
+    const changing = {
+      get name() {
+        return reads++ === 0 ? "chat-system" : (undefined as unknown as string);
+      },
+      version: 4,
+    };
+    const span = encode({ type: "generation", prompt: changing });
+    expect(attribute(span, ATTR.promptName)).toEqual({
+      stringValue: "chat-system",
+    });
+    expect(attribute(span, ATTR.promptVersion)).toEqual({ intValue: "4" });
+  });
+
   test("writes no prompt on a span", () => {
     const span = encode({ type: "span", prompt });
     expect(attribute(span, ATTR.promptName)).toBeUndefined();

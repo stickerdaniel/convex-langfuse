@@ -70,22 +70,23 @@ export function costDetails(cost: Record<string, number>): string | undefined {
 }
 
 /**
- * Whether `prompt` is a link to export: an object with a non-empty string
- * name and a positive integer version. It checks at runtime, because a
- * caller without types can pass anything. Langfuse rejects a generation that
- * carries only one of the two attributes, so the encoder writes both or
- * neither.
+ * The prompt link to export, or `undefined`: a copy of an object with a
+ * non-empty string name and a positive integer version. It checks at
+ * runtime, because a caller without types can pass anything, and reads each
+ * field once, so what it checked is what it returns. Langfuse rejects a
+ * generation that carries only one of the two attributes, so the encoder
+ * writes both or neither.
  */
-export function isPromptLink(prompt: unknown): prompt is Prompt {
-  if (typeof prompt !== "object" || prompt === null) return false;
+export function promptLink(prompt: unknown): Prompt | undefined {
+  if (typeof prompt !== "object" || prompt === null) return undefined;
   const { name, version } = prompt as { name?: unknown; version?: unknown };
-  return (
-    typeof name === "string" &&
+  return typeof name === "string" &&
     name !== "" &&
     typeof version === "number" &&
     Number.isSafeInteger(version) &&
     version > 0
-  );
+    ? { name, version }
+    : undefined;
 }
 
 /**
@@ -99,11 +100,10 @@ export function encodeSpan(
   observation: Observation,
 ): string {
   const { experiment } = trace;
-  const { prompt } = observation;
-  const linked =
-    observation.type === "generation" &&
-    prompt !== undefined &&
-    isPromptLink(prompt);
+  const link =
+    observation.type === "generation"
+      ? promptLink(observation.prompt)
+      : undefined;
 
   const candidates: [AttributeName, AnyValue | undefined][] = [
     [ATTR.observationType, { stringValue: observation.type }],
@@ -136,11 +136,8 @@ export function encodeSpan(
       stringValue(observation.usage && usageDetails(observation.usage)),
     ],
     [ATTR.cost, stringValue(observation.cost && costDetails(observation.cost))],
-    [ATTR.promptName, linked ? { stringValue: prompt.name } : undefined],
-    [
-      ATTR.promptVersion,
-      linked ? { intValue: String(prompt.version) } : undefined,
-    ],
+    [ATTR.promptName, link && { stringValue: link.name }],
+    [ATTR.promptVersion, link && { intValue: String(link.version) }],
     [
       ATTR.completionStartTime,
       observation.completionStartTime === undefined
