@@ -7,6 +7,7 @@ import {
   MAX_PENDING_AGE_MS,
   RETENTION_BATCH,
   RETENTION_BATCH_BYTES,
+  SCORE_KEY_RETENTION_MS,
 } from "./constants.js";
 import {
   getExporter,
@@ -15,17 +16,26 @@ import {
   scheduleCount,
   withRemoved,
 } from "./outbox.js";
+import { forgetOp } from "./scoreKeys.js";
 
 /**
- * Hourly sweep. Expires outbox rows older than `MAX_PENDING_AGE_MS`, except
- * the batch in flight, and deletes dead letters older than
- * `DEAD_LETTER_RETENTION_MS`, at most `RETENTION_BATCH` of each and
- * `RETENTION_BATCH_BYTES` of payloads in total per run; a run that reaches a
- * limit schedules the next one at once. Expired rows add to the removed
- * totals. Starts a count chain while rows are pending or receipts are left,
- * then sets the gate from both totals and resets drifted totals once the
- * outbox is empty. A run that finds nothing to do writes and schedules
- * nothing.
+ * Kinds whose rows and dead letters expire. Trace deletion requests never
+ * do: they leave the outbox only when Langfuse accepts them.
+ */
+const EXPIRING = ["span", "scoreCreate", "scoreDelete"] as const;
+
+/**
+ * Hourly sweep. Expires outbox rows of `EXPIRING` kinds older than
+ * `MAX_PENDING_AGE_MS`, except the batch in flight, deletes their dead
+ * letters older than `DEAD_LETTER_RETENTION_MS`, and deletes `scoreKeys`
+ * rows without pointers idle for `SCORE_KEY_RETENTION_MS`. At most
+ * `RETENTION_BATCH` of each and `RETENTION_BATCH_BYTES` of payloads in total
+ * per run; a run that reaches a limit schedules the next one at once.
+ * Expired span rows add to the removed totals, and an expired score op
+ * leaves no pointer to it. Starts a count chain while rows are pending or
+ * receipts are left, then sets the gate from both totals and resets drifted
+ * totals once no span row is left. A run that finds nothing to do writes and
+ * schedules nothing.
  */
 export const sweep = internalMutation({
   args: {},
@@ -52,18 +62,26 @@ export const sweep = internalMutation({
 
     let exporter = await getExporter(ctx);
     const claimed = new Set(exporter?.claimed);
-    const stale = await ctx.db
-      .query("outbox")
-      .withIndex("by_creation_time", (q) =>
-        q.lt("_creationTime", now - MAX_PENDING_AGE_MS),
-      )
-      .take(RETENTION_BATCH);
+    const stale: Doc<"outbox">[] = [];
+    for (const kind of EXPIRING) {
+      const budget = RETENTION_BATCH - stale.length;
+      if (budget === 0) break;
+      stale.push(
+        ...(await ctx.db
+          .query("outbox")
+          .withIndex("by_kind", (q) =>
+            q.eq("kind", kind).lt("_creationTime", now - MAX_PENDING_AGE_MS),
+          )
+          .take(budget)),
+      );
+    }
     const expired: Doc<"outbox">[] = [];
     for (const row of stale) {
       if (claimed.has(row._id)) continue;
       if (!fits(row.bytes)) break;
       await ctx.db.delete("payloads", row.payloadId);
       await ctx.db.delete("outbox", row._id);
+      await forgetOp(ctx, row, now);
       expired.push(row);
     }
     if (expired.length > 0) {
@@ -76,18 +94,37 @@ export const sweep = internalMutation({
 
     // Once the outbox rows spent the budget, the dead letters wait for the
     // next run.
-    const deadLetters = overBudget
-      ? []
-      : await ctx.db
+    const deadLetters: Doc<"deadLetters">[] = [];
+    for (const kind of overBudget ? [] : EXPIRING) {
+      const budget = RETENTION_BATCH - deadLetters.length;
+      if (budget === 0) break;
+      deadLetters.push(
+        ...(await ctx.db
           .query("deadLetters")
-          .withIndex("by_failedAt", (q) =>
-            q.lt("failedAt", now - DEAD_LETTER_RETENTION_MS),
+          .withIndex("by_kind_failedAt", (q) =>
+            q.eq("kind", kind).lt("failedAt", now - DEAD_LETTER_RETENTION_MS),
           )
-          .take(RETENTION_BATCH);
+          .take(budget)),
+      );
+    }
     for (const deadLetter of deadLetters) {
       if (!fits(deadLetter.bytes)) break;
       await ctx.db.delete("payloads", deadLetter.payloadId);
       await ctx.db.delete("deadLetters", deadLetter._id);
+    }
+
+    // A key with a pointer stays; its op expires within `MAX_PENDING_AGE_MS`.
+    const idleKeys = await ctx.db
+      .query("scoreKeys")
+      .withIndex("by_updatedAt", (q) =>
+        q.lt("updatedAt", now - SCORE_KEY_RETENTION_MS),
+      )
+      .take(RETENTION_BATCH);
+    let deletedKeys = 0;
+    for (const key of idleKeys) {
+      if (key.queued !== undefined || key.inFlight !== undefined) continue;
+      await ctx.db.delete("scoreKeys", key._id);
+      deletedKeys += 1;
     }
 
     // Receipts stay behind when traffic stops before the next chain is due.
@@ -102,7 +139,8 @@ export const sweep = internalMutation({
     if (
       overBudget ||
       stale.length === RETENTION_BATCH ||
-      deadLetters.length === RETENTION_BATCH
+      deadLetters.length === RETENTION_BATCH ||
+      (idleKeys.length === RETENTION_BATCH && deletedKeys > 0)
     ) {
       await ctx.scheduler.runAfter(0, internal.retention.sweep, {});
     }

@@ -247,7 +247,7 @@ describe("fencing", () => {
     // The run claims a batch, Langfuse accepts it, and the run dies before
     // reporting.
     const step = await t.mutation(internal.exporter.advance, { generation: 1 });
-    if (step.done) throw new Error("expected a claim");
+    if (!("spans" in step)) throw new Error("expected a span batch");
     const { send } = await import("./exporter.js");
     const config = {
       publicKey: "pk-lf-test",

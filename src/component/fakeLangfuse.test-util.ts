@@ -10,18 +10,22 @@ import type { Observation, TraceContext } from "../shared/validators.js";
 
 export type TestConvex = ReturnType<typeof initConvexTest>;
 
-/** How the fake answers one request. */
+/** How the fake answers one request. `body` is sent as JSON. */
 export type Behaviour =
-  | { status: number; headers?: Record<string, string> }
+  | { status: number; headers?: Record<string, string>; body?: unknown }
   | { network: true }
   | { hang: true };
 
 export type RecordedRequest = {
   url: string;
+  method: string;
+  /** Path and query of `url`. */
+  path: string;
   headers: Record<string, string>;
   body: string;
   /** Fake-clock time the request was sent. */
   at: number;
+  /** Span ids of an OTLP request; empty for any other request. */
   spanIds: string[];
 };
 
@@ -35,8 +39,10 @@ type ExportBody = {
 
 export type FakeLangfuse = ReturnType<typeof installFakeLangfuse>;
 
+const OTLP_PATH = "/api/public/otel/v1/traces";
+
 /**
- * Replaces global `fetch` with a fake endpoint. It records every request and
+ * Replaces global `fetch` with a fake Langfuse. It records every request and
  * answers from the queue filled by `respond`, then with `fallback`. An answer
  * can be a function of the recorded request.
  */
@@ -58,17 +64,22 @@ export function installFakeLangfuse() {
     "fetch",
     async (input: string | URL | Request, init?: RequestInit) => {
       const body = String(init?.body ?? "");
-      const parsed = JSON.parse(body) as ExportBody;
+      const url = new URL(String(input));
+      const parsed =
+        url.pathname === OTLP_PATH ? (JSON.parse(body) as ExportBody) : null;
       const request: RecordedRequest = {
         url: String(input),
+        method: init?.method ?? "GET",
+        path: url.pathname + url.search,
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
         body,
         at: Date.now(),
-        spanIds: parsed.resourceSpans.flatMap((resource) =>
-          resource.scopeSpans.flatMap((scope) =>
-            scope.spans.map((span) => span.spanId),
-          ),
-        ),
+        spanIds:
+          parsed?.resourceSpans.flatMap((resource) =>
+            resource.scopeSpans.flatMap((scope) =>
+              scope.spans.map((span) => span.spanId),
+            ),
+          ) ?? [],
       };
       requests.push(request);
       const answer = queue.shift() ?? fake.fallback;
@@ -84,10 +95,10 @@ export function installFakeLangfuse() {
           });
         });
       }
-      return new Response(null, {
-        status: behaviour.status,
-        headers: behaviour.headers,
-      });
+      return new Response(
+        behaviour.body === undefined ? null : JSON.stringify(behaviour.body),
+        { status: behaviour.status, headers: behaviour.headers },
+      );
     },
   );
   return fake;
@@ -266,6 +277,7 @@ export type Tables = {
   counter: Doc<"counter">[];
   exporter: Doc<"exporter">[];
   gate: Doc<"gate">[];
+  scoreKeys: Doc<"scoreKeys">[];
 };
 
 /** Every document of the component's export tables. */
@@ -278,6 +290,7 @@ export async function tables(t: TestConvex): Promise<Tables> {
     counter: await ctx.db.query("counter").collect(),
     exporter: await ctx.db.query("exporter").collect(),
     gate: await ctx.db.query("gate").collect(),
+    scoreKeys: await ctx.db.query("scoreKeys").collect(),
   }));
 }
 

@@ -32,8 +32,8 @@ export const saveAnswer = mutation({
 
 This repository is a fork of
 [sholajegede/convex-langfuse](https://github.com/sholajegede/convex-langfuse)
-with a new architecture and a new API. Version 0.1.0 covers tracing. Scores,
-trace deletion and prompt management are in progress.
+with a new architecture and a new API. Version 0.1.0 covers tracing, scores and
+trace deletion. Prompt management is in progress.
 
 ## How it works
 
@@ -58,6 +58,8 @@ Your functions never wait for Langfuse and never fail because Langfuse is down.
 - [Setup](#setup)
 - [Recording](#recording)
 - [Ids](#ids)
+- [Scores](#scores)
+- [Deleting traces](#deleting-traces)
 - [Content and privacy](#content-and-privacy)
 - [Errors](#errors)
 - [Delivery](#delivery)
@@ -240,31 +242,112 @@ and `observationIdFromKey` without the client, for a service outside Convex.
 A key recorded twice gives two rows in Langfuse. Record from an idempotent
 mutation, or put the attempt into the key.
 
+## Scores
+
+Declare the score names once. `score` then accepts only these names, with values
+of their type:
+
+```ts
+import { defineScores, Langfuse } from "convex-langfuse";
+import { components } from "./_generated/api";
+
+const scores = defineScores({
+  helpful: { dataType: "BOOLEAN" },
+  rating: { dataType: "NUMERIC", min: 1, max: 5 },
+  tone: { dataType: "CATEGORICAL", categories: ["formal", "casual"] },
+});
+
+export const langfuse = new Langfuse(components.convexLangfuse, {
+  content: "full",
+  scores,
+});
+```
+
+Record a score in a mutation, for example behind a feedback button:
+
+```ts
+export const rate = mutation({
+  args: { messageId: v.id("messages"), helpful: v.boolean() },
+  handler: async (ctx, args) => {
+    const message = await ctx.db.get(args.messageId);
+    if (!message) throw new Error("unknown message");
+    await ctx.db.patch(args.messageId, { helpful: args.helpful });
+    await langfuse.score(ctx, {
+      name: "helpful",
+      value: args.helpful,
+      trace: { seed: `chat:${message.chatId}` },
+      observation: { key: `answer:${args.messageId}` },
+      id: `helpful:${args.messageId}`,
+      timestamp: message._creationTime,
+    });
+  },
+});
+```
+
+- With an `id` and its `timestamp`, a later write with the same pair overwrites
+  the score in Langfuse. Without an `id`, the id is a new UUID and the timestamp
+  is now.
+- `langfuse.deleteScore(ctx, { id })` asks Langfuse to delete a score. A
+  self-hosted Langfuse applies one score deletion per 120 seconds by default
+  (`LANGFUSE_SCORE_DELETE_CONCURRENCY` per
+  `LANGFUSE_CLICKHOUSE_TRACE_DELETION_CONCURRENCY_DURATION_MS`). Deleting a
+  trace deletes its scores in one step.
+- A write or a deletion replaces an operation of the same id that still waits.
+  Operations of one id are sent one at a time, at least 30 seconds apart,
+  because Langfuse can apply a write up to 15 seconds after it accepted it.
+- Langfuse does not order two operations on one id, so the value it finally
+  stores is not guaranteed. Keep your own record of a rating as the source of
+  truth, as the example does.
+- `langfuse.syncScoreConfigs(ctx)`, called from an action, creates a Langfuse
+  score config for every defined name that has none and lets the component
+  attach the config ids. Run it after you deploy changed definitions. The
+  component repeats it every hour.
+- Without the `scores` option, `score` takes any name with a boolean, a number
+  or a string.
+
+## Deleting traces
+
+```ts
+await langfuse.deleteTraces(ctx, {
+  traces: [{ seed: `chat:${chatId}` }],
+});
+```
+
+- The request is recorded in the caller's transaction and sent at least once,
+  after the observations that were enqueued before it. The component does not
+  verify that Langfuse completed the erasure.
+- `deleteTraces` ignores `onError`. On an enabled component every failure
+  throws, so a purge mutation rolls back with it. On a disabled component it
+  returns `{ enqueued: false, reason: "disabled" }`.
+- A deletion request passes a closed backlog gate and never expires. At most
+  1,000 requests can wait. The next one throws.
+
 ## Content and privacy
 
 ```ts
 new Langfuse(components.convexLangfuse, {
   content: "none",
-  redact: (record) => ({
-    ...record,
-    trace: { ...record.trace, userId: undefined },
-  }),
+  redact: (record) =>
+    record.kind === "observation"
+      ? { ...record, trace: { ...record.trace, userId: undefined } }
+      : record,
   maxFieldBytes: 32_768,
 });
 ```
 
-- `content: "full"` exports `input`, `output` and `statusMessage`.
-  `content: "none"` removes them before anything is stored. There is no default:
-  every deployment states its choice.
-- `redact` sees each record before it is serialized. It returns the record to
-  export, or `null` to drop it. Names, tags, metadata and model parameters are
-  yours to project here. The record, its `trace` and its `observation` are
-  shallow copies. Nested values such as `tags`, `input` or `metadata` are your
-  own objects: return new ones instead of changing them in place.
-- `input` and `output` are serialized with sorted keys. A longer value keeps its
-  first `maxFieldBytes` UTF-8 bytes (default 131,072), cut on a character
-  boundary, followed by `…[truncated <n> bytes]`. The marker comes on top of
-  `maxFieldBytes`.
+- `content: "full"` exports `input`, `output`, `statusMessage` and score
+  comments. `content: "none"` removes them before anything is stored. There is
+  no default: every deployment states its choice.
+- `redact` sees each record before it is serialized: an observation with its
+  trace fields, or a score. It returns the record to export, or `null` to drop
+  it. Names, tags, metadata and model parameters are yours to project here. The
+  record and its `trace`, `observation` or `score` are shallow copies. Nested
+  values such as `tags`, `input` or `metadata` are your own objects: return new
+  ones instead of changing them in place.
+- `input`, `output` and score comments are serialized with sorted keys. A longer
+  value keeps its first `maxFieldBytes` UTF-8 bytes (default 131,072), cut on a
+  character boundary, followed by `…[truncated <n> bytes]`. The marker comes on
+  top of `maxFieldBytes`.
 - Log lines of the client carry a code and ids, never field content or error
   text. An id you passed that is not a valid id is logged as an empty string.
 
@@ -283,6 +366,8 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | `invalid_id`          | A trace id, observation id, seed or key is invalid           | no                 |
 | `invalid_environment` | The trace's or the default environment name is invalid       | no                 |
 | `row_too_large`       | The encoded observation exceeds 900 KiB                      | no                 |
+| `invalid_score`       | A score id, name or value is invalid                         | no                 |
+| `score_too_large`     | The score exceeds 900 KiB                                    | no                 |
 | `redact_failed`       | `redact` threw                                               | no                 |
 | `backlog`             | The outbox is full, see [Delivery](#delivery)                | no                 |
 | `enqueue_failed`      | The component call failed                                    | no                 |
@@ -313,24 +398,31 @@ throws an `Error` whose message is the code, which rolls back a mutation.
   A row rejected alone becomes a dead letter. After 20 consecutive dead letters
   the exporter treats the rejection as a configuration problem and stops
   discarding.
+- **Scores and deletion requests.** Each one is a request of its own. A 404, a
+  405 or a redirect from its endpoint delays only that request by 30 minutes;
+  observations behind it are still sent.
 - **Backlog.** Above 25,000 pending observations or 256 MiB of pending payload
-  the component stops accepting. Recording calls then log `backlog` and drop the
-  record. It accepts again below half of both.
-- **Retention.** A pending row older than 72 hours expires. A dead letter is
-  deleted after 7 days.
+  the component stops accepting. Recording and score calls then log `backlog`
+  and drop the record. It accepts again below half of both. Deletion requests
+  are always accepted.
+- **Retention.** A pending observation or score older than 72 hours expires. A
+  dead letter is deleted after 7 days. Deletion requests never expire.
 
 ## Limits
 
-| Limit                                  | Value                                  |
-| -------------------------------------- | -------------------------------------- |
-| Encoded observation                    | 900 KiB                                |
-| Observations per component call        | 50, split by the client                |
-| Encoded bytes per component call       | 3 MiB, split by the client             |
-| Kept part of a cut `input` or `output` | `maxFieldBytes`, default 131,072 bytes |
-| Tags per trace                         | 8,192                                  |
-| Entries of `usage` or `cost`           | 1,024 each                             |
-| Spans per export request               | 50                                     |
-| Bytes per export request               | 512 KiB, a larger span goes alone      |
+| Limit                                             | Value                                  |
+| ------------------------------------------------- | -------------------------------------- |
+| Encoded observation                               | 900 KiB                                |
+| Observations per component call                   | 50, split by the client                |
+| Encoded bytes per component call                  | 3 MiB, split by the client             |
+| Kept part of a cut `input`, `output` or `comment` | `maxFieldBytes`, default 131,072 bytes |
+| Tags per trace                                    | 8,192                                  |
+| Entries of `usage` or `cost`                      | 1,024 each                             |
+| Spans per export request                          | 50                                     |
+| Bytes per export request                          | 512 KiB, a larger span goes alone      |
+| Score id                                          | 1 to 128 bytes                         |
+| Trace ids per deletion request                    | 100, split by the client               |
+| Pending deletion requests                         | 1,000                                  |
 
 ## Operations
 
@@ -360,7 +452,8 @@ the CLI:
 # Clear a backoff and start the exporter now, for example after fixing the keys.
 npx convex run --component convexLangfuse exporter:kick
 
-# Move up to 500 dead letters back to the outbox.
+# Move up to 500 dead letters back to the outbox: observations and trace
+# deletion requests. Score dead letters are not retried.
 npx convex run --component convexLangfuse outbox:retryDeadLetters '{"limit": 100}'
 ```
 

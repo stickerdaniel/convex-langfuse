@@ -49,6 +49,65 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Name
       >;
     };
+    scores: {
+      remove: FunctionReference<
+        "mutation",
+        "internal",
+        { id: string },
+        { enqueued: boolean; reason?: "disabled" | "backlog" },
+        Name
+      >;
+      syncConfigs: FunctionReference<
+        "action",
+        "internal",
+        {
+          definitions: Array<{
+            categories?: Array<string>;
+            dataType: "BOOLEAN" | "NUMERIC" | "CATEGORICAL";
+            max?: number;
+            min?: number;
+            name: string;
+          }>;
+        },
+        {
+          configs: Array<{ configId: string; created: boolean; name: string }>;
+          conflicts: Array<{
+            configId: string;
+            name: string;
+            reason: "archived" | "incompatible";
+          }>;
+          status: "ok" | "running" | "incomplete" | "disabled";
+        },
+        Name
+      >;
+      upsert: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          comment?: string;
+          dataType: "BOOLEAN" | "NUMERIC" | "CATEGORICAL";
+          environment?: string;
+          id: string;
+          metadata?: string;
+          name: string;
+          observationId?: string;
+          timestamp: number;
+          traceId: string;
+          value: number | string;
+        },
+        { enqueued: boolean; reason?: "disabled" | "backlog" },
+        Name
+      >;
+    };
+    traces: {
+      remove: FunctionReference<
+        "mutation",
+        "internal",
+        { traceIds: Array<string> },
+        { enqueued: boolean; reason?: "disabled" },
+        Name
+      >;
+    };
     tracing: {
       record: FunctionReference<
         "mutation",

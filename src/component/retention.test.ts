@@ -201,6 +201,7 @@ describe("retention sweep", () => {
       counter: [],
       exporter: [],
       gate: [],
+      scoreKeys: [],
     });
     expect(await pendingScheduled(t)).toEqual([]);
   });

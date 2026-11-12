@@ -13,6 +13,7 @@ export const exportTables = internalQuery({
     deadLetters: await ctx.db.query("deadLetters").collect(),
     exporter: await ctx.db.query("exporter").collect(),
     gate: await ctx.db.query("gate").collect(),
+    scoreKeys: await ctx.db.query("scoreKeys").collect(),
   }),
 });
 

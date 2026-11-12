@@ -201,7 +201,7 @@ describe("record", () => {
     const step = await fresh.mutation(internal.exporter.advance, {
       generation: 1,
     });
-    expect(step.done === false && step.spans).toHaveLength(50);
+    expect("spans" in step && step.spans).toHaveLength(50);
 
     // One 900 KiB row, claimed alone.
     const single = initConvexTest({ transactionLimits: true });
@@ -210,7 +210,7 @@ describe("record", () => {
     const alone = await single.mutation(internal.exporter.advance, {
       generation: 1,
     });
-    expect(alone.done === false && alone.spans).toHaveLength(1);
+    expect("spans" in alone && alone.spans).toHaveLength(1);
   });
 });
 
@@ -230,6 +230,7 @@ describe("disabled", () => {
       counter: [],
       exporter: [],
       gate: [],
+      scoreKeys: [],
     });
     const worker = await t.run(async (ctx) =>
       ctx.runQuery(components.batchWorker.lib.status, { name: WORKER_NAME }),

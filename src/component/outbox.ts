@@ -153,10 +153,10 @@ export async function scheduleCount(
  * `exporter.removed*`. It reads both totals and the gate in this transaction,
  * so every gate move follows from one consistent state. It is also the
  * safety net for drift, for example after rows were deleted by hand: when the
- * backlog is positive or the gate is closed although the outbox is empty, it
- * opens the gate and sets the removed totals to the added ones. A negative
- * backlog stays, because its receipts are still to be consumed. It reads the
- * outbox only in that case.
+ * backlog is positive or the gate is closed although the outbox holds no span
+ * row, it opens the gate and sets the removed totals to the added ones. A
+ * negative backlog stays, because its receipts are still to be consumed. It
+ * reads the outbox only in that case.
  *
  * It reads the counter and the exporter document, so it runs in the sweep or
  * in `reconcileGate`, never inside a count step or `advance`.
@@ -175,7 +175,10 @@ export async function reconcile(ctx: MutationCtx): Promise<void> {
   const positive = pending.pendingRows > 0 || pending.pendingBytes > 0;
   if (
     (positive || (await gateClosed(ctx))) &&
-    !(await ctx.db.query("outbox").first())
+    !(await ctx.db
+      .query("outbox")
+      .withIndex("by_kind", (q) => q.eq("kind", "span"))
+      .first())
   ) {
     if (positive) {
       const { _id } = exporter ?? (await getOrCreateExporter(ctx));
@@ -339,21 +342,37 @@ export const health = query({
 });
 
 /**
- * Moves up to `limit` (default 100, at most `RETRY_DEAD_LETTERS_MAX`) dead
- * letters, oldest first, back to the outbox and wakes the exporter. Writes
- * one receipt for the moved rows, so the next count step counts them once.
- * Does nothing while the gate is closed. Run it from the dashboard or CLI
- * after fixing what made Langfuse reject them.
+ * Moves up to `limit` (default 100, at most `RETRY_DEAD_LETTERS_MAX`) span
+ * and trace deletion dead letters, oldest first, back to the outbox and
+ * wakes the exporter. Writes one receipt for the moved span rows, so the
+ * next count step counts them once. While the gate is closed it moves trace
+ * deletion requests only. Score dead letters stay: the app re-sends the
+ * score. Run it from the dashboard or CLI after fixing what made Langfuse
+ * reject them.
  */
 export const retryDeadLetters = internalMutation({
   args: { limit: v.optional(v.number()) },
   returns: v.object({ moved: v.number() }),
   handler: async (ctx, { limit = 100 }) => {
-    if (await gateClosed(ctx)) return { moved: 0 };
-    const deadLetters = await ctx.db
-      .query("deadLetters")
-      .withIndex("by_failedAt")
-      .take(Math.min(RETRY_DEAD_LETTERS_MAX, Math.max(0, Math.floor(limit))));
+    const take = Math.min(
+      RETRY_DEAD_LETTERS_MAX,
+      Math.max(0, Math.floor(limit)),
+    );
+    const kinds = (await gateClosed(ctx))
+      ? (["traceDelete"] as const)
+      : (["span", "traceDelete"] as const);
+    const candidates: Doc<"deadLetters">[] = [];
+    for (const kind of kinds) {
+      candidates.push(
+        ...(await ctx.db
+          .query("deadLetters")
+          .withIndex("by_kind_failedAt", (q) => q.eq("kind", kind))
+          .take(take)),
+      );
+    }
+    const deadLetters = candidates
+      .sort((a, b) => a.failedAt - b.failedAt)
+      .slice(0, take);
     const now = Date.now();
     for (const { _id, kind, ref, bytes, payloadId } of deadLetters) {
       await ctx.db.insert("outbox", {
@@ -365,14 +384,15 @@ export const retryDeadLetters = internalMutation({
       });
       await ctx.db.delete("deadLetters", _id);
     }
-    if (deadLetters.length > 0) {
+    const spans = deadLetters.filter((row) => row.kind === "span");
+    if (spans.length > 0) {
       await ctx.db.insert("receipts", {
-        rows: deadLetters.length,
-        bytes: deadLetters.reduce((sum, row) => sum + row.bytes, 0),
+        rows: spans.length,
+        bytes: spans.reduce((sum, row) => sum + row.bytes, 0),
         seq: ctx.db.vars.commitTs,
       });
-      await pingExporter(ctx);
     }
+    if (deadLetters.length > 0) await pingExporter(ctx);
     return { moved: deadLetters.length };
   },
 });

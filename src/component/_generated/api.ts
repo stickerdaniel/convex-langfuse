@@ -13,7 +13,10 @@ import type * as crons from "../crons.js";
 import type * as exporter from "../exporter.js";
 import type * as outbox from "../outbox.js";
 import type * as retention from "../retention.js";
+import type * as scoreKeys from "../scoreKeys.js";
+import type * as scores from "../scores.js";
 import type * as settings from "../settings.js";
+import type * as traces from "../traces.js";
 import type * as tracing from "../tracing.js";
 
 import type {
@@ -29,7 +32,10 @@ const fullApi: ApiFromModules<{
   exporter: typeof exporter;
   outbox: typeof outbox;
   retention: typeof retention;
+  scoreKeys: typeof scoreKeys;
+  scores: typeof scores;
   settings: typeof settings;
+  traces: typeof traces;
   tracing: typeof tracing;
 }> = anyApi as any;
 

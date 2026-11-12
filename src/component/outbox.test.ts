@@ -453,6 +453,17 @@ describe("counting", () => {
     expect(health.accepting).toBe(true);
   });
 
+  test("a pending trace deletion request does not keep drifted totals alive", async () => {
+    const t = initConvexTest();
+    await drift(t);
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await t.mutation(internal.retention.sweep, {});
+    const health = await t.query(api.outbox.health, {});
+    expect(health.pendingCounted).toEqual({ rows: 0, bytes: 0 });
+    expect(health.accepting).toBe(true);
+    expect((await tables(t)).outbox).toHaveLength(1);
+  });
+
   test("stale totals stay while the outbox holds a row", async () => {
     const t = initConvexTest();
     await drift(t);

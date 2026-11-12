@@ -5,8 +5,11 @@
 // bumping `generation` and taking a lease, or tells the loop how long to wait.
 // The run action alternates between `advance`, which applies the previous
 // request's outcome and claims the next batch, and one HTTP request per batch.
-// A run that dies leaves its lease to expire; the next generation then claims
-// the same rows and sends the same bytes again.
+// A batch is either a run of consecutive span rows, sent as one OTLP request,
+// or exactly one API op (score upsert, score deletion, trace deletion), sent
+// as one request to the Langfuse public API. A run that dies leaves its lease
+// to expire; the next generation then claims the same rows and sends the
+// same bytes again.
 
 import { defineBatchWorkerValidators } from "@convex-dev/batch-worker";
 import { v, type Infer } from "convex/values";
@@ -18,6 +21,7 @@ import {
   internalQuery,
 } from "./_generated/server.js";
 import {
+  API_TIMEOUT_MS,
   BACKOFF_BASE_MS,
   BACKOFF_CAP_MS,
   BATCH_MAX_BYTES,
@@ -25,11 +29,19 @@ import {
   BREAKER_REJECTED_SPANS,
   CLAIM_WINDOW,
   CONFIG_BACKOFF_CAP_MS,
+  DEFERRED_MS,
   LEASE_MS,
   REQUEST_TIMEOUT_MS,
   RUN_BUDGET_MS,
   WORKER_NAME,
 } from "./constants.js";
+import {
+  forgetOp,
+  markAccepted,
+  markFailed,
+  markInFlight,
+} from "./scoreKeys.js";
+import { vApiKind } from "./schema.js";
 import {
   getExporter,
   getOrCreateExporter,
@@ -40,7 +52,7 @@ import {
   withRemoved,
   type Removed,
 } from "./outbox.js";
-import { exportConfig, type ExportConfig } from "./settings.js";
+import { basicAuth, exportConfig, type ExportConfig } from "./settings.js";
 import { buildExportBody } from "../shared/otlp.js";
 import { VERSION } from "../shared/version.js";
 
@@ -58,11 +70,13 @@ const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
   });
 
 export const vReport = v.object({
+  /** `deferred` is a route error of an API op; spans never get it. */
   outcome: v.union(
     v.literal("accepted"),
     v.literal("rejected"),
     v.literal("transient"),
     v.literal("config"),
+    v.literal("deferred"),
   ),
   status: v.optional(v.number()),
   retryAfterMs: v.optional(v.number()),
@@ -70,9 +84,20 @@ export const vReport = v.object({
 /** Outcome of one export request. */
 export type Report = Infer<typeof vReport>;
 
+const vOp = v.object({
+  kind: vApiKind,
+  /** The score id of a score op. */
+  ref: v.string(),
+  /** The request body; empty for a score deletion. */
+  body: v.string(),
+});
+/** One API op, as `advance` hands it to the run. */
+export type Op = Infer<typeof vOp>;
+
 const vStep = v.union(
   v.object({ done: v.literal(true) }),
   v.object({ done: v.literal(false), spans: v.array(v.string()) }),
+  v.object({ done: v.literal(false), op: vOp }),
 );
 type Step = Infer<typeof vStep>;
 
@@ -140,6 +165,10 @@ export const claimable = internalQuery({
  * state, because `nextWork` saw a stale snapshot. It reads no outbox range,
  * so enqueues do not conflict with the loop. Always returns a `debounceMs`,
  * so the loop stays `running` and an enqueue `ping` stays read-only.
+ *
+ * A start after a run died treats a score op still listed in `claimed` like
+ * a transient failure, so no `inFlight` marker survives into the new
+ * generation.
  */
 export const dispatch = internalMutation({
   args: vMutationArgs,
@@ -153,6 +182,10 @@ export const dispatch = internalMutation({
     const backoff = backoffRemaining(exporter, now);
     if (backoff > 0) {
       return { debounceMs: Math.min(backoff, BACKOFF_POLL_MS) };
+    }
+    for (const id of exporter.claimed) {
+      const row = await ctx.db.get("outbox", id);
+      if (row) await markFailed(ctx, row, now);
     }
     // `nextWork` saw an available row. If it is gone, the run ends at once.
     const generation = exporter.generation + 1;
@@ -183,8 +216,14 @@ export const run = internalAction({
         report,
       });
       if (step.done) return null;
-      // Keys removed after rows were enqueued: back off like a 401 would.
-      report = config ? await send(config, step.spans) : { outcome: "config" };
+      if (!config) {
+        // Keys removed after rows were enqueued: back off like a 401 would.
+        report = { outcome: "config" };
+      } else if ("op" in step) {
+        report = await sendOp(config, step.op);
+      } else {
+        report = await send(config, step.spans);
+      }
     }
   },
 });
@@ -202,6 +241,11 @@ function backoffDelay(report: Report, failures: number, cap: number): number {
  * the next batch and renews the lease. Returns `done` when the generation is
  * superseded, the request failed, the run budget is spent or nothing is
  * available.
+ *
+ * An API op differs from a span batch: it never counts toward the removed
+ * totals or the breaker, a rejected op becomes a dead letter at once, and a
+ * `deferred` op moves `DEFERRED_MS` ahead while the run goes on. Score ops
+ * also move through their `scoreKeys` state on claim and with the outcome.
  */
 export const advance = internalMutation({
   args: { generation: v.number(), report: v.optional(vReport) },
@@ -222,7 +266,8 @@ export const advance = internalMutation({
       await scheduleReconcile(ctx);
     };
     const settle = async (): Promise<Removed> => {
-      if (removed.length > 0) await reopen();
+      // Only spans count toward the backlog the gate decides on.
+      if (removed.some((row) => row.kind === "span")) await reopen();
       return withRemoved(exporter, removed);
     };
     const endRun = async (patch: Partial<Doc<"exporter">>) => {
@@ -247,15 +292,21 @@ export const advance = internalMutation({
           exporter.claimed.map((id) => ctx.db.get("outbox", id)),
         )
       ).filter((row) => row !== null);
+      // An API op is always claimed alone. The breaker and the isolation of
+      // rejected batches concern spans only.
+      const op =
+        rows.length === 1 && rows[0]!.kind !== "span" ? rows[0]! : null;
       let outcome = report.outcome;
       if (
         outcome === "rejected" &&
         rows.length === 1 &&
+        !op &&
         consecutiveRejected >= BREAKER_REJECTED_SPANS
       ) {
         // Breaker: a systemic rejection must not dead-letter the backlog.
         outcome = "config";
       }
+      if (outcome === "deferred" && !op && rows.length > 0) outcome = "config";
       switch (outcome) {
         case "accepted":
           for (const row of rows) {
@@ -263,8 +314,12 @@ export const advance = internalMutation({
             await ctx.db.delete("outbox", row._id);
           }
           removed.push(...rows);
-          consecutiveRejected = 0;
-          isolateRemaining = Math.max(0, isolateRemaining - rows.length);
+          if (op) {
+            await markAccepted(ctx, op, now);
+          } else {
+            consecutiveRejected = 0;
+            isolateRemaining = Math.max(0, isolateRemaining - rows.length);
+          }
           Object.assign(patch, {
             accepted: exporter.accepted + rows.length,
             lastAcceptedAt: now,
@@ -288,13 +343,32 @@ export const advance = internalMutation({
             });
             await ctx.db.delete("outbox", _id);
             removed.push(rows[0]!);
-            consecutiveRejected += 1;
-            isolateRemaining = Math.max(0, isolateRemaining - 1);
+            if (op) {
+              await forgetOp(ctx, op, now);
+            } else {
+              consecutiveRejected += 1;
+              isolateRemaining = Math.max(0, isolateRemaining - 1);
+            }
             patch.deadLettered = exporter.deadLettered + 1;
           }
           break;
+        case "deferred":
+          // A route error of one endpoint: only this op waits, the run goes
+          // on with the rows behind it.
+          if (op && !(await markFailed(ctx, op, now))) {
+            await ctx.db.patch("outbox", op._id, {
+              availableAt: now + DEFERRED_MS,
+            });
+          }
+          patch.lastError = {
+            at: now,
+            class: "config",
+            ...(report.status === undefined ? {} : { status: report.status }),
+          };
+          break;
         case "transient":
         case "config": {
+          if (op) await markFailed(ctx, op, now);
           const consecutiveFailures = exporter.consecutiveFailures + 1;
           const cap =
             outcome === "transient" ? BACKOFF_CAP_MS : CONFIG_BACKOFF_CAP_MS;
@@ -325,17 +399,20 @@ export const advance = internalMutation({
       { now },
       { useStaleSnapshot: true },
     );
-    // The longest prefix within the span and byte budgets, at least one row;
-    // exactly one row while isolating the rows of a rejected batch.
+    // Either the longest prefix of span rows within the span and byte
+    // budgets, at least one row, or exactly one API op when the first row is
+    // one. Exactly one row while isolating the rows of a rejected batch.
     const claimed: Doc<"outbox">["_id"][] = [];
     const spans: string[] = [];
+    let op: Op | undefined;
     let bytes = 0;
     for (const id of window) {
       const row = await ctx.db.get("outbox", id);
       if (!row || row.availableAt > now) continue;
       if (
         claimed.length > 0 &&
-        (isolateRemaining > 0 ||
+        (row.kind !== "span" ||
+          isolateRemaining > 0 ||
           claimed.length >= BATCH_MAX_SPANS ||
           bytes + row.bytes > BATCH_MAX_BYTES)
       ) {
@@ -346,9 +423,15 @@ export const advance = internalMutation({
         // A row without its payload can never be sent.
         await ctx.db.delete("outbox", row._id);
         removed.push(row);
+        await forgetOp(ctx, row, now);
         continue;
       }
       claimed.push(row._id);
+      if (row.kind !== "span") {
+        op = { kind: row.kind, ref: row.ref, body: payload.data };
+        await markInFlight(ctx, row, now);
+        break;
+      }
       spans.push(payload.data);
       bytes += row.bytes;
     }
@@ -360,7 +443,7 @@ export const advance = internalMutation({
       claimed,
       leaseExpiresAt: now + LEASE_MS,
     });
-    return { done: false, spans };
+    return op ? { done: false, op } : { done: false, spans };
   },
 });
 
@@ -399,22 +482,33 @@ export function parseRetryAfter(
   return Number.isNaN(at) ? undefined : Math.max(0, at - now);
 }
 
-/** Maps an HTTP status to the exporter's outcome classes. */
+/**
+ * Maps an HTTP status to the exporter's outcome classes. A route error (404,
+ * 405, any 3xx) is `config` for the OTLP request and `deferred` for an API
+ * op, so one wrong API route does not stop the spans.
+ */
 export function classify(
   status: number,
   retryAfter: string | null,
   now: number,
+  target: "otlp" | "api" = "otlp",
 ): Report {
   if (status >= 200 && status < 300) return { outcome: "accepted", status };
   const retryAfterMs = parseRetryAfter(retryAfter, now);
   const timing = retryAfterMs === undefined ? {} : { retryAfterMs };
+  if (status === 401 || status === 403) {
+    return { outcome: "config", status, ...timing };
+  }
   // Status 0 is an opaque redirect in runtimes that hide 3xx responses.
   if (
     status === 0 ||
     (status >= 300 && status < 400) ||
-    [401, 403, 404, 405].includes(status)
+    status === 404 ||
+    status === 405
   ) {
-    return { outcome: "config", status, ...timing };
+    return target === "api"
+      ? { outcome: "deferred", status }
+      : { outcome: "config", status, ...timing };
   }
   if ([408, 425, 429].includes(status) || status >= 500) {
     return { outcome: "transient", status, ...timing };
@@ -423,44 +517,87 @@ export function classify(
   return { outcome: "transient", status, ...timing };
 }
 
-function basicAuth({ publicKey, secretKey }: ExportConfig): string {
-  const bytes = new TextEncoder().encode(`${publicKey}:${secretKey}`);
-  return `Basic ${btoa(String.fromCharCode(...bytes))}`;
-}
-
 /**
- * Sends one batch of encoded spans. Never throws and never reads the response
- * body: network errors and the `REQUEST_TIMEOUT_MS` timeout are `transient`.
+ * One request with `redirect: "manual"`, Basic auth and a JSON body, aborted
+ * after `timeoutMs`. Never throws and never reads the response body: network
+ * errors and the timeout are `transient`.
  */
-export async function send(
+async function request(
   config: ExportConfig,
-  spans: string[],
+  init: {
+    method: "POST" | "DELETE";
+    path: string;
+    body?: string;
+    headers?: Record<string, string>;
+    timeoutMs: number;
+    target: "otlp" | "api";
+  },
 ): Promise<Report> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), init.timeoutMs);
   try {
-    const response = await fetch(
-      `${config.baseUrl}/api/public/otel/v1/traces`,
-      {
-        method: "POST",
-        redirect: "manual",
-        signal: controller.signal,
-        headers: {
-          Authorization: basicAuth(config),
-          "Content-Type": "application/json",
-          "x-langfuse-ingestion-version": "4",
-        },
-        body: buildExportBody(spans, VERSION),
+    const response = await fetch(`${config.baseUrl}${init.path}`, {
+      method: init.method,
+      redirect: "manual",
+      signal: controller.signal,
+      headers: {
+        Authorization: basicAuth(config),
+        "Content-Type": "application/json",
+        ...init.headers,
       },
-    );
+      body: init.body,
+    });
     return classify(
       response.status,
       response.headers.get("Retry-After"),
       Date.now(),
+      init.target,
     );
   } catch {
     return { outcome: "transient" };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/** Sends one batch of encoded spans, with a `REQUEST_TIMEOUT_MS` timeout. */
+export async function send(
+  config: ExportConfig,
+  spans: string[],
+): Promise<Report> {
+  return await request(config, {
+    method: "POST",
+    path: "/api/public/otel/v1/traces",
+    headers: { "x-langfuse-ingestion-version": "4" },
+    body: buildExportBody(spans, VERSION),
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    target: "otlp",
+  });
+}
+
+/** Sends one API op, with an `API_TIMEOUT_MS` timeout. */
+export async function sendOp(config: ExportConfig, op: Op): Promise<Report> {
+  const api = { timeoutMs: API_TIMEOUT_MS, target: "api" as const };
+  switch (op.kind) {
+    case "scoreCreate":
+      return await request(config, {
+        method: "POST",
+        path: "/api/public/scores",
+        body: op.body,
+        ...api,
+      });
+    case "scoreDelete":
+      return await request(config, {
+        method: "DELETE",
+        path: `/api/public/scores/${encodeURIComponent(op.ref)}`,
+        ...api,
+      });
+    case "traceDelete":
+      return await request(config, {
+        method: "DELETE",
+        path: "/api/public/traces",
+        body: op.body,
+        ...api,
+      });
   }
 }

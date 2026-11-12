@@ -9,7 +9,9 @@ const HOUR = 60 * MINUTE;
 export {
   MAX_CALL_BYTES,
   MAX_CALL_RECORDS,
+  MAX_DELETE_IDS,
   MAX_ROW_BYTES,
+  MAX_SCORE_ID_BYTES,
 } from "../shared/limits.js";
 /** UTF-8 bytes of an outbox `ref`. */
 export const MAX_REF_BYTES = 128;
@@ -71,6 +73,34 @@ export const RETENTION_BATCH_BYTES = 8 * MIB;
 
 /** Counts in `health` are lower bounds capped at this value. */
 export const HEALTH_COUNT_CAP = 1_000;
+
+/**
+ * Shortest time between two submissions for one score id. Langfuse applies a
+ * score up to 15 s after it accepted it (`LANGFUSE_INGESTION_QUEUE_DELAY_MS`,
+ * used for scores around the UTC date boundary) but a deletion at once, so a
+ * deletion sent sooner can overtake the write it follows.
+ */
+export const SCORE_SETTLE_MS = 30 * SECOND;
+/** Timeout of one API op request. */
+export const API_TIMEOUT_MS = 10 * SECOND;
+/** How far a route error (404, 405, 3xx) moves an API op ahead. */
+export const DEFERRED_MS = 30 * MINUTE;
+/** Pending trace deletion requests at which `traces.remove` throws. */
+export const MAX_PENDING_DELETES = 1_000;
+/** `scoreKeys` rows without pointers are deleted after this idle time. */
+export const SCORE_KEY_RETENTION_MS = 24 * HOUR;
+/** A synced score config is attached for this long after its sync. */
+export const CONFIG_FRESH_MS = 3 * HOUR;
+/** A config sync that started this recently makes another call return `running`. */
+export const CONFIG_SYNC_LEASE_MS = 5 * MINUTE;
+/** Pages of `CONFIG_PAGE_LIMIT` configs one sync reads at most. */
+export const CONFIG_SYNC_MAX_PAGES = 50;
+/** Configs per page of `GET /api/public/score-configs`, the server maximum. */
+export const CONFIG_PAGE_LIMIT = 100;
+/** Wall time within which one sync must read every page. */
+export const CONFIG_SYNC_DEADLINE_MS = 4 * MINUTE;
+/** Score definitions per config sync. */
+export const MAX_SCORE_DEFINITIONS = 500;
 
 /** Name of the batch-worker loop that drives the exporter. */
 export const WORKER_NAME = "export";
