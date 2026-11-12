@@ -857,6 +857,69 @@ async function main() {
       },
     );
 
+    await runCase(
+      "12 a batch of deleted prompts leaves the cache",
+      async ({ finish }) => {
+        // The refreshes of 100 names start at once, 8 at a time. Each finds
+        // its prompt gone and stops tracking its name.
+        const names = Array.from(
+          { length: 100 },
+          (_, i) => `integration/gone-${String(i).padStart(3, "0")}`,
+        );
+        await Promise.all(
+          names.map((name) =>
+            fake.addPrompt({ name, prompt: "Hello", labels: ["production"] }),
+          ),
+        );
+        const versions = async () => [
+          ...(await client.query(api.promptVersions, {
+            names: names.slice(0, 50),
+          })),
+          ...(await client.query(api.promptVersions, {
+            names: names.slice(50),
+          })),
+        ];
+        await client.action(api.syncPrompts, { names });
+        await waitFor(
+          "every name in the cache",
+          async () => (await versions()).every((v) => v === 1),
+          60_000,
+          500,
+        );
+        const { tracked } = await client.query(api.promptHealth, {});
+        const authorization = `Basic ${btoa("pk-lf-integration:sk-lf-integration")}`;
+        for (const name of names) {
+          const response = await fetch(
+            `${fake.url}/api/public/v2/prompts/${encodeURIComponent(name)}`,
+            { method: "DELETE", headers: { authorization } },
+          );
+          if (response.status !== 204) {
+            throw new Error(
+              `the fake answered ${response.status} to a deletion`,
+            );
+          }
+        }
+        await client.action(api.syncPrompts, { names });
+        await waitFor(
+          "every name out of the cache",
+          async () =>
+            (await client.query(api.promptHealth, {})).tracked ===
+              tracked - names.length &&
+            (await versions()).every((v) => v === null),
+          60_000,
+          500,
+        );
+        const failed = (await finish()).filter((log) => log.error);
+        if (failed.length > 0) {
+          throw new Error(
+            `${failed.length} failed executions, first ${failed[0].identifier}: ` +
+              String(failed[0].error).split("\n")[0].slice(0, 160),
+          );
+        }
+        return `${names.length} names tracked, deleted at the endpoint and no longer tracked`;
+      },
+    );
+
     const final = await fake.stats();
     const diverging = divergent(final);
     results.push({

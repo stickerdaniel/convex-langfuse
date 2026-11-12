@@ -114,9 +114,12 @@ export const prompt = query({
   },
 });
 
-/** Tracks every prompt the endpoint lists, as `prompts.sync` does. */
+/**
+ * Tracks `names`, or every prompt the endpoint lists, as `prompts.sync`
+ * does.
+ */
 export const syncPrompts = action({
-  args: {},
+  args: { names: v.optional(v.array(v.string())) },
   returns: v.object({
     status: v.union(
       v.literal("ok"),
@@ -126,7 +129,7 @@ export const syncPrompts = action({
     tracked: v.number(),
     overflow: v.number(),
   }),
-  handler: async (ctx) => await strict.prompts.sync(ctx),
+  handler: async (ctx, args) => await strict.prompts.sync(ctx, args),
 });
 
 /**
