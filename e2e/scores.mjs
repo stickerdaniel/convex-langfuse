@@ -403,11 +403,10 @@ async function characterize({ client, langfuse, score, recordTrace }) {
         // A repetition that ends with a deletion says nothing about the
         // component while the server does not apply its own deletions.
         evaluated: spec.expected !== null || deletionsApplied,
-        // An expected absence must hold at both reads.
-        correct:
-          spec.expected === null
-            ? ok(first[i]) && ok(second[i])
-            : ok(second[i]),
+        // The second read is the final state. Langfuse applies score
+        // deletions in batches, so a deleted score can still show at the
+        // first read.
+        correct: ok(second[i]),
       };
     });
     results.phases.push({ phase, outcomes });

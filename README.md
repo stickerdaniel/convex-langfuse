@@ -293,9 +293,9 @@ export const rate = mutation({
   `LANGFUSE_CLICKHOUSE_TRACE_DELETION_CONCURRENCY_DURATION_MS`). Deleting a
   trace deletes its scores in one step.
 - A write or a deletion replaces an operation of the same id that still waits.
-  Operations of one id are sent one at a time, at least 30 seconds apart.
-  Langfuse applies a write asynchronously, around midnight UTC after a queue
-  delay of 15 seconds.
+  Operations of one id are sent one at a time, the next one at least 30 seconds
+  after Langfuse accepted the one before. Langfuse applies a write
+  asynchronously, around midnight UTC after a queue delay of 15 seconds.
 - Langfuse does not order two operations on one id, so the value it finally
   stores is not guaranteed. Keep your own record of a rating as the source of
   truth, as the example does.

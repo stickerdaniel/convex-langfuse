@@ -34,6 +34,7 @@ import {
   LEASE_MS,
   REQUEST_TIMEOUT_MS,
   RUN_BUDGET_MS,
+  SCORE_SETTLE_MS,
   WORKER_NAME,
 } from "./constants.js";
 import {
@@ -431,7 +432,7 @@ export const advance = internalMutation({
         break;
       }
       if (row.kind === "traceDelete") {
-        const heldUntil = await behindOlderScoreWrites(ctx, row);
+        const heldUntil = await behindOlderScoreWrites(ctx, row, now);
         if (heldUntil !== undefined) {
           await ctx.db.patch("outbox", row._id, { availableAt: heldUntil });
           continue;
@@ -467,14 +468,16 @@ export const advance = internalMutation({
 });
 
 /**
- * The `availableAt` just after the latest one among the first `CLAIM_WINDOW`
- * score writes created before the trace deletion request `row`, or
- * `undefined` when the outbox holds none. Langfuse deletes a trace with its
- * scores, and a score write sent after that creates a score for the purged
- * trace, so a deletion request waits until the score writes enqueued before
- * it left the outbox: accepted, rejected or expired. A later claim evaluates
- * again. Score writes created after the request and score deletions do not
- * hold it back.
+ * When the trace deletion request `row` is looked at again, or `undefined`
+ * when the outbox holds no score write created before it. Langfuse deletes a
+ * trace with its scores, and a score write sent after that creates a score
+ * for the purged trace, so a deletion request waits until the score writes
+ * enqueued before it left the outbox: accepted, rejected, expired or
+ * replaced. The time is just after the latest `availableAt` among the first
+ * `CLAIM_WINDOW` of them, at most `SCORE_SETTLE_MS` ahead, so a request whose
+ * older score writes are gone before their time is sent within that
+ * interval. Each claim evaluates again. Score writes created after the
+ * request and score deletions do not hold it back.
  *
  * `advance` calls it only while a deletion request is first in line. It is
  * the one place where `advance` reads an outbox index range, so a score
@@ -483,6 +486,7 @@ export const advance = internalMutation({
 async function behindOlderScoreWrites(
   ctx: QueryCtx,
   row: Doc<"outbox">,
+  now: number,
 ): Promise<number | undefined> {
   const older = await ctx.db
     .query("outbox")
@@ -491,7 +495,8 @@ async function behindOlderScoreWrites(
     )
     .take(CLAIM_WINDOW);
   if (older.length === 0) return undefined;
-  return Math.max(...older.map((score) => score.availableAt)) + 1;
+  const latest = Math.max(...older.map((score) => score.availableAt));
+  return Math.min(latest + 1, now + SCORE_SETTLE_MS);
 }
 
 /**

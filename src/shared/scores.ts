@@ -55,10 +55,10 @@ export type ScoreFields = {
  * It leaves out what the component adds to the request body. The ISO
  * timestamp adds at most 28 bytes over the number, the default environment
  * at most 57 bytes (40 characters), and the config id 14 bytes plus its
- * length, 39 bytes for the 25-character cuid Langfuse 4.78.0 gives a config.
- * The component measures `metadata` as it re-serializes it, and the stored
+ * length, 50 bytes for the UUID Langfuse 4.78.0 gives a config. The
+ * component measures `metadata` as it re-serializes it, and the stored
  * object is shorter than that string. A stored score body therefore has at
- * most `MAX_ROW_BYTES` + 124 = 921,724 bytes, below the 1 MiB of a Convex
+ * most `MAX_ROW_BYTES` + 135 = 921,735 bytes, below the 1 MiB of a Convex
  * document.
  */
 export function scoreBytes(fields: ScoreFields): number {

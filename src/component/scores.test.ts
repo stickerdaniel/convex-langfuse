@@ -608,21 +608,46 @@ describe("trace deletion requests", () => {
     expect(fake.requests[1]!.at - requestedAt).toBeLessThan(SCORE_SETTLE_MS);
   });
 
-  test("the claim that holds back a deletion request goes on with the spans behind it", async () => {
+  test("spans behind a held-back deletion request are sent while it waits", async () => {
     await upsert("s1", 1);
     await acceptFirst();
     await upsert("s1", 2);
     await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    const recordedAt = Date.now();
     await recordSpans(0, 3);
-    await startRunByHand(t);
+    await drive(t, fake);
 
-    const step = await t.mutation(internal.exporter.advance, { generation: 1 });
-    expect(step).toMatchObject({ done: false, spans: { length: 3 } });
-    // The request now waits just behind the score write enqueued before it.
-    const { outbox } = await tables(t);
-    const score = outbox.find((row) => row.kind === "scoreCreate")!;
-    const deletion = outbox.find((row) => row.kind === "traceDelete")!;
-    expect(deletion.availableAt).toBe(score.availableAt + 1);
+    expect(requestLog()).toEqual([
+      "score 1",
+      "spans 3",
+      "score 2",
+      "trace delete",
+    ]);
+    expect(fake.requests[1]!.at - recordedAt).toBeLessThan(SCORE_SETTLE_MS);
+  });
+
+  test("a held-back deletion request is sent soon after its older score write was replaced by a deletion", async () => {
+    // The score endpoint answers 404, so the score write waits DEFERRED_MS.
+    fake.fallback = (request) =>
+      isScorePost(request) ? { status: 404 } : { status: 200 };
+    await upsert("s1", 1);
+    await drive(t, fake, { until: () => scorePosts().length === 1 });
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    const deletionRow = async () =>
+      (await tables(t)).outbox.find((row) => row.kind === "traceDelete")!;
+    const enqueuedFor = (await deletionRow()).availableAt;
+    // The exporter holds the request back behind the deferred score write.
+    await drive(t, fake, {
+      until: async () => (await deletionRow()).availableAt !== enqueuedFor,
+    });
+    expect(fake.requests.some(isTraceDelete)).toBe(false);
+    const replacedAt = Date.now();
+    await t.mutation(api.scores.remove, { id: "s1" });
+    await drive(t, fake, { until: () => fake.requests.some(isTraceDelete) });
+
+    const deletion = fake.requests.find(isTraceDelete)!;
+    expect(deletion.at - replacedAt).toBeLessThan(2 * SCORE_SETTLE_MS);
+    expect(deletion.at - replacedAt).toBeLessThan(DEFERRED_MS / 10);
   });
 
   test("returns disabled without writing on a disabled component", async () => {
