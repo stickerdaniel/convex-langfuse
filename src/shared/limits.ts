@@ -17,7 +17,7 @@ export const MAX_CALL_RECORDS = 50;
  * stay close to this size and far below Convex's 16 MiB argument limit.
  */
 export const CLIENT_CALL_BYTES = 3 * MIB;
-/** Tags per trace. Convex accepts 8,192 array elements. */
-export const MAX_TAGS = 1_000;
-/** Entries of one usage or cost record. Convex accepts 1,024 object fields. */
-export const MAX_DETAIL_KEYS = 1_000;
+/** Tags per trace: the elements Convex accepts in an array. */
+export const MAX_TAGS = 8_192;
+/** Entries of one usage or cost record: the fields Convex accepts in an object. */
+export const MAX_DETAIL_KEYS = 1_024;

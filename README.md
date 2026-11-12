@@ -206,9 +206,9 @@ Notes on the fields:
 - Times are epoch milliseconds. `startTime` defaults to now, `endTime` to
   `startTime`.
 - `usage` keys are passed through. Values must be non-negative integers.
-- `usage` and `cost` hold at most 1,000 entries each. A key has 1 to 1,024
+- `usage` and `cost` hold at most 1,024 entries each. A key has 1 to 1,024
   printable ASCII characters and starts with neither `$` nor `_`.
-- `tags` are at most 1,000 strings.
+- `tags` are at most 8,192 strings.
 - With `cost` set, Langfuse uses your numbers and infers nothing from the model
   name. Without it, Langfuse prices the usage from its model table.
 - `prompt` links a generation to a prompt version in Langfuse. Other observation
@@ -273,19 +273,21 @@ With `onError: "log"`, the default, a recording method never throws. It logs
 `[convex-langfuse] <code>` and returns the ids. With `onError: "throw"` it
 throws an `Error` whose message is the code, which rolls back a mutation.
 
-| Code                  | Meaning                                                       | Record sent        |
-| --------------------- | ------------------------------------------------------------- | ------------------ |
-| `invalid_id`          | A trace id, observation id, seed or key is invalid            | no                 |
-| `invalid_environment` | The environment name breaks Langfuse's rule                   | no                 |
-| `row_too_large`       | The encoded observation exceeds 900 KiB                       | no                 |
-| `redact_failed`       | `redact` threw                                                | no                 |
-| `backlog`             | The outbox is full, see [Delivery](#delivery)                 | no                 |
-| `enqueue_failed`      | The component call failed                                     | no                 |
-| `unserializable`      | `input`, `output` or a JSON field cannot be serialized        | without that field |
-| `invalid_metadata`    | A metadata or model-parameter value is not a plain object     | without that field |
-| `invalid_tags`        | The tags are not an array of at most 1,000 strings            | without the tags   |
-| `invalid_usage`       | A usage entry has a bad key or value, or there are over 1,000 | without that entry |
-| `invalid_cost`        | A cost entry has a bad key or value, or there are over 1,000  | without that entry |
+| Code                  | Meaning                                                      | Record sent        |
+| --------------------- | ------------------------------------------------------------ | ------------------ |
+| `invalid_id`          | A trace id, observation id, seed or key is invalid           | no                 |
+| `invalid_environment` | The environment name breaks Langfuse's rule                  | no                 |
+| `row_too_large`       | The encoded observation exceeds 900 KiB                      | no                 |
+| `redact_failed`       | `redact` threw                                               | no                 |
+| `backlog`             | The outbox is full, see [Delivery](#delivery)                | no                 |
+| `enqueue_failed`      | The component call failed                                    | no                 |
+| `unserializable`      | `input`, `output` or a JSON field cannot be serialized       | without that field |
+| `invalid_metadata`    | A metadata or model-parameter value is not a plain object    | without that field |
+| `invalid_tags`        | The tags are not an array of at most 8,192 strings           | without the tags   |
+| `invalid_usage`       | A usage entry has a bad key or value                         | without that entry |
+| `invalid_usage`       | `usage` has more than 1,024 entries                          | without `usage`    |
+| `invalid_cost`        | A cost entry has a bad key or value                          | without that entry |
+| `invalid_cost`        | `cost` has more than 1,024 entries, or its sum is not finite | without `cost`     |
 
 ## Delivery
 
@@ -317,8 +319,8 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Observations per component call        | 50, split by the client                |
 | Encoded bytes per component call       | 3 MiB, split by the client             |
 | Kept part of a cut `input` or `output` | `maxFieldBytes`, default 131,072 bytes |
-| Tags per trace                         | 1,000                                  |
-| Entries of `usage` or `cost`           | 1,000 each                             |
+| Tags per trace                         | 8,192                                  |
+| Entries of `usage` or `cost`           | 1,024 each                             |
 | Spans per export request               | 50                                     |
 | Bytes per export request               | 512 KiB, a larger span goes alone      |
 
