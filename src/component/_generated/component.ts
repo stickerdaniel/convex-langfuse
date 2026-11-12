@@ -45,6 +45,63 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           oldestPendingAt?: number;
           pendingAtLeast: number;
           pendingCounted: { bytes: number; rows: number };
+          prompts: {
+            errors: number;
+            lastListAt?: number;
+            lastWebhookAt?: number;
+            oldestAttemptAt?: number;
+            tracked: number;
+          };
+        },
+        Name
+      >;
+    };
+    prompts: {
+      get: FunctionReference<
+        "query",
+        "internal",
+        { label?: string; name: string; version?: number },
+        {
+          config: string;
+          name: string;
+          prompt: string;
+          snapshotId: string;
+          source: "langfuse" | "fallback";
+          type: "text" | "chat";
+          version?: number;
+        } | null,
+        Name
+      >;
+      pin: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          fallback?: { config?: string; prompt: string; type: "text" | "chat" };
+          label?: string;
+          name: string;
+          scope: string;
+          ttlMs?: number;
+          version?: number;
+        },
+        {
+          config: string;
+          name: string;
+          prompt: string;
+          snapshotId: string;
+          source: "langfuse" | "fallback";
+          type: "text" | "chat";
+          version?: number;
+        } | null,
+        Name
+      >;
+      sync: FunctionReference<
+        "action",
+        "internal",
+        { names?: Array<string> },
+        {
+          overflow: number;
+          status: "ok" | "incomplete" | "disabled";
+          tracked: number;
         },
         Name
       >;

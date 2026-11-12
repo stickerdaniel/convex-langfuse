@@ -3,7 +3,12 @@ import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { expectTypeOf, test } from "vitest";
 import componentTest from "../test.js";
-import { defineScores, Langfuse, type Recorded } from "./index.js";
+import {
+  defineScores,
+  Langfuse,
+  type ChatMessage,
+  type Recorded,
+} from "./index.js";
 
 // An app with a table of its own: its ctx types carry a concrete data model.
 const app = defineTestApp({
@@ -128,6 +133,49 @@ test("generation accepts the mutation and action ctx of an app", () => {
     handler: async (ctx) => {
       // @ts-expect-error a query cannot record
       await trace.generation(ctx, { key: "k", name: "n" });
+    },
+  });
+});
+
+test("prompts: get takes a label or a version, pin needs a mutation or action ctx", () => {
+  const { prompts } = new Langfuse(component, { content: "full" });
+  app.query({
+    args: {},
+    handler: async (ctx) => {
+      const prompt = await prompts.get(ctx, { name: "n", label: "staging" });
+      await prompts.get(ctx, { name: "n", version: 3 });
+      // @ts-expect-error a label and a version together
+      await prompts.get(ctx, { name: "n", label: "staging", version: 3 });
+      // @ts-expect-error a query cannot pin
+      await prompts.pin(ctx, { scope: "s", name: "n" });
+      if (prompt?.type === "chat") {
+        expectTypeOf(prompt.prompt).toEqualTypeOf<ChatMessage[]>();
+      } else if (prompt) {
+        expectTypeOf(prompt.prompt).toEqualTypeOf<string>();
+      }
+    },
+  });
+  app.mutation({
+    args: {},
+    handler: async (ctx) => {
+      await prompts.pin(ctx, {
+        scope: "s",
+        name: "n",
+        fallback: { type: "chat", prompt: [{ role: "user", content: "c" }] },
+      });
+      await prompts.pin(ctx, {
+        scope: "s",
+        name: "n",
+        // @ts-expect-error a chat fallback takes messages
+        fallback: { type: "chat", prompt: "text" },
+      });
+    },
+  });
+  app.action({
+    args: {},
+    handler: async (ctx) => {
+      await prompts.sync(ctx, { names: ["n"] });
+      await prompts.pin(ctx, { scope: "s", name: "n" });
     },
   });
 });

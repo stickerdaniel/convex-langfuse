@@ -1,5 +1,5 @@
-// Bounds of the component's enqueue calls. The component enforces them; the
-// client splits and refuses before it calls the component.
+// Bounds of the component's calls. The component enforces them; the client
+// splits and refuses before it calls the component.
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
@@ -29,3 +29,5 @@ export const MAX_DETAIL_KEYS = 1_024;
 export const MAX_SCORE_ID_BYTES = 128;
 /** Trace ids per `traces.remove` call, and so per deletion request. */
 export const MAX_DELETE_IDS = 100;
+/** UTF-8 bytes of a `prompts.pin` scope. */
+export const MAX_PROMPT_SCOPE_BYTES = 256;

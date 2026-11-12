@@ -12,8 +12,12 @@
 // The public API routes the component and the end-to-end scripts use keep
 // their state in memory and apply it at once: scores (`POST /scores`,
 // `DELETE /scores/{id}`, `GET /v3/scores?id=`), score configs (`GET` and
-// `POST /score-configs`), trace deletion (`DELETE /traces`) and observations
-// of the received spans (`GET /v2/observations?traceId=`).
+// `POST /score-configs`), trace deletion (`DELETE /traces`), observations
+// of the received spans (`GET /v2/observations?traceId=`) and prompts
+// (`GET /v2/prompts?name=`, `GET /v2/prompts/{name}?label=|version=`,
+// without references). `POST /control/prompts` with `{ name, prompt,
+// labels }` adds the next text version of a prompt and moves the labels to
+// it.
 
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -41,6 +45,20 @@ const scores = new Map();
 const configs = [];
 /** Trace id to the ids of its received spans. */
 const observations = new Map();
+/** Prompt name to its versions: `{ version, prompt, labels }`. */
+const prompts = new Map();
+
+/** Adds the next text version of `name` and moves `labels` to it. */
+function addPrompt({ name, prompt, labels }) {
+  const versions = prompts.get(name) ?? [];
+  prompts.set(name, versions);
+  for (const entry of versions) {
+    entry.labels = entry.labels.filter((label) => !labels.includes(label));
+  }
+  const version = versions.length + 1;
+  versions.push({ version, prompt, labels: [...labels] });
+  return version;
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -101,7 +119,9 @@ function validScore(body) {
 /** Answers a public API request; returns false for an unknown route. */
 async function publicApi(req, res, url) {
   const route = url.pathname.replace(/^\/api\/public/, "");
-  const key = `${req.method} ${route.replace(/^\/scores\/.+/, "/scores/{id}")}`;
+  const key = `${req.method} ${route
+    .replace(/^\/scores\/.+/, "/scores/{id}")
+    .replace(/^\/v2\/prompts\/.+/, "/v2/prompts/{name}")}`;
   stats.api[key] = (stats.api[key] ?? 0) + 1;
   if (req.method === "POST" && route === "/scores") {
     const body = JSON.parse(await readBody(req));
@@ -167,6 +187,52 @@ async function publicApi(req, res, url) {
     for (const traceId of traceIds) observations.delete(traceId);
     return json(res, 200, { message: "Traces deleted successfully" });
   }
+  if (req.method === "GET" && route === "/v2/prompts") {
+    const name = url.searchParams.get("name");
+    const page = Number(url.searchParams.get("page") ?? 1);
+    const limit = Number(url.searchParams.get("limit") ?? 10);
+    const names = [...prompts.keys()]
+      .filter((item) => name === null || item === name)
+      .sort();
+    const data = names.slice((page - 1) * limit, page * limit).map((item) => ({
+      name: item,
+      versions: prompts.get(item).map((entry) => entry.version),
+      labels: [...new Set(prompts.get(item).flatMap((e) => e.labels))].sort(),
+      tags: [],
+      lastUpdatedAt: new Date().toISOString(),
+      type: "text",
+      lastConfig: {},
+    }));
+    const totalPages = Math.ceil(names.length / limit);
+    return json(res, 200, {
+      data,
+      meta: { page, limit, totalItems: names.length, totalPages },
+    });
+  }
+  if (req.method === "GET" && route.startsWith("/v2/prompts/")) {
+    const name = decodeURIComponent(route.slice("/v2/prompts/".length));
+    const version = url.searchParams.get("version");
+    const label = url.searchParams.get("label") ?? "production";
+    const entry = prompts
+      .get(name)
+      ?.find((item) =>
+        version === null
+          ? item.labels.includes(label)
+          : item.version === Number(version),
+      );
+    if (!entry) return json(res, 404, { message: "Prompt not found" });
+    return json(res, 200, {
+      id: `${name}@${entry.version}`,
+      name,
+      version: entry.version,
+      type: "text",
+      prompt: entry.prompt,
+      config: {},
+      labels: entry.labels,
+      tags: [],
+      resolutionGraph: null,
+    });
+  }
   if (req.method === "GET" && route === "/v2/observations") {
     const traceId = url.searchParams.get("traceId");
     const data = [...(observations.get(traceId) ?? [])].map((id) => ({
@@ -183,6 +249,10 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://fake");
     if (req.method === "GET" && url.pathname === "/stats") {
       return json(res, 200, stats);
+    }
+    if (req.method === "POST" && url.pathname === "/control/prompts") {
+      const version = addPrompt(JSON.parse(await readBody(req)));
+      return json(res, 200, { version });
     }
     if (req.method === "POST" && url.pathname === "/control") {
       mode = JSON.parse(await readBody(req));

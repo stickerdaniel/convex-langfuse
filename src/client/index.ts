@@ -17,6 +17,7 @@ import {
   MAX_CALL_RECORDS,
   MAX_DELETE_IDS,
   MAX_DETAIL_KEYS,
+  MAX_PROMPT_SCOPE_BYTES,
   MAX_ROW_BYTES,
   MAX_SCORE_ID_BYTES,
   MAX_TAGS,
@@ -25,6 +26,7 @@ import {
   byteLength,
   costDetails,
   encodeSpan,
+  hasLoneSurrogate,
   isCostValue,
   promptLink,
 } from "../shared/otlp.js";
@@ -33,7 +35,7 @@ import type {
   Level,
   Observation,
   ObservationType,
-  Prompt,
+  Prompt as PromptLink,
   TraceContext,
 } from "../shared/validators.js";
 
@@ -121,6 +123,189 @@ export type ScoreInit<S extends ScoreDefinitions | undefined = undefined> =
 export type SyncResult = FunctionReturnType<
   ComponentApi["scores"]["syncConfigs"]
 >;
+
+/** A chat message as the Langfuse SDKs model it: a message or a placeholder. */
+export type ChatMessage =
+  | { role: string; content: string }
+  | { type: "placeholder"; name: string };
+
+/**
+ * A cached prompt. `version` is absent for a fallback. `source` tells where
+ * the bytes came from: link an observation to the prompt (`prompt: { name,
+ * version }`) only when it is `"langfuse"`. `snapshotId` names the immutable
+ * snapshot, so equal ids mean equal bytes.
+ */
+export type Prompt = {
+  name: string;
+  version?: number;
+  source: "langfuse" | "fallback";
+  snapshotId: string;
+  /** The prompt's config, parsed from JSON. */
+  config: unknown;
+} & (
+  | { type: "text"; prompt: string }
+  | { type: "chat"; prompt: ChatMessage[] }
+);
+
+/** What `prompts.pin` stores and pins when the cache holds no prompt. */
+export type PromptFallback =
+  | { type: "text"; prompt: string; config?: Record<string, unknown> }
+  | { type: "chat"; prompt: ChatMessage[]; config?: Record<string, unknown> };
+
+/** A prompt name with a label (default `production`) or a version, not both. */
+export type PromptSelector = { name: string } & (
+  | { label?: string; version?: never }
+  | { version: number; label?: never }
+);
+
+/** The result of `prompts.sync`, as the component returns it. */
+export type PromptSyncResult = FunctionReturnType<
+  ComponentApi["prompts"]["sync"]
+>;
+
+/**
+ * The component's prompt cache. It holds what Langfuse served and never
+ * fetches on a read. The signed webhook refreshes a prompt and the prompts
+ * that reference it; a rolling refresh schedules every tracked name again
+ * no later than the first 5-minute tick after its last attempt is 13 minutes
+ * old, plus 99.8 s. Template compilation is not part of the component:
+ * compile `prompt` with the variables of the call site.
+ *
+ * A name, label or scope with a lone surrogate, and a scope over 256 UTF-8
+ * bytes, are refused with a `ConvexError` before the component call:
+ * `invalid_prompt_name`, `invalid_prompt_selector` or `invalid_prompt_scope`.
+ */
+export interface Prompts {
+  /**
+   * The cached prompt for a label (default `production`) or a version, or
+   * `null` on a miss. A version is served as the last refresh resolved it,
+   * while a label or a pin still holds that snapshot; a pin on an older
+   * resolution of the version does not keep the version readable. From a
+   * query, it is reactive: the query reruns when a refresh moves the label.
+   * Throws on a label and a version together.
+   */
+  get(ctx: RunQueryCtx, selector: PromptSelector): Promise<Prompt | null>;
+  /**
+   * The prompt a scope, such as a conversation, uses for a name. The first
+   * call resolves like `get`, stores `fallback` on a miss, and pins the
+   * result for `ttlMs` (default 7 days); every later call for the scope and
+   * name returns the same bytes until the pin expires, whatever its label,
+   * version or fallback. Returns `null` on a miss without a fallback. Runs
+   * in the caller's transaction. A scope has at most 256 UTF-8 bytes. A lone
+   * surrogate in the fallback's text or config is stored as U+FFFD.
+   */
+  pin(
+    ctx: RunMutationCtx,
+    args: PromptSelector & {
+      scope: string;
+      fallback?: PromptFallback;
+      ttlMs?: number;
+    },
+  ): Promise<Prompt | null>;
+  /**
+   * Turns the cache on and schedules refreshes: for `names`, or for every
+   * prompt of the project. Run it from an action after deploying; the
+   * refreshes run in the background. Without it or a webhook delivery, the
+   * cache stays empty. A listing that stops at 5,000 names or 150 requests,
+   * or skips a name whose listing entry alone passes the response cap of
+   * 6 MiB, returns `incomplete`. A name has 1 to 256 UTF-8 bytes;
+   * `invalid_prompt_name` refuses another.
+   */
+  sync(
+    ctx: RunActionCtx,
+    args?: { names?: string[] },
+  ): Promise<PromptSyncResult>;
+}
+
+type StoredPrompt = NonNullable<
+  FunctionReturnType<ComponentApi["prompts"]["get"]>
+>;
+
+/** A prompt as the component stores it, with its JSON parsed. */
+function decodePrompt(stored: StoredPrompt): Prompt {
+  const { name, version, source, snapshotId } = stored;
+  const base = {
+    name,
+    ...(version === undefined ? {} : { version }),
+    source,
+    snapshotId,
+    config: JSON.parse(stored.config) as unknown,
+  };
+  return stored.type === "chat"
+    ? {
+        ...base,
+        type: "chat",
+        prompt: JSON.parse(stored.prompt) as ChatMessage[],
+      }
+    : { ...base, type: "text", prompt: stored.prompt };
+}
+
+/**
+ * Refuses a name, label or scope with a lone surrogate before the component
+ * call, which Convex would refuse: a replaced character would name another
+ * prompt or scope. Refuses a scope over `MAX_PROMPT_SCOPE_BYTES` too, as the
+ * component does.
+ */
+function checkPromptArgs({
+  name,
+  label,
+  scope,
+}: {
+  name: string;
+  label?: string;
+  scope?: string;
+}): void {
+  if (hasLoneSurrogate(name)) throw new ConvexError("invalid_prompt_name");
+  if (label !== undefined && hasLoneSurrogate(label)) {
+    throw new ConvexError("invalid_prompt_selector");
+  }
+  if (
+    scope !== undefined &&
+    (hasLoneSurrogate(scope) || byteLength(scope) > MAX_PROMPT_SCOPE_BYTES)
+  ) {
+    throw new ConvexError("invalid_prompt_scope");
+  }
+}
+
+function promptsOf(component: ComponentApi): Prompts {
+  return {
+    async get(ctx, { name, label, version }) {
+      checkPromptArgs({ name, label });
+      const stored = await ctx.runQuery(component.prompts.get, {
+        name,
+        label,
+        version,
+      });
+      return stored && decodePrompt(stored);
+    },
+    async pin(ctx, { scope, name, label, version, fallback, ttlMs }) {
+      checkPromptArgs({ name, label, scope });
+      const stored = await ctx.runMutation(component.prompts.pin, {
+        scope,
+        name,
+        label,
+        version,
+        ttlMs,
+        fallback: fallback && {
+          type: fallback.type,
+          prompt:
+            fallback.type === "chat"
+              ? wellFormedJson(fallback.prompt)
+              : wellFormed(fallback.prompt),
+          config:
+            fallback.config === undefined
+              ? undefined
+              : wellFormedJson(fallback.config),
+        },
+      });
+      return stored && decodePrompt(stored);
+    },
+    async sync(ctx, args = {}) {
+      for (const name of args.names ?? []) checkPromptArgs({ name });
+      return await ctx.runAction(component.prompts.sync, args);
+    },
+  };
+}
 
 /** An observation named by a key, hashed together with the trace id, or by its id. */
 export type ObservationRef =
@@ -308,9 +493,10 @@ function sortedJson(value: unknown): unknown {
 }
 
 /**
- * A copy with every lone surrogate replaced by U+FFFD, in strings at any
- * depth. A string cut inside an emoji holds one. Convex refuses an argument
- * with such a string, which would fail the whole component call.
+ * A copy with every lone surrogate replaced by U+FFFD, in strings and
+ * object keys at any depth. A string cut inside an emoji holds one. Convex
+ * refuses an argument with such a string, which would fail the whole
+ * component call.
  */
 function wellFormed<T>(value: T): T;
 function wellFormed(value: unknown): unknown {
@@ -320,10 +506,24 @@ function wellFormed(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((item) => wellFormed(item));
   if (typeof value === "object" && value !== null) {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, wellFormed(item)]),
+      Object.entries(value).map(([key, item]) => [
+        wellFormed(key),
+        wellFormed(item),
+      ]),
     );
   }
   return value;
+}
+
+/**
+ * `value` as JSON with every lone surrogate replaced by U+FFFD. Parsing the
+ * JSON first applies `toJSON`, and `JSON.stringify` would only escape a
+ * lone surrogate, which parses back into one.
+ */
+function wellFormedJson(value: unknown): string {
+  return JSON.stringify(
+    wellFormed(JSON.parse(JSON.stringify(value)) as unknown),
+  );
 }
 
 /**
@@ -473,15 +673,6 @@ function scoreValue(
   }
 }
 
-/**
- * Whether `text` holds a lone surrogate. Convex refuses such an argument,
- * and `wellFormed` would replace it, so a name, id or category with one is
- * refused instead: the replaced text would name another thing.
- */
-function hasLoneSurrogate(text: string): boolean {
-  return /\p{Cs}/u.test(text);
-}
-
 /** A score id has 1 to `MAX_SCORE_ID_BYTES` UTF-8 bytes and no lone surrogate. */
 function isScoreId(id: string): boolean {
   const bytes = byteLength(id);
@@ -564,10 +755,13 @@ export class Langfuse<
   readonly #options: LangfuseOptions<S>;
   /** `definitionFingerprint` per defined score name, computed once. */
   readonly #fingerprints = new Map<string, Promise<string>>();
+  /** The prompt cache: `get`, `pin` and `sync`. */
+  readonly prompts: Prompts;
 
   constructor(component: ComponentApi, options: LangfuseOptions<S>) {
     this.#component = component;
     this.#options = options;
+    this.prompts = promptsOf(component);
   }
 
   /**
@@ -1029,7 +1223,7 @@ export class Langfuse<
     const exported = cost.kept && costDetails(cost.kept) !== undefined;
     if (cost.invalid || (cost.kept && !exported)) problems.add("invalid_cost");
     // Only a generation exports its prompt link, and only a complete one.
-    let link: Prompt | undefined;
+    let link: PromptLink | undefined;
     if (observation.type === "generation" && observation.prompt !== undefined) {
       link = promptLink(observation.prompt);
       if (!link) problems.add("invalid_prompt");

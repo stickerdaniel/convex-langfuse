@@ -17,6 +17,7 @@ import {
   RETRY_DEAD_LETTERS_MAX,
   WORKER_NAME,
 } from "./constants.js";
+import { promptHealth, vPromptHealth } from "./prompts.js";
 import type { Kind } from "./schema.js";
 import { exportConfig } from "./settings.js";
 
@@ -305,7 +306,7 @@ const vLastError = v.object({
  * bytes, so before it is consumed the bytes can also be too high.
  * `oldestPendingAt` is the
  * creation time of the oldest pending row. `backoffUntil` is set only while a
- * backoff is active.
+ * backoff is active. `prompts` is the state of the prompt cache.
  */
 export const health = query({
   args: {},
@@ -326,6 +327,7 @@ export const health = query({
       deadLettered: v.number(),
       expired: v.number(),
     }),
+    prompts: vPromptHealth,
   }),
   handler: async (ctx) => {
     const now = Date.now();
@@ -365,6 +367,7 @@ export const health = query({
         deadLettered: exporter?.deadLettered ?? 0,
         expired: exporter?.expired ?? 0,
       },
+      prompts: await promptHealth(ctx),
     };
   },
 });

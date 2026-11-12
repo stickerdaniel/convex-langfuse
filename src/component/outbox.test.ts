@@ -669,6 +669,7 @@ describe("health", () => {
         deadLettered: 1,
         expired: 0,
       },
+      prompts: { tracked: 0, errors: 0 },
     });
   });
 });

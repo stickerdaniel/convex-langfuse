@@ -32,8 +32,8 @@ export const saveAnswer = mutation({
 
 This repository is a fork of
 [sholajegede/convex-langfuse](https://github.com/sholajegede/convex-langfuse)
-with a new architecture and a new API. Version 0.1.0 covers tracing, scores and
-trace deletion. Prompt management is in progress.
+with a new architecture and a new API. Version 0.1.0 covers tracing, scores,
+trace deletion and a prompt cache.
 
 ## How it works
 
@@ -60,6 +60,7 @@ Your functions never wait for Langfuse and never fail because Langfuse is down.
 - [Ids](#ids)
 - [Scores](#scores)
 - [Deleting traces](#deleting-traces)
+- [Prompts](#prompts)
 - [Content and privacy](#content-and-privacy)
 - [Errors](#errors)
 - [Delivery](#delivery)
@@ -122,6 +123,7 @@ npx convex env set LANGFUSE_BASE_URL https://cloud.langfuse.com
 | `LANGFUSE_BASE_URL`                          | Your region or your own host, for example `https://us.cloud.langfuse.com`. There is no default.                    |
 | `LANGFUSE_TRACING_ENVIRONMENT`               | Environment for traces that set none: 1 to 40 lowercase letters, digits, `-` or `_`, not starting with `langfuse`. |
 | `LANGFUSE_RELEASE`                           | Release for traces that set none.                                                                                  |
+| `LANGFUSE_WEBHOOK_SECRET`                    | Signing secret of the Langfuse prompt webhook. See [Prompts](#prompts).                                            |
 
 The component exports only when both keys and the base URL are set. Without them
 a recording call writes nothing and returns, so a preview or test deployment
@@ -327,6 +329,103 @@ await langfuse.deleteTraces(ctx, {
   1,000 requests can be pending, counting the ones Langfuse rejected, which stay
   in the dead letters. The next one throws.
 
+## Prompts
+
+The component keeps a cache of your Langfuse prompts in Convex. A read never
+calls Langfuse.
+
+```ts
+export const supportPrompt = query({
+  args: {},
+  handler: async (ctx) =>
+    await langfuse.prompts.get(ctx, { name: "support-agent" }),
+});
+// { name, version, type: "text" | "chat", prompt, config, source, snapshotId }
+```
+
+`get` takes a `label`, `production` by default, or a `version`. A version is
+served as the last refresh resolved it, while a label or a pin still holds that
+snapshot. `get` returns `null` on a miss. Called from a query it is reactive:
+the query reruns when the label moves.
+
+Pin a prompt for a conversation, so every turn uses the same bytes:
+
+```ts
+const prompt = await langfuse.prompts.pin(ctx, {
+  scope: `chat:${chatId}`,
+  name: "support-agent",
+  fallback: { type: "text", prompt: "You are a helpful assistant." },
+});
+
+await trace.generation(ctx, {
+  key: "llm",
+  name: "answer",
+  input,
+  output,
+  prompt:
+    prompt?.source === "langfuse"
+      ? { name: prompt.name, version: prompt.version }
+      : undefined,
+});
+```
+
+- The first `pin` for a scope and a name resolves like `get` and stores the
+  result for 7 days, or for `ttlMs`. Later calls return the same snapshot,
+  whatever label, version or fallback they pass.
+- On a miss, `pin` stores the `fallback` as a snapshot with
+  `source: "fallback"`. Link a generation to a prompt only when the source is
+  `"langfuse"`.
+- Equal `snapshotId` values mean equal bytes.
+- The component does not compile templates. Fill the variables of `prompt` at
+  the call site.
+- A prompt name and a scope have at most 256 bytes each. `get` returns `null`
+  for a longer name, `pin` and `sync` throw `invalid_prompt_name`, and `pin`
+  throws `invalid_prompt_scope` for a longer scope. A name, label or scope that
+  holds a lone surrogate throws `invalid_prompt_name`, `invalid_prompt_selector`
+  or `invalid_prompt_scope` as a `ConvexError`.
+
+Turn the cache on once, from an action:
+
+```ts
+export const syncPrompts = internalAction({
+  args: {},
+  handler: async (ctx) => await langfuse.prompts.sync(ctx),
+});
+```
+
+`sync` returns how many prompt names it tracks. Its status is `incomplete` when
+the listing did not reach every prompt. One listing reads at most 5,000 names in
+at most 150 requests; `sync` with `names` tracks prompts beyond that. A prompt
+whose latest config alone exceeds 6 MiB cannot be listed: it is not discovered,
+and a version of it that is cached already stays as it is, with an error in
+`health`.
+
+After that the cache follows Langfuse in two ways. Every 5 minutes a rolling
+refresh schedules each prompt whose last attempt is 13 minutes old, 200 ms
+apart. A webhook refreshes a prompt, and the prompts that reference it, when it
+changes. A prompt tracks at most 32 referenced prompts for the webhook; the
+rolling refresh covers the rest. To set up the webhook:
+
+1. Mount the component with an HTTP prefix and bind the webhook secret:
+
+   ```ts
+   app.use(convexLangfuse, {
+     httpPrefix: "/langfuse/",
+     env: {
+       // ...the settings from Setup
+       LANGFUSE_WEBHOOK_SECRET: app.env.LANGFUSE_WEBHOOK_SECRET,
+     },
+   });
+   ```
+
+2. In Langfuse, add a webhook for prompt events with the URL
+   `https://<deployment>.convex.site/langfuse/prompt-webhook`.
+3. Store the signing secret Langfuse shows:
+   `npx convex env set LANGFUSE_WEBHOOK_SECRET lf-whsec_...`.
+
+The route verifies the signature and refuses a delivery older than 5 minutes.
+Without the secret it answers 404.
+
 ## Content and privacy
 
 ```ts
@@ -431,6 +530,10 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Score id                                          | 1 to 128 bytes                         |
 | Trace ids per deletion request                    | 100, split by the client               |
 | Pending deletion requests, rejected ones included | 1,000                                  |
+| Cached prompt names                               | 500                                    |
+| Prompt name, pin scope                            | 256 bytes each                         |
+| Labels per prompt name                            | 50                                     |
+| Prompt snapshot                                   | 900 KiB                                |
 
 ## Operations
 
@@ -443,15 +546,16 @@ export const langfuseHealth = query({
 });
 ```
 
-| Field                                                                                       | Meaning                                                            |
-| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `enabled`                                                                                   | Keys and base URL are set                                          |
-| `accepting`                                                                                 | The backlog gate is open                                           |
-| `pendingAtLeast`, `oldestPendingAt`                                                         | Rows in the outbox, counted up to 1,000, and the age of the oldest |
-| `pendingCounted`                                                                            | Pending rows and bytes as the gate counts them                     |
-| `deadLettersAtLeast`                                                                        | Dead letters, counted up to 1,000                                  |
-| `exporter.backoffUntil`, `exporter.consecutiveFailures`, `exporter.lastError`               | Present while Langfuse fails                                       |
-| `exporter.lastAcceptedAt`, `exporter.accepted`, `exporter.deadLettered`, `exporter.expired` | Progress counters                                                  |
+| Field                                                                                                         | Meaning                                                            |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `enabled`                                                                                                     | Keys and base URL are set                                          |
+| `accepting`                                                                                                   | The backlog gate is open                                           |
+| `pendingAtLeast`, `oldestPendingAt`                                                                           | Rows in the outbox, counted up to 1,000, and the age of the oldest |
+| `pendingCounted`                                                                                              | Pending rows and bytes as the gate counts them                     |
+| `deadLettersAtLeast`                                                                                          | Dead letters, counted up to 1,000                                  |
+| `exporter.backoffUntil`, `exporter.consecutiveFailures`, `exporter.lastError`                                 | Present while Langfuse fails                                       |
+| `exporter.lastAcceptedAt`, `exporter.accepted`, `exporter.deadLettered`, `exporter.expired`                   | Progress counters                                                  |
+| `prompts.tracked`, `prompts.errors`, `prompts.lastListAt`, `prompts.lastWebhookAt`, `prompts.oldestAttemptAt` | State of the prompt cache                                          |
 
 Two internal functions help after an incident. Run them from the dashboard or
 the CLI:

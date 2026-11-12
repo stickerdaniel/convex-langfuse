@@ -4,6 +4,7 @@ import {
   DEAD_LETTER_RETENTION_MS,
   MAX_PENDING_AGE_MS,
   MAX_ROW_BYTES,
+  MAX_SNAPSHOT_BYTES,
   RETENTION_BATCH,
   RETENTION_BATCH_BYTES,
   SCORE_KEY_RETENTION_MS,
@@ -190,6 +191,37 @@ describe("retention sweep", () => {
       expect(state.deadLetters).toEqual([]);
       expect(state.payloads).toEqual([]);
       expect(state.exporter[0]!.expired).toBe(rows);
+    });
+
+    test("prompt snapshot collection waits for the next run once outbox rows spent the budget", async () => {
+      await insertLargeRows(Math.floor(RETENTION_BATCH_BYTES / MAX_ROW_BYTES));
+      const snapshots = async () =>
+        await t.run(
+          async (ctx) => await ctx.db.query("promptSnapshots").collect(),
+        );
+      for (let i = 0; i < 4; i++) {
+        await t.run(async (ctx) => {
+          await ctx.db.insert("promptSnapshots", {
+            key: `big-${i}`,
+            name: "big",
+            version: i + 1,
+            source: "langfuse",
+            type: "text",
+            prompt: "x".repeat(MAX_SNAPSHOT_BYTES - 2),
+            config: "{}",
+            fetchedAt: Date.now(),
+          });
+        });
+      }
+      vi.setSystemTime(Date.now() + MAX_PENDING_AGE_MS + 1_000);
+
+      await t.mutation(internal.retention.sweep, {});
+      expect((await tables(t)).outbox).toEqual([]);
+      expect(await snapshots()).toHaveLength(4);
+      expect(await pendingScheduled(t)).toContain("retention:sweep");
+
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+      expect(await snapshots()).toEqual([]);
     });
   });
 
