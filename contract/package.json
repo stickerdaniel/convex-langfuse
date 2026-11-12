@@ -1,0 +1,10 @@
+{
+  "name": "convex-langfuse-contract",
+  "private": true,
+  "type": "module",
+  "description": "Host app of the Langfuse contract suite. `run.mjs` links `convex-langfuse` to the repository root.",
+  "dependencies": {
+    "convex": "1.49.0",
+    "convex-langfuse": "file:.."
+  }
+}

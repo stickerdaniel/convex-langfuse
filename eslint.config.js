@@ -34,9 +34,15 @@ export default [
   },
   pluginJs.configs.recommended,
   ...tseslint.configs.recommended,
-  // Integration harness, end-to-end and maintenance scripts - Node environment
+  // Integration harness, contract suite, end-to-end and maintenance scripts -
+  // Node environment
   {
-    files: ["integration/**/*.mjs", "e2e/**/*.mjs", "scripts/**/*.mjs"],
+    files: [
+      "integration/**/*.mjs",
+      "contract/**/*.mjs",
+      "e2e/**/*.mjs",
+      "scripts/**/*.mjs",
+    ],
     languageOptions: {
       globals: globals.node,
     },

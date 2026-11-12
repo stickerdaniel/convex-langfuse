@@ -1,0 +1,4 @@
+# The convex-langfuse link run.mjs creates.
+/node_modules/
+# The logs of each run, scanned for secrets; CI uploads them.
+/logs/
