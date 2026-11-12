@@ -176,17 +176,17 @@ function startLoad(client, caseNo, { size, concurrency, paceMs = 0 }) {
   };
 }
 
-/** Span ids of a case the fake endpoint has received. */
+/** Span ids of a case the fake endpoint has accepted with a 2xx. */
 function received(stats, caseNo, total) {
   let count = 0;
   for (let n = firstId(caseNo); n < firstId(caseNo) + total; n++) {
-    if (stats.spans[hexId(n)]) count += 1;
+    if (stats.accepted[hexId(n)]) count += 1;
   }
   return count;
 }
 
 /**
- * Span ids of committed load mutations the fake endpoint has not received.
+ * Span ids of committed load mutations the fake endpoint has not accepted.
  * A mutation given up at `stop` leaves a gap in the ids, so the committed
  * ranges are checked one by one.
  */
@@ -194,23 +194,27 @@ function missing(stats, commits, size) {
   let count = 0;
   for (const { from } of commits) {
     for (let n = from; n < from + size; n++) {
-      if (!stats.spans[hexId(n)]) count += 1;
+      if (!stats.accepted[hexId(n)]) count += 1;
     }
   }
   return count;
 }
 
-/** Span ids whose deliveries did not all carry the same content. */
+/**
+ * Span ids whose span bytes differ between deliveries, refused ones
+ * included.
+ */
 function divergent(stats) {
   return Object.entries(stats.spans).filter(
     ([, hashes]) => new Set(hashes).size > 1,
   );
 }
 
-function deliveries(stats, caseNo, total) {
+/** Requests answered with a 2xx that carried a span id of a case. */
+function acceptedDeliveries(stats, caseNo, total) {
   let count = 0;
   for (let n = firstId(caseNo); n < firstId(caseNo) + total; n++) {
-    count += stats.spans[hexId(n)]?.length ?? 0;
+    count += stats.accepted[hexId(n)] ?? 0;
   }
   return count;
 }
@@ -353,6 +357,7 @@ async function main() {
         1_000,
       );
       // Recovery must send the in-flight batch again, with the same bytes.
+      // A resend counts whatever its answer, so `stats.spans` holds it.
       const afterKill = stats.log.slice(seenAtKill);
       for (const { bodyHash, spanIds } of inflight) {
         if (!afterKill.some((request) => request.bodyHash === bodyHash)) {
@@ -370,12 +375,12 @@ async function main() {
       );
       const diverging = divergent(stats);
       if (diverging.length > 0) {
-        throw new Error(`${diverging.length} span ids with different content`);
+        throw new Error(`${diverging.length} span ids with different bytes`);
       }
       const resent = inflight.reduce((sum, r) => sum + r.spanIds.length, 0);
       return (
-        `${total} span ids, ${deliveries(stats, 3, total)} deliveries, ` +
-        `${resent} in-flight spans resent with identical request bytes`
+        `${total} span ids, ${acceptedDeliveries(stats, 3, total)} accepted ` +
+        `deliveries, ${resent} in-flight spans resent with identical request bytes`
       );
     });
 
@@ -798,13 +803,21 @@ async function main() {
       return "the span arrived with U+FFFD in place of the lone surrogate";
     });
 
-    const diverging = divergent(await fake.stats());
+    const final = await fake.stats();
+    const diverging = divergent(final);
     results.push({
-      name: "all deliveries of a span identical",
+      name: "the span bytes of every delivery of an id identical",
       ok: diverging.length === 0,
       ms: 0,
       requests: 0,
-      detail: `${diverging.length} span ids with different content`,
+      detail: `${diverging.length} span ids with different bytes`,
+    });
+    results.push({
+      name: "every request with credentials and the required headers",
+      ok: final.badHeaders === 0,
+      ms: 0,
+      requests: 0,
+      detail: `${final.badHeaders} without`,
     });
   } catch (error) {
     results.push({

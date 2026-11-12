@@ -195,8 +195,15 @@ export class Backend {
     );
   }
 
-  /** Kills the backend and its executor without a clean shutdown. */
+  /**
+   * Kills the backend and its executor without a clean shutdown. Returns at
+   * once when the backend already exited, whose `exit` event does not come
+   * again.
+   */
   async kill() {
+    if (this.process.exitCode !== null || this.process.signalCode !== null) {
+      return;
+    }
     const exited = new Promise((resolve) => this.process.once("exit", resolve));
     stop(this.process);
     await exited;

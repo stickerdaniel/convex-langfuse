@@ -14,17 +14,20 @@
 //
 // - `load`: 53,000 spans in 53 bursts of 1,000 while the fake endpoint
 //   answers 5 % of the export requests with 500, 1 % with 429 and delays 1 %
-//   by 5 s. Every span id must arrive, every delivery of an id with the same
-//   bytes; the outbox ends empty, without dead letters and without a failed
-//   `exporter:advance`, `exporter:dispatch` or `outbox:count` execution.
+//   by 5 s; each of the three must occur. Every span id must be accepted
+//   with a 2xx at least once, no other id may arrive, and the span bytes of
+//   every delivery of an id must be identical; the outbox ends empty,
+//   without dead letters and without a failed `exporter:advance`,
+//   `exporter:dispatch` or `outbox:count` execution.
 // - `outage`: three runs on fresh backends. Each measures the server-side
 //   execution time of 2,000 enqueue mutations with the endpoint healthy and
 //   2,000 with the endpoint down. The outage p95 must stay within
 //   `max(2 × healthy p95, healthy p95 + 50 ms)`, and the backlog must drain
 //   after the endpoint recovers.
 // - `threshold`: 60,000 records offered at 6,000 per minute with the endpoint
-//   down. At most 37,000 may be enqueued, every call after the gate closed must
-//   be refused with `backlog`, and after recovery and `exporter.kick` the
+//   down. The rate until the gate closed must reach 95 % of that. At most
+//   37,000 may be enqueued, every call sent after the gate closed must be
+//   refused with `backlog`, and after recovery and `exporter.kick` the
 //   backlog must drain and a new record must be enqueued. With `--kill`, the
 //   backend is killed while the first export request is in flight and
 //   restarted before the records are offered.
@@ -32,9 +35,13 @@
 //   1 through `prompts.sync`, then moved to version 2 on the fake endpoint
 //   without a webhook. It waits for real cron ticks, so it runs for about 20
 //   minutes. Every name must return version 2 within 25 minutes after that
-//   version exists, the first and the last refresh of the tick must start 99 s
-//   to 130 s apart, and no `prompts:*` execution may fail. The per-name times
-//   are kept in `prompts.json` of the diagnostics folder.
+//   version exists, every name must start a refresh, the first and the last
+//   start must lie 99 s to 130 s apart, and no `prompts:*` execution may
+//   fail. The per-name times are kept in `prompts.json` of the diagnostics
+//   folder.
+//
+// Every driver requires that the fake endpoint saw every request with
+// credentials and the required headers.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -128,12 +135,7 @@ async function setup(binary) {
     }
   } catch (error) {
     await fake.stop();
-    if (
-      backend.process?.exitCode === null &&
-      backend.process.signalCode === null
-    ) {
-      await backend.kill();
-    }
+    if (backend.process) await backend.kill();
     throw error;
   }
   console.log(`diagnostics: ${stateDir}`);
@@ -142,8 +144,6 @@ async function setup(binary) {
   // Give the log stream time to attach before the first measured call.
   await sleep(2_000);
   const executions = [];
-  const alive = () =>
-    backend.process.exitCode === null && backend.process.signalCode === null;
   return {
     backend,
     fake,
@@ -188,7 +188,7 @@ async function setup(binary) {
         );
       } finally {
         await fake.stop();
-        if (alive()) await backend.kill();
+        await backend.kill();
         // Keep the logs, not the database and its payloads.
         for (const file of [
           "storage",
@@ -232,6 +232,14 @@ function failedExporter(executions) {
 
 /** A named check of a driver. */
 const check = (name, ok, detail) => ({ check: name, ok: Boolean(ok), detail });
+
+/** The fake saw every request with credentials and the required headers. */
+const headersCheck = (badHeaders, prefix = "") =>
+  check(
+    `${prefix}every request with credentials and the required headers`,
+    badHeaders === 0,
+    `${badHeaders} without`,
+  );
 
 // ── load ───────────────────────────────────────────────────────────────────
 
@@ -317,15 +325,23 @@ async function loadDriver(binary) {
     const stats = await fake.stats();
     const executions = await env.executions();
 
+    // An id counts as delivered once a request that carried it got a 2xx.
+    // `stats.spans` holds every attempt, refused ones included.
+    const expected = new Set(
+      Array.from({ length: LOAD_SPANS }, (_, i) => hexId(i + 1)),
+    );
     let missing = 0;
-    for (let n = 1; n <= LOAD_SPANS; n++) {
-      if (!stats.spans[hexId(n)]) missing += 1;
+    for (const id of expected) {
+      if (!stats.accepted[id]) missing += 1;
     }
     const ids = Object.keys(stats.spans);
+    const unexpected = ids.filter((id) => !expected.has(id));
     const divergent = ids.filter(
       (id) => new Set(stats.spans[id]).size > 1,
     ).length;
-    const deliveries = ids.reduce((sum, id) => sum + stats.spans[id].length, 0);
+    const attempts = ids.reduce((sum, id) => sum + stats.spans[id].length, 0);
+    const accepted = Object.values(stats.accepted);
+    const acceptedDeliveries = accepted.reduce((sum, n) => sum + n, 0);
     // The time from an injected 500 or 429 to the next export request: the
     // backoff plus the loop's reaction time.
     let longestRetryGapMs = 0;
@@ -344,26 +360,51 @@ async function loadDriver(binary) {
       boundWaitSeconds: seconds(boundWaitMs),
       maxPendingAtBurstCheck: maxPending,
       exportRequests: stats.requests,
-      distinctSpanIds: ids.length,
-      deliveries,
-      resends: deliveries - LOAD_SPANS,
+      attemptedSpanIds: ids.length,
+      acceptedSpanIds: accepted.length,
+      // Span sends in all requests, and in requests answered with a 2xx.
+      attempts,
+      acceptedDeliveries,
+      // Sends of an id after its first, refused or not.
+      resends: attempts - ids.length,
+      // Accepted sends of an id after its first accepted one: what a server
+      // that keeps every accepted copy would store twice.
+      acceptedTwice: acceptedDeliveries - accepted.length,
       injected500: stats.faults[500],
       injected429: stats.faults[429],
       injectedDelays: stats.faults.delay,
       longestSampledBackoffSeconds: seconds(longestBackoffMs),
       longestRetryGapSeconds: seconds(longestRetryGapMs),
-      badHeaders: stats.badHeaders,
     };
     return {
       diagnostics: env.stateDir,
       metrics,
       checks: [
-        check("every span id received", missing === 0, `${missing} missing`),
         check(
-          "every delivery of an id identical",
+          "every span id accepted with a 2xx",
+          missing === 0,
+          `${missing} of ${LOAD_SPANS} never accepted`,
+        ),
+        check(
+          "no span id outside the enqueued set",
+          unexpected.length === 0,
+          `${unexpected.length} unexpected` +
+            (unexpected[0] ? `, first ${unexpected[0]}` : ""),
+        ),
+        check(
+          "the span bytes of every delivery of an id identical",
           divergent === 0,
           `${divergent} ids with different bytes`,
         ),
+        check(
+          "every fault kind injected",
+          stats.faults[500] > 0 &&
+            stats.faults[429] > 0 &&
+            stats.faults.delay > 0,
+          `${stats.faults[500]} × 500, ${stats.faults[429]} × 429, ` +
+            `${stats.faults.delay} delays`,
+        ),
+        headersCheck(stats.badHeaders),
         check(
           "outbox empty",
           backlog.pendingAtLeast === 0,
@@ -433,7 +474,7 @@ async function outageRun(binary, run) {
     const drained = await waitFor(
       "the backlog to drain after recovery",
       async () =>
-        (await fake.summary()).distinct >= total &&
+        (await fake.summary()).accepted >= total &&
         (await env.backlog()).pendingAtLeast === 0,
       600_000,
       1_000,
@@ -441,6 +482,7 @@ async function outageRun(binary, run) {
       () => Date.now(),
       () => undefined,
     );
+    const { badHeaders } = await fake.summary();
     const executions = await env.executions();
     // The log has one entry per attempt; an attempt that lost an OCC
     // conflict is retried under the same request id. A mutation's time is
@@ -504,6 +546,7 @@ async function outageRun(binary, run) {
           failed.length === 0,
           failed[0] ?? "none",
         ),
+        headersCheck(badHeaders, `run ${run}: `),
       ],
     };
   } finally {
@@ -529,11 +572,22 @@ async function outageDriver(binary) {
 
 const OFFERED = 60_000;
 const THRESHOLD_CALL_RECORDS = 10;
+/** The intake the bound below is measured under. */
+const OFFER_RATE_PER_MINUTE = 6_000;
 /** 10 records every 100 ms: 6,000 records per minute. */
 const OFFER_INTERVAL_MS = 100;
+/**
+ * The offered rate until the gate closed must reach 95 % of
+ * `OFFER_RATE_PER_MINUTE`: below it, the bound was measured under a lighter
+ * load than it names.
+ */
+const OFFER_RATE_TOLERANCE = 0.95;
 /** The gate's threshold of 25,000 plus two minutes of intake. */
 const ENQUEUED_BOUND = 37_000;
-/** Calls in flight at most; a slower backend lowers the offered rate. */
+/**
+ * Calls in flight at most. While the cap holds, the loop waits, so a slow
+ * backend lowers the offered rate; the rate check catches that.
+ */
 const MAX_IN_FLIGHT = 50;
 
 async function thresholdDriver(binary, { kill }) {
@@ -589,10 +643,16 @@ async function thresholdDriver(binary, { kill }) {
     const paced = next;
     const pacedAt = Date.now();
     const paceStart = pacedAt - next * OFFER_INTERVAL_MS;
+    /** Every wait of the loop at the in-flight cap: `{ from, to }`. */
+    const capWaits = [];
     while (next < OFFERED / THRESHOLD_CALL_RECORDS) {
       const due = paceStart + next * OFFER_INTERVAL_MS;
       if (due > Date.now()) await sleep(due - Date.now());
-      while (pending.size >= MAX_IN_FLIGHT) await Promise.race(pending);
+      if (pending.size >= MAX_IN_FLIGHT) {
+        const from = Date.now();
+        while (pending.size >= MAX_IN_FLIGHT) await Promise.race(pending);
+        capWaits.push({ from, to: Date.now() });
+      }
       const promise = offer(next++).finally(() => pending.delete(promise));
       pending.add(promise);
     }
@@ -608,14 +668,17 @@ async function thresholdDriver(binary, { kill }) {
     const otherReason = answered.filter(
       (c) => c.result.reason !== undefined && c.result.reason !== "backlog",
     );
+    // The closure is the moment the first refusal was answered.
     const firstRefusal = [...refused].sort(
       (a, b) => a.receivedAt - b.receivedAt,
     )[0];
-    // A call sent after a refusal was answered must be refused too.
+    const closedAt = firstRefusal?.receivedAt;
+    // "After the closure" means sent after the closure: such a call must be
+    // refused too. A call sent before the closure is not judged, whatever
+    // its answer, because it may have committed before the gate closed.
     const acceptedAfterClosure = firstRefusal
       ? answered.filter(
-          (c) =>
-            c.sentAt > firstRefusal.receivedAt && c.result.reason !== "backlog",
+          (c) => c.sentAt > closedAt && c.result.reason !== "backlog",
         )
       : [];
     const invalidResults = answered.filter(({ result }) =>
@@ -623,10 +686,26 @@ async function thresholdDriver(binary, { kill }) {
         ? result.enqueued !== 0 || result.dropped !== THRESHOLD_CALL_RECORDS
         : result.enqueued !== THRESHOLD_CALL_RECORDS,
     );
-    // Nothing drains before recovery, so the final enqueue count includes
-    // every commit before closure, even if its response arrived later.
+    // `enqueued` is the total after all offers. Nothing drains before
+    // recovery, so it equals the count at the closure, including commits
+    // whose answer came after it.
     const enqueuedAtClosure = enqueued;
     const maxCounted = Math.max(0, ...samples.map((s) => s.pendingCounted));
+    // The offered rate from the first paced offer until the closure, or
+    // until the last paced offer when the gate never closed.
+    const pacedCalls = calls.filter((c) => c.i >= paced);
+    const rateUntil = closedAt ?? Math.max(...pacedCalls.map((c) => c.sentAt));
+    const rateFrom = pacedCalls[0]?.sentAt ?? rateUntil;
+    const offeredBeforeClosure = pacedCalls.filter(
+      (c) => c.sentAt <= rateUntil,
+    ).length;
+    const rateMs = Math.max(1, rateUntil - rateFrom);
+    const offeredPerMinuteUntilClosure = Math.round(
+      (offeredBeforeClosure * THRESHOLD_CALL_RECORDS * 60_000) / rateMs,
+    );
+    const minRate = OFFER_RATE_PER_MINUTE * OFFER_RATE_TOLERANCE;
+    const capWaitsBeforeClosure = capWaits.filter((w) => w.from < rateUntil);
+    const waited = (waits) => waits.reduce((sum, w) => sum + w.to - w.from, 0);
 
     // Recovery.
     await fake.control({ mode: "healthy" });
@@ -650,8 +729,8 @@ async function thresholdDriver(binary, { kill }) {
       count: 1,
     });
     const arrived = await waitFor(
-      "every enqueued record at the endpoint",
-      async () => (await fake.summary()).distinct >= enqueued + after.enqueued,
+      "every enqueued record accepted by the endpoint",
+      async () => (await fake.summary()).accepted >= enqueued + after.enqueued,
       300_000,
       1_000,
     ).then(
@@ -668,17 +747,23 @@ async function thresholdDriver(binary, { kill }) {
         offeredPerMinute: Math.round(
           ((calls.length - paced) * THRESHOLD_CALL_RECORDS * 60) / pacedSeconds,
         ),
+        offeredPerMinuteUntilClosure,
+        capWaitsUntilClosure: capWaitsBeforeClosure.length,
+        capWaitSecondsUntilClosure: seconds(waited(capWaitsBeforeClosure)),
+        capWaits: capWaits.length,
+        capWaitSeconds: seconds(waited(capWaits)),
         enqueued,
         refusedRecords: refused.reduce((sum, c) => sum + c.result.dropped, 0),
         enqueuedAtClosure,
-        closureSeconds: firstRefusal
-          ? seconds(firstRefusal.receivedAt - firstAt)
-          : null,
+        // From the first offer, before a `--kill` restart, until the first
+        // refusal was answered.
+        closureSeconds: firstRefusal ? seconds(closedAt - firstAt) : null,
         maxPendingCounted: maxCounted,
         drainSeconds:
           drained === undefined ? null : seconds(drained - kickedAt),
         exportRequests: summary.requests,
-        distinctSpanIds: summary.distinct,
+        attemptedSpanIds: summary.attempted,
+        acceptedSpanIds: summary.accepted,
       },
       checks: [
         check(
@@ -699,6 +784,14 @@ async function thresholdDriver(binary, { kill }) {
           "the gate closed",
           firstRefusal !== undefined,
           firstRefusal ? `${enqueuedAtClosure} enqueued` : "no refusal",
+        ),
+        check(
+          `offered at least ${minRate} records per minute until the closure`,
+          offeredPerMinuteUntilClosure >= minRate,
+          `${offeredPerMinuteUntilClosure} per minute over ` +
+            `${seconds(rateMs)} s; the in-flight cap held the loop ` +
+            `${capWaitsBeforeClosure.length} times for ` +
+            `${seconds(waited(capWaitsBeforeClosure))} s`,
         ),
         check(
           `at most ${ENQUEUED_BOUND} records enqueued`,
@@ -723,15 +816,16 @@ async function thresholdDriver(binary, { kill }) {
           JSON.stringify(after),
         ),
         check(
-          "every enqueued record exported once recovered",
+          "every enqueued record accepted once recovered",
           arrived && summary.divergent === 0,
-          `${summary.distinct} distinct ids, ${summary.divergent} divergent`,
+          `${summary.accepted} accepted ids, ${summary.divergent} divergent`,
         ),
         check(
           "no failed exporter execution",
           failed.length === 0,
           failed[0] ?? "none",
         ),
+        headersCheck(summary.badHeaders),
       ],
     };
   } finally {
@@ -837,13 +931,17 @@ async function promptsDriver(binary) {
 
     const byName = new Map(records.map((r) => [r.name, r]));
     let refreshRequests = 0;
-    for (const request of (await fake.stats()).promptRequests) {
+    const stats = await fake.stats();
+    for (const request of stats.promptRequests) {
       const record = byName.get(request.name);
       if (request.route !== REFRESH_START || !record) continue;
       if (request.at < record.createdAt) continue;
       refreshRequests += 1;
       record.refreshAt ??= request.at;
     }
+    // The span is judged only when every name has a start: the first and
+    // last of a partial set say nothing about the names without one.
+    const notStarted = records.filter((r) => r.refreshAt === undefined);
     const starts = records.flatMap((r) => r.refreshAt ?? []);
     const applied = records.flatMap((r) => r.appliedAt ?? []);
     const firstStart = starts.length > 0 ? Math.min(...starts) : undefined;
@@ -885,6 +983,7 @@ async function promptsDriver(binary) {
             : seconds(Math.max(...applied) - firstStart),
         maxAgeSeconds: seconds(maxAge),
         notApplied: notApplied.length,
+        notStarted: notStarted.length,
         failedPromptExecutions: failed.length,
       },
       checks: [
@@ -896,8 +995,15 @@ async function promptsDriver(binary) {
             `, largest age ${seconds(maxAge)} s`,
         ),
         check(
-          "refresh starts span 99 s to 130 s",
-          span !== undefined &&
+          "every name has a refresh start after version 2",
+          notStarted.length === 0,
+          `${notStarted.length} of ${PROMPT_NAMES.length} without a start` +
+            (notStarted[0] ? `, first ${notStarted[0].name}` : ""),
+        ),
+        check(
+          "refresh starts of every name span 99 s to 130 s",
+          notStarted.length === 0 &&
+            span !== undefined &&
             span >= START_SPAN_MS.min &&
             span <= START_SPAN_MS.max,
           span === undefined
@@ -910,6 +1016,7 @@ async function promptsDriver(binary) {
           failed[0] ??
             `${promptRuns.length} executions logged, ${refreshRuns} refreshes`,
         ),
+        headersCheck(stats.badHeaders),
       ],
     };
   } finally {

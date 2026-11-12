@@ -13,7 +13,10 @@
 //
 // Gate: a score with a synced `configId` is read back through
 // `GET /api/public/v3/scores?id=` within 90 s, and a trace deletion request
-// built by the component is accepted with a 2xx.
+// built by the component is accepted with a 2xx. The acceptance is read from
+// the exporter's counters, so it is checked only on a backend the script
+// started; on another backend, other writers move the same counters, and the
+// gate reports the request as enqueued.
 //
 // `--characterize` also runs, once idle and once while `--load` (2,000)
 // unrelated scores are posted through the component, `--reps` (20)
@@ -170,7 +173,7 @@ async function main() {
   const langfuse = langfuseApi(settings);
 
   linkPackage();
-  const { backend, cleanup } = await connectBackend();
+  const { backend, owned, cleanup } = await connectBackend();
   const createdScores = [];
   const createdTraces = [];
   let client;
@@ -233,18 +236,27 @@ async function main() {
       traceIds: [traceId],
     });
     if (!deletion.enqueued) throw new Error("trace deletion not enqueued");
-    await drained(client, 120_000);
-    const after = await client.query(api.health, {});
-    if (
-      after.accepted !== before.accepted + 1 ||
-      after.deadLettersAtLeast !== before.deadLettersAtLeast ||
-      after.lastErrorAt !== before.lastErrorAt
-    ) {
-      throw new Error(
-        `trace deletion request not accepted: ${JSON.stringify({ before, after })}`,
+    if (owned) {
+      // Only this script writes to a backend it started, so the exporter's
+      // counters moved for its deletion request alone.
+      await drained(client, 120_000);
+      const after = await client.query(api.health, {});
+      if (
+        after.accepted !== before.accepted + 1 ||
+        after.deadLettersAtLeast !== before.deadLettersAtLeast ||
+        after.lastErrorAt !== before.lastErrorAt
+      ) {
+        throw new Error(
+          `trace deletion request not accepted: ${JSON.stringify({ before, after })}`,
+        );
+      }
+      gate.push("trace deletion request accepted with a 2xx");
+    } else {
+      gate.push(
+        "trace deletion request enqueued; acceptance not checked on a " +
+          "backend this script did not start",
       );
     }
-    gate.push("trace deletion request accepted with a 2xx");
     console.log(`gate passed: ${gate.join("; ")}`);
 
     if (options.characterize) {

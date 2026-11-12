@@ -1,8 +1,8 @@
 // Helpers of the end-to-end scripts: the Langfuse settings, the Convex
 // backend and the public API.
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Backend, ensureBinary, startFake } from "../integration/backend.mjs";
 
@@ -69,25 +69,46 @@ export function publicApi({ baseUrl, publicKey, secretKey }) {
 /**
  * The backend named by CONVEX_SELF_HOSTED_URL and
  * CONVEX_SELF_HOSTED_ADMIN_KEY, or a local backend started like the
- * integration run. `siteUrl` is set for a local backend only.
+ * integration run. `siteUrl` is set for a local backend only. `owned` is
+ * true for the local backend: no other writer uses it, so its global
+ * counters move only for this script.
+ *
+ * The local backend's state folder holds the Langfuse keys the scripts set.
+ * It lives in the OS temp directory and is removed by `cleanup`, when the
+ * start fails, and when the process exits for any other reason, including
+ * SIGINT and SIGTERM.
  */
 export async function connectBackend() {
   const url = process.env.CONVEX_SELF_HOSTED_URL;
   const adminKey = process.env.CONVEX_SELF_HOSTED_ADMIN_KEY;
-  if (url && adminKey) return { backend: { url, adminKey }, cleanup() {} };
+  if (url && adminKey) {
+    return { backend: { url, adminKey }, owned: false, cleanup() {} };
+  }
   if (url || adminKey) {
     throw new Error(
       "set both CONVEX_SELF_HOSTED_URL and CONVEX_SELF_HOSTED_ADMIN_KEY",
     );
   }
-  const scratch = fileURLToPath(new URL("../scratch/", import.meta.url));
-  mkdirSync(scratch, { recursive: true });
-  const stateDir = mkdtempSync(join(scratch, "e2e-"));
-  const backend = new Backend(await ensureBinary(), stateDir);
-  await backend.init();
-  await backend.start();
-  return {
-    backend,
-    cleanup: () => rmSync(stateDir, { recursive: true, force: true }),
-  };
+  const binary = await ensureBinary();
+  const stateDir = mkdtempSync(join(tmpdir(), "convex-langfuse-e2e-"));
+  // The backend may still write while it dies, so removal is retried.
+  const cleanup = () =>
+    rmSync(stateDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
+  // Registered after `backend.mjs`'s own handler, which kills the backend.
+  process.once("exit", cleanup);
+  const backend = new Backend(binary, stateDir);
+  try {
+    await backend.init();
+    await backend.start();
+  } catch (error) {
+    if (backend.process) await backend.kill();
+    cleanup();
+    throw error;
+  }
+  return { backend, owned: true, cleanup };
 }

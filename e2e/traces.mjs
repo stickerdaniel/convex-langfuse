@@ -26,7 +26,10 @@
 // fails.
 //
 // The run deletes its traces through the component and its prompt through
-// `DELETE /api/public/v2/prompts/{name}` at the end.
+// `DELETE /api/public/v2/prompts/{name}` at the end. On a backend it started
+// itself, it checks that the trace deletion request was accepted; on another
+// backend, other writers move the same counters, so it reports the request
+// as enqueued.
 
 import { randomBytes, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
@@ -220,7 +223,7 @@ async function main() {
   const settings = await langfuseSettings(options.fake);
   const langfuse = publicApi(settings);
   linkPackage();
-  const { backend, cleanup } = await connectBackend();
+  const { backend, owned, cleanup } = await connectBackend();
   const checks = [];
   const createdTraces = [];
   const reads = {};
@@ -335,6 +338,7 @@ async function main() {
     });
   } finally {
     const cleanupProblems = [];
+    const cleanupDone = [];
     if (client && createdTraces.length > 0) {
       try {
         const drain = () =>
@@ -347,18 +351,32 @@ async function main() {
             600_000,
             1_000,
           );
+        // The spans go out before the deletion request is enqueued.
         const before = await drain();
         const deletion = await client.mutation(anyApi.e2e.deleteTraces, {
           traceIds: createdTraces,
         });
-        if (!deletion.enqueued)
+        if (!deletion.enqueued) {
           cleanupProblems.push("trace deletion not enqueued");
-        const after = await drain();
-        if (
-          after.accepted !== before.accepted + 1 ||
-          after.deadLettersAtLeast !== before.deadLettersAtLeast
-        ) {
-          cleanupProblems.push("trace deletion was not accepted");
+        } else if (owned) {
+          // Only this script writes to a backend it started, so the
+          // exporter's counters moved for its deletion request alone.
+          const after = await drain();
+          if (
+            after.accepted !== before.accepted + 1 ||
+            after.deadLettersAtLeast !== before.deadLettersAtLeast
+          ) {
+            cleanupProblems.push("trace deletion was not accepted");
+          } else {
+            cleanupDone.push(
+              `deletion accepted for ${createdTraces.length} traces`,
+            );
+          }
+        } else {
+          cleanupDone.push(
+            `deletion enqueued for ${createdTraces.length} traces; ` +
+              "acceptance not checked on a backend this script did not start",
+          );
         }
       } catch (error) {
         cleanupProblems.push(`traces: ${error?.message ?? error}`);
@@ -370,7 +388,8 @@ async function main() {
           "DELETE",
           `/api/public/v2/prompts/${encodeURIComponent(promptName)}`,
         );
-        if (!deleted.ok) cleanupProblems.push(`prompt: HTTP ${deleted.status}`);
+        if (deleted.ok) cleanupDone.push("1 prompt deleted");
+        else cleanupProblems.push(`prompt: HTTP ${deleted.status}`);
       } catch (error) {
         cleanupProblems.push(`prompt: ${error?.message ?? error}`);
       }
@@ -378,9 +397,7 @@ async function main() {
     checks.push({
       check: "cleanup",
       ok: cleanupProblems.length === 0,
-      detail:
-        cleanupProblems.join("; ") ||
-        `deletion accepted for ${createdTraces.length} traces, 1 prompt deleted`,
+      detail: cleanupProblems.join("; ") || cleanupDone.join(", "),
     });
     console.table(
       checks.map(({ check, ok, detail }) => ({

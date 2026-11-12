@@ -4,10 +4,12 @@
 //   node integration/fake-langfuse.mjs --port 0
 //
 // Prints `listening <port>` once ready. `POST /api/public/otel/v1/traces`
-// records every span id with a hash of that span's content and every request
+// records every span id with a hash of that span's bytes and every request
 // with the hash of its raw body, its arrival time and its answer, then
-// answers according to the mode. `POST /control` switches the mode of that
-// route:
+// answers according to the mode. A span id counts as accepted once per
+// request that carried it and was answered with a 2xx, also when the client
+// gave up before a held answer came. `POST /control` switches the mode of
+// that route:
 //
 // - `{ "mode": "healthy" }` answers 200.
 // - `{ "mode": "status", "status": number }` answers `status`.
@@ -18,6 +20,12 @@
 //   `seed` (default 1) and answers 500, 429 with `Retry-After: 1`, 200 after
 //   `delayMs`, or 200, with the given probabilities. Setting the mode restarts
 //   the sequence, so two runs see the same answers.
+//
+// The OTLP route and every route under `/api/public` answer 401 without a
+// Basic `Authorization` header that carries a public and a secret key, as
+// Langfuse 4.78.0 does. The OTLP route answers 400 to a content type without
+// `application/json`; Langfuse also takes protobuf, which this fake cannot
+// read. The fake's own routes, `/stats` and `/control…`, take any request.
 //
 // `GET /stats` returns what was received; `GET /stats?summary=1` returns the
 // counts only.
@@ -47,10 +55,20 @@ let draw = mulberry32(1);
 const stats = {
   requests: 0,
   inflight: 0,
-  /** Requests without the headers the exporter must send. */
+  /**
+   * Requests without the headers a client must send: an OTLP request without
+   * a well-formed Basic `Authorization`, `x-langfuse-ingestion-version: 4` or
+   * a JSON content type, and a public API request without a well-formed
+   * Basic `Authorization`.
+   */
   badHeaders: 0,
-  /** Span id to the content hash of every delivery of that span. */
+  /**
+   * Span id to the hash of its span bytes in every request that carried it
+   * and passed the credential and content type checks, whatever the answer.
+   */
   spans: {},
+  /** Span id to the number of requests that carried it and got a 2xx. */
+  accepted: {},
   /**
    * Every request in arrival order: raw body hash, span ids, arrival time
    * and the status it was answered with, `null` until it is answered.
@@ -212,11 +230,8 @@ function rawSpans(body) {
   return spans;
 }
 
-/** Records one request and returns its entry in `stats.log`. */
-function recordSpans(body) {
-  const parsed = JSON.parse(body);
-  const raw = rawSpans(body);
-  let next = 0;
+/** Adds one request to `stats.log` and returns its entry. */
+function logRequest(body) {
   const entry = {
     bodyHash: createHash("sha256").update(body).digest("hex"),
     spanIds: [],
@@ -224,6 +239,19 @@ function recordSpans(body) {
     status: null,
   };
   stats.log.push(entry);
+  return entry;
+}
+
+/**
+ * Records one request and returns its entry in `stats.log`. The hash kept
+ * per span id covers the bytes of that span object only. Resource and scope
+ * are built per request, so they are not part of it.
+ */
+function recordSpans(body) {
+  const parsed = JSON.parse(body);
+  const raw = rawSpans(body);
+  let next = 0;
+  const entry = logRequest(body);
   for (const resource of parsed.resourceSpans) {
     const resourceAttributes = attributeMap(resource.resource?.attributes);
     for (const scope of resource.scopeSpans) {
@@ -474,10 +502,9 @@ async function publicApi(req, res, url) {
       lastConfig: prompts.get(item).at(-1).config,
     }));
     const totalPages = Math.ceil(names.length / limit);
-    return json(res, 200, {
-      data,
-      meta: { page, limit, totalItems: names.length, totalPages },
-    });
+    const meta = { page, limit, totalPages, totalItems: names.length };
+    // 4.78.0 repeats `meta` as `pagination` for older clients.
+    return json(res, 200, { data, meta, pagination: meta });
   }
   if (req.method === "DELETE" && route.startsWith("/v2/prompts/")) {
     const name = decodeURIComponent(route.slice("/v2/prompts/".length));
@@ -499,7 +526,10 @@ async function publicApi(req, res, url) {
           : item.version === Number(version),
       );
     if (!entry) return json(res, 404, { message: "Prompt not found" });
-    return json(res, 200, promptBody(name, entry));
+    return json(res, 200, {
+      ...promptBody(name, entry),
+      isActive: entry.labels.includes("production"),
+    });
   }
   if (req.method === "GET" && route === "/v2/observations") {
     const traceId = url.searchParams.get("traceId");
@@ -544,7 +574,12 @@ async function publicApi(req, res, url) {
   return false;
 }
 
-/** The counts of `stats`, without the per-span and per-request detail. */
+/**
+ * The counts of `stats`, without the per-span and per-request detail:
+ * distinct span ids `attempted` and `accepted`, span `deliveries` in every
+ * request and `acceptedDeliveries` in requests answered with a 2xx, and the
+ * ids whose span bytes differ between deliveries.
+ */
 function summary() {
   let deliveries = 0;
   let divergent = 0;
@@ -552,15 +587,43 @@ function summary() {
     deliveries += hashes.length;
     if (new Set(hashes).size > 1) divergent += 1;
   }
+  const accepted = Object.values(stats.accepted);
   return {
     requests: stats.requests,
     inflight: stats.inflight,
     badHeaders: stats.badHeaders,
-    distinct: Object.keys(stats.spans).length,
+    attempted: Object.keys(stats.spans).length,
+    accepted: accepted.length,
     deliveries,
+    acceptedDeliveries: accepted.reduce((sum, n) => sum + n, 0),
     divergent,
     faults: stats.faults,
   };
+}
+
+/**
+ * Whether `header` is a Basic `Authorization` value with a public and a
+ * secret key, the shape Langfuse's `extractBasicAuthCredentials` reads.
+ */
+function basicAuth(header) {
+  if (!header?.startsWith("Basic ")) return false;
+  const value = header.split(" ")[1];
+  if (!value) return false;
+  try {
+    const [publicKey, secretKey] = atob(value).split(":");
+    return Boolean(publicKey && secretKey);
+  } catch {
+    // Not base64.
+    return false;
+  }
+}
+
+/** Answers 401 as Langfuse's public API does without valid credentials. */
+function unauthorized(res) {
+  json(res, 401, {
+    message: "Invalid authorization header",
+    error: "UnauthorizedError",
+  });
 }
 
 /** Waits `ms` while the request counts as in flight. */
@@ -597,6 +660,12 @@ const server = createServer(async (req, res) => {
       return json(res, 200, mode);
     }
     if (url.pathname !== ROUTE) {
+      if (url.pathname.startsWith("/api/public/")) {
+        if (!basicAuth(req.headers.authorization)) {
+          stats.badHeaders += 1;
+          return unauthorized(res);
+        }
+      }
       if ((await publicApi(req, res, url)) === false) {
         json(res, 404, { error: "not found" });
       }
@@ -608,15 +677,35 @@ const server = createServer(async (req, res) => {
       return;
     }
     stats.requests += 1;
+    const authorized = basicAuth(req.headers.authorization);
+    const jsonBody = /application\/json/i.test(
+      req.headers["content-type"] ?? "",
+    );
     if (
-      !req.headers.authorization?.startsWith("Basic ") ||
+      !authorized ||
+      !jsonBody ||
       req.headers["x-langfuse-ingestion-version"] !== "4"
     ) {
       stats.badHeaders += 1;
     }
+    // Langfuse authenticates before it reads the body, then checks the
+    // content type. A refused request is logged without its spans.
+    if (!authorized) {
+      logRequest(await readBody(req)).status = 401;
+      return unauthorized(res);
+    }
+    if (!jsonBody) {
+      logRequest(await readBody(req)).status = 400;
+      return json(res, 400, { error: "Invalid content type" });
+    }
     const entry = recordSpans(await readBody(req));
     const answer = (status, headers) => {
       entry.status = status;
+      if (status >= 200 && status < 300) {
+        for (const id of entry.spanIds) {
+          stats.accepted[id] = (stats.accepted[id] ?? 0) + 1;
+        }
+      }
       json(res, status, {}, headers);
     };
     if (mode.mode === "status") return answer(mode.status);
