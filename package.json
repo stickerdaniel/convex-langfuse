@@ -40,6 +40,8 @@
     "test:coverage": "vitest run --coverage --coverage.reporter=text",
     "test:integration": "node integration/run.mjs",
     "test:load": "node integration/load.mjs",
+    "test:contract": "node contract/run.mjs",
+    "test:contract:faults": "node contract/faults.mjs",
     "preversion": "npm install --legacy-peer-deps && npm run build:clean && run-p test lint typecheck",
     "prepack": "node scripts/sync-version.mjs && npm run build",
     "prepublishOnly": "npm whoami || npm login",

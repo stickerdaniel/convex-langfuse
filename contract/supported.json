@@ -1,0 +1,16 @@
+{
+  "stacks": [
+    {
+      "langfuse": "4.78.0",
+      "source": "https://github.com/langfuse/langfuse/tree/138beceb728b998003059981892ad09e04f154b1",
+      "images": {
+        "web": "langfuse/langfuse:4.78.0@sha256:037188385ac6612d3494319fa060052da407b235502874c7ea79ade583c29002",
+        "worker": "langfuse/langfuse-worker:4.78.0@sha256:175a32200b9908b283104e67b84d080381e841daa8ee6692f5bb26538df1a59e",
+        "postgres": "postgres:17@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f",
+        "clickhouse": "clickhouse/clickhouse-server:26.3.62.3@sha256:de3e47c64078aa196dae2349e048fc98ba81947f651f5c20e06e46baea8ae40a",
+        "redis": "redis:7@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90",
+        "minio": "cgr.dev/chainguard/minio:latest@sha256:db3f583fa49121942168bd6383a773b2cde3384c9a99bf7193560b9a0f3a28fd"
+      }
+    }
+  ]
+}

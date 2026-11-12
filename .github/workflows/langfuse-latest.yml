@@ -1,0 +1,102 @@
+# Runs the contract suite against the latest stable Langfuse release, outside
+# the pull request gate. It records the release and its image digests in the
+# job summary and an artifact; a failure shows as this failed run. It never
+# changes contract/supported.json.
+name: Langfuse latest
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest:
+    name: Contract on the latest Langfuse
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node setup
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.x"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
+
+      # The highest stable release tag `vX.Y.Z`, its commit and the digests
+      # of its web and worker images. The other images stay those of the
+      # first entry of contract/supported.json.
+      - name: Resolve the latest stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api --paginate 'repos/langfuse/langfuse/releases?per_page=100' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          test -n "$tag"
+          version=${tag#v}
+          commit=$(gh api "repos/langfuse/langfuse/commits/$tag" --jq .sha)
+          digest() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest
+          }
+          web="langfuse/langfuse:$version@$(digest "langfuse/langfuse:$version")"
+          worker="langfuse/langfuse-worker:$version@$(digest "langfuse/langfuse-worker:$version")"
+          mkdir -p "$RUNNER_TEMP/latest"
+          jq --arg version "$version" --arg commit "$commit" \
+            --arg web "$web" --arg worker "$worker" \
+            '{stacks: [.stacks[0]
+              | .langfuse = $version
+              | .source = "https://github.com/langfuse/langfuse/tree/\($commit)"
+              | .images.web = $web
+              | .images.worker = $worker]}' \
+            contract/supported.json > "$RUNNER_TEMP/latest/stack.json"
+          {
+            echo "## Latest stable Langfuse: $tag"
+            echo
+            echo "- Commit: \`$commit\`"
+            echo "- Web: \`$web\`"
+            echo "- Worker: \`$worker\`"
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/latest/stack.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the resolved stack
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: langfuse-latest-stack
+          path: ${{ runner.temp }}/latest/stack.json
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Contract suite
+        run: npm run test:contract -- --stack "$RUNNER_TEMP/latest/stack.json"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: contract-logs-latest
+          path: contract/logs/
+          if-no-files-found: ignore
+
+      - name: Remove leftover stacks
+        if: always()
+        run: |
+          docker compose ls --all --format json |
+            jq -r '.[].Name | select(startswith("convex-langfuse-contract-"))' |
+            xargs -r -I{} docker compose -p {} down --volumes --remove-orphans

@@ -1,0 +1,193 @@
+# The Langfuse stack of the contract suite: web, worker, Postgres,
+# ClickHouse, Redis and MinIO, plus a relay for the prompt webhook.
+#
+# `contract/run.mjs` starts it with a project name of its own per run
+# (`docker compose -p`), so every run gets fresh volumes and networks, and
+# removes it with `down --volumes`. Every value below comes from the
+# environment of that `docker compose` process: the image references from
+# `contract/supported.json`, and the keys, passwords and ids, which the runner
+# generates per run and never writes to a file. Web and worker publish their
+# ports on a free port of 127.0.0.1.
+#
+# Settings that differ from Langfuse's own compose file:
+# - The v4 write mode is set explicitly: `events_only` with the preview
+#   opt-in on web and worker, the direct OTLP path on the worker.
+# - The organisation, project, API keys and a user are created at boot.
+# - Test speed, not processing bounds: no ingestion queue delay, a 100 ms
+#   ClickHouse write interval and a 100 ms deletion limiter duration, so a
+#   score or trace deletion is applied within a read-back deadline.
+# - The webhook relay listens on port 80, the only plain HTTP port Langfuse
+#   accepts for a webhook, and forwards to the Convex backend's HTTP actions
+#   on the host. `LANGFUSE_WEBHOOK_ALLOWED_HOSTS` lets Langfuse post to its
+#   private address.
+# - No AI gateway, no telemetry.
+
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: http://localhost:3000
+  DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+  SALT: ${SALT}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_PASSWORD}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_PASSWORD}
+  LANGFUSE_MIGRATION_V4_WRITE_MODE: events_only
+  LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: "true"
+  LANGFUSE_INGESTION_QUEUE_DELAY_MS: "0"
+  LANGFUSE_WEBHOOK_ALLOWED_HOSTS: webhook-relay
+
+x-depends-on-infrastructure: &depends-on-infrastructure
+  postgres:
+    condition: service_healthy
+  clickhouse:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+
+services:
+  langfuse-web:
+    image: ${LANGFUSE_WEB_IMAGE}
+    depends_on: *depends-on-infrastructure
+    ports:
+      - 127.0.0.1::3000
+    environment:
+      <<: *langfuse-env
+      # Next.js binds to this address; the default, the container's hostname,
+      # leaves 127.0.0.1 unbound for the health check.
+      HOSTNAME: 0.0.0.0
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_USER_EMAIL}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_USER_PASSWORD}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/public/health').then((r) =>
+          process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 2s
+      timeout: 5s
+      retries: 300
+
+  langfuse-worker:
+    image: ${LANGFUSE_WORKER_IMAGE}
+    # The web container runs the migrations; the worker starts after them.
+    depends_on:
+      langfuse-web:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1::3030
+    environment:
+      <<: *langfuse-env
+      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: direct
+      LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS: "100"
+      LANGFUSE_CLICKHOUSE_TRACE_DELETION_CONCURRENCY_DURATION_MS: "100"
+
+  webhook-relay:
+    # The web image only for its Node runtime, so the stack needs no image
+    # besides the pinned ones.
+    image: ${LANGFUSE_WEB_IMAGE}
+    entrypoint: ["node", "/relay.mjs"]
+    environment:
+      RELAY_TARGET: http://host.docker.internal:${CONVEX_SITE_PORT}
+    volumes:
+      - ./relay.mjs:/relay.mjs:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  clickhouse:
+    image: ${CLICKHOUSE_IMAGE}
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test:
+        wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit
+        1
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  redis:
+    image: ${REDIS_IMAGE}
+    # The server reads its configuration from stdin, so the password is in
+    # the container's environment and not among the server's arguments.
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        exec redis-server - <<EOF
+        requirepass $$REDIS_PASSWORD
+        maxmemory-policy noeviction
+        EOF
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  minio:
+    image: ${MINIO_IMAGE}
+    entrypoint: sh
+    # Creates the `langfuse` bucket before the server starts.
+    command:
+      -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  clickhouse_logs:
+  redis_data:
+  minio_data:

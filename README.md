@@ -66,6 +66,7 @@ Your functions never wait for Langfuse and never fail because Langfuse is down.
 - [Delivery](#delivery)
 - [Limits](#limits)
 - [Operations](#operations)
+- [Compatibility](#compatibility)
 - [Testing](#testing)
 - [Example app](#example-app)
 - [License](#license)
@@ -568,6 +569,40 @@ npx convex run --component convexLangfuse exporter:kick
 # deletion requests. Score dead letters are not retried.
 npx convex run --component convexLangfuse outbox:retryDeadLetters '{"limit": 100}'
 ```
+
+## Compatibility
+
+| Dependency | Tested with                                                             |
+| ---------- | ----------------------------------------------------------------------- |
+| Convex     | `convex` 1.49.0 on the backend release `precompiled-2026-10-28-d1fcbea` |
+| Langfuse   | 4.78.0, self-hosted, the images of `contract/supported.json`            |
+
+A contract suite runs on every pull request. A host app on a real Convex backend
+records through the client, the exporter delivers to a real Langfuse stack, and
+the suite reads the result back through Langfuse's public API and compares it
+with the values it recorded. It covers:
+
+- ids from seeds and keys, parent links and the ten observation types,
+- timestamps, model, usage keys with the derived total, and explicit costs,
+- environment, release, session, user, tags and metadata,
+- experiment items, and a trace that another producer joins,
+- prompt links, also after the label moved to a newer version,
+- scores of each type on a trace and on an observation, an update and a
+  deletion,
+- the prompt cache with a webhook delivered by Langfuse, and during an outage,
+- `content: "none"`, a `redact` hook, and a record the hook drops,
+- trace deletion, and a resend after a lost response.
+
+A weekly run repeats the suite on the latest stable Langfuse release. Langfuse
+Cloud is not part of the suite.
+
+Observed on Langfuse 4.78.0:
+
+- A span that was sent twice came back as two observations with the same id and
+  the same recorded fields.
+- A score metadata value that is a numeric string reads back as a number.
+- Observation metadata also holds `scope.name`, `scope.version` and
+  `resourceAttributes.service.name`.
 
 ## Testing
 

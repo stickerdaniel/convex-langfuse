@@ -34,6 +34,17 @@ npm run test:load
 node integration/load.mjs outage
 ```
 
+The contract suite needs Docker. It starts the Langfuse stack of
+`contract/supported.json`, runs every case against it and removes it again, in
+about 3 minutes. CI runs it on every pull request.
+
+```sh
+npm run test:contract
+
+# Plants three faults in the encoder and expects a case to catch each.
+npm run test:contract:faults
+```
+
 The scripts under `e2e/` check traces, scores and prompts against a Langfuse
 instance of your own. They create traces, scores and prompts with unique names.
 At the end they request the deletion of their traces through the component and
