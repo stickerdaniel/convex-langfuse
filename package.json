@@ -1,6 +1,6 @@
 {
   "name": "convex-langfuse",
-  "description": "Export LLM traces from a Convex app to Langfuse through a transactional outbox.",
+  "description": "Export LLM traces and scores from a Convex app to Langfuse through a transactional outbox, with a prompt cache.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/stickerdaniel/convex-langfuse.git"
