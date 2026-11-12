@@ -585,10 +585,12 @@ const OFFER_RATE_TOLERANCE = 0.95;
 /** The gate's threshold of 25,000 plus two minutes of intake. */
 const ENQUEUED_BOUND = 37_000;
 /**
- * Calls in flight at most. While the cap holds, the loop waits, so a slow
- * backend lowers the offered rate; the rate check catches that.
+ * Calls in flight at most, below the 16 mutations a local backend runs at a
+ * time: beyond that it refuses calls with `TooManyConcurrentRequests`. While
+ * the cap holds, the loop waits, so a slow backend lowers the offered rate;
+ * the rate check catches that.
  */
-const MAX_IN_FLIGHT = 50;
+const MAX_IN_FLIGHT = 12;
 
 async function thresholdDriver(binary, { kill }) {
   const env = await setup(binary);
