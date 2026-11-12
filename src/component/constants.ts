@@ -180,12 +180,13 @@ export const PROMPT_STEP_LABELS = 2;
 export const MAX_SNAPSHOT_BYTES = 900 * KIB;
 /**
  * Bytes of one prompt API response that a refresh or a listing reads, a
- * transport bound that admits every snapshot the cache accepts. A text
- * prompt arrives as a JSON string, where a control character escapes to 6
- * bytes; chat messages, config and resolution graph arrive as JSON of the
- * size they are stored at. So a snapshot of `MAX_SNAPSHOT_BYTES` takes at
- * most 6 × 900 KiB = 5400 KiB of a response, and 744 KiB are left for the
- * other fields.
+ * transport bound. A text prompt arrives as a JSON string, where a control
+ * character escapes to 6 bytes; chat messages, config and resolution graph
+ * arrive as JSON of the size they are stored at. So a snapshot of
+ * `MAX_SNAPSHOT_BYTES` takes at most 6 × 900 KiB = 5400 KiB of a response,
+ * and 744 KiB are left for the fields the cache does not store, such as
+ * tags and the commit message. A response whose other fields need more is
+ * refused as `oversize` although its snapshot would fit.
  */
 export const MAX_PROMPT_RESPONSE_BYTES = 6 * MIB;
 /**

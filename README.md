@@ -396,7 +396,9 @@ export const syncPrompts = internalAction({
 `sync` returns how many prompt names it tracks. Its status is `incomplete` when
 the listing did not reach every prompt. One listing reads at most 5,000 names in
 at most 150 requests; `sync` with `names` tracks prompts beyond that. A prompt
-whose latest config alone exceeds 6 MiB is not cached.
+whose latest config alone exceeds 6 MiB cannot be listed: it is not discovered,
+and a version of it that is cached already stays as it is, with an error in
+`health`.
 
 After that the cache follows Langfuse in two ways. Every 5 minutes a rolling
 refresh schedules each prompt whose last attempt is 13 minutes old, 200 ms
