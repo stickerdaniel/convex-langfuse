@@ -96,15 +96,35 @@ export async function ensureBinary() {
 // ── Processes ──────────────────────────────────────────────────────────────
 
 const children = new Set();
+const processGroups = new WeakSet();
 
-function track(child) {
+/**
+ * Stops an owned process, including its children when it owns a group. A
+ * group that is already gone answers `ESRCH`. On macOS a group whose
+ * processes have all exited and wait to be reaped answers `EPERM`.
+ */
+function stop(child) {
+  if (!processGroups.has(child)) return child.kill("SIGKILL");
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH" && error.code !== "EPERM") throw error;
+  }
+}
+
+function track(child, group = false) {
   children.add(child);
-  child.once("exit", () => children.delete(child));
+  if (group) processGroups.add(child);
+  child.once("exit", () => {
+    // A backend's Node executor survives its parent unless killed too.
+    if (group) stop(child);
+    children.delete(child);
+  });
   return child;
 }
 
 export function stopAll() {
-  for (const child of children) child.kill("SIGKILL");
+  for (const child of children) stop(child);
 }
 process.on("exit", stopAll);
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -161,8 +181,9 @@ export class Backend {
           "--disable-beacon",
           join(this.stateDir, "backend.sqlite3"),
         ],
-        { cwd: this.stateDir, stdio: ["ignore", log, log] },
+        { cwd: this.stateDir, stdio: ["ignore", log, log], detached: true },
       ),
+      true,
     );
     await waitFor(
       "the backend",
@@ -178,10 +199,17 @@ export class Backend {
     );
   }
 
-  /** Kills the process without letting it shut down cleanly. */
+  /**
+   * Kills the backend and its executor without a clean shutdown. Returns at
+   * once when the backend already exited, whose `exit` event does not come
+   * again.
+   */
   async kill() {
+    if (this.process.exitCode !== null || this.process.signalCode !== null) {
+      return;
+    }
     const exited = new Promise((resolve) => this.process.once("exit", resolve));
-    this.process.kill("SIGKILL");
+    stop(this.process);
     await exited;
   }
 
@@ -238,16 +266,52 @@ export async function startFake() {
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
     },
-    /** Adds the next text version of a prompt with `labels`. */
+    /**
+     * Adds the next text version of a prompt with `labels`. Returns `{
+     * version, createdAt }`, the version's number and the fake's time once
+     * the version exists.
+     */
     async addPrompt(prompt) {
       const response = await fetch(`${url}/control/prompts`, {
         method: "POST",
         body: JSON.stringify(prompt),
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
+      return await response.json();
     },
     async stats() {
       return await (await fetch(`${url}/stats`)).json();
+    },
+    /** Counts only, without the per-span and per-request detail. */
+    async summary() {
+      return await (await fetch(`${url}/stats?summary=1`)).json();
+    },
+    /** Makes the fake sign and post a webhook event per created prompt. */
+    async webhook(target) {
+      const response = await fetch(`${url}/control/webhook`, {
+        method: "POST",
+        body: JSON.stringify(target),
+      });
+      if (!response.ok) throw new Error("fake endpoint control failed");
+    },
+    /**
+     * Makes the fake answer each prompt by name after a random time up to
+     * `ms`, and each listing of one name, the first request of a refresh,
+     * after a random time up to `listingMs`. 0 answers at once again.
+     */
+    async holdPrompts(ms, listingMs = 0) {
+      const response = await fetch(`${url}/control/prompt-hold`, {
+        method: "POST",
+        body: JSON.stringify({ ms, listingMs }),
+      });
+      if (!response.ok) throw new Error("fake endpoint control failed");
+    },
+    /** Stops the fake process. */
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGKILL");
+      await exited;
     },
   };
 }

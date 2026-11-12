@@ -1,63 +1,202 @@
-// Fake Langfuse for the integration run and the end-to-end scripts.
+// Fake Langfuse for the integration run, the load drivers and the end-to-end
+// scripts.
 //
 //   node integration/fake-langfuse.mjs --port 0
 //
 // Prints `listening <port>` once ready. `POST /api/public/otel/v1/traces`
-// records every span id with a hash of that span's content and every request
-// with the hash of its raw body, then answers according to the mode. `POST
-// /control` with `{ "mode": "healthy" | "status" | "delay" | "down",
-// "status"?: number, "delayMs"?: number }` switches the mode of that route;
-// `GET /stats` returns what was received.
+// records every span id with a hash of that span's bytes and every request
+// with the hash of its raw body, its arrival time and its answer, then
+// answers according to the mode. A span id counts as accepted once per
+// request that carried it and was answered with a 2xx, also when the client
+// gave up before a held answer came. `POST /control` switches the mode of
+// that route:
+//
+// - `{ "mode": "healthy" }` answers 200.
+// - `{ "mode": "status", "status": number }` answers `status`.
+// - `{ "mode": "delay", "delayMs": number }` answers 200 after `delayMs`.
+// - `{ "mode": "down" }` closes the connection without an answer.
+// - `{ "mode": "faults", "p500", "p429", "pDelay", "delayMs", "seed"? }`
+//   draws one number per request from a pseudo-random sequence seeded with
+//   `seed` (default 1) and answers 500, 429 with `Retry-After: 1`, 200 after
+//   `delayMs`, or 200, with the given probabilities. Setting the mode restarts
+//   the sequence, so two runs see the same answers.
+//
+// The OTLP route and every route under `/api/public` answer 401 without a
+// Basic `Authorization` header that carries a public and a secret key, as
+// Langfuse 4.78.0 does. The OTLP route answers 400 to a content type without
+// `application/json`; Langfuse also takes protobuf, which this fake cannot
+// read. The fake's own routes, `/stats` and `/control…`, take any request.
+//
+// `GET /stats` returns what was received; `GET /stats?summary=1` returns the
+// counts only.
 //
 // The public API routes the component and the end-to-end scripts use keep
 // their state in memory and apply it at once: scores (`POST /scores`,
 // `DELETE /scores/{id}`, `GET /v3/scores?id=`), score configs (`GET` and
-// `POST /score-configs`), trace deletion (`DELETE /traces`), observations
-// of the received spans (`GET /v2/observations?traceId=`) and prompts
-// (`GET /v2/prompts?name=`, `GET /v2/prompts/{name}?label=|version=`,
-// without references). `POST /control/prompts` with `{ name, prompt,
-// labels }` adds the next text version of a prompt and moves the labels to
-// it.
+// `POST /score-configs`), trace deletion (`DELETE /traces`), the received
+// spans as observations (`GET /v2/observations?traceId=`) and experiment items
+// (`GET /experiment-items?fromStartTime=`), and prompts (`POST /v2/prompts`,
+// `GET /v2/prompts?name=`, `GET /v2/prompts/{name}?label=|version=`, `DELETE
+// /v2/prompts/{name}`, without references). Every prompt `GET` is logged in
+// `stats.promptRequests` with its route, prompt name and arrival time. `POST
+// /control/prompts` with `{ name, prompt, labels }` adds the next text version
+// of a prompt, moves the labels to it and answers `{ version, createdAt }`.
+// After `POST /control/webhook` with `{ url, secret }`, every created prompt
+// version is posted to `url` as a signed `prompt-version` event.
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 const ROUTE = "/api/public/otel/v1/traces";
 
 let mode = { mode: "healthy" };
+/** The next draw of the `faults` mode, in [0, 1). */
+let draw = mulberry32(1);
 const stats = {
   requests: 0,
   inflight: 0,
-  /** Requests without the headers the exporter must send. */
+  /**
+   * Requests without the headers a client must send: an OTLP request without
+   * a well-formed Basic `Authorization`, `x-langfuse-ingestion-version: 4` or
+   * a JSON content type, and a public API request without a well-formed
+   * Basic `Authorization`.
+   */
   badHeaders: 0,
-  /** Span id to the content hash of every delivery of that span. */
+  /**
+   * Span id to the hash of its span bytes in every request that carried it
+   * and passed the credential and content type checks, whatever the answer.
+   */
   spans: {},
-  /** Every request in arrival order: raw body hash and span ids. */
+  /** Span id to the number of requests that carried it and got a 2xx. */
+  accepted: {},
+  /**
+   * Every request in arrival order: raw body hash, span ids, arrival time
+   * and the status it was answered with, `null` until it is answered.
+   */
   log: [],
   /** Indexes into `log` of the requests that are being delayed right now. */
   inflightLog: [],
+  /** Answers the `faults` mode injected, by kind. */
+  faults: { 500: 0, 429: 0, delay: 0 },
   /** Public API requests by `<method> <route>`. */
   api: {},
+  /**
+   * Every prompt `GET` in arrival order: `<method> <route>` as in `api`, the
+   * prompt name (`null` for a listing without `name`) and the arrival time.
+   */
+  promptRequests: [],
 };
 
 /** Score id to the stored score. */
 const scores = new Map();
 const configs = [];
-/** Trace id to the ids of its received spans. */
+/**
+ * Trace id to its spans from requests answered with a 2xx, by span id; the
+ * last accepted delivery wins.
+ */
 const observations = new Map();
-/** Prompt name to its versions: `{ version, prompt, labels }`. */
+/** Prompt name to its versions: `{ version, type, prompt, config, labels }`. */
 const prompts = new Map();
+/** Where created prompt versions are posted, or `null`. */
+let webhook = null;
+/**
+ * A prompt by name and the listing of one name are answered after a random
+ * time up to this many milliseconds each, so the answers of refreshes that
+ * run side by side do not arrive in step.
+ */
+let promptHoldMs = 0;
+let listingHoldMs = 0;
+let holdDraw = mulberry32(1);
+/** Waits a random time up to `maxMs`. */
+const holdUpTo = (maxMs) =>
+  new Promise((resolve) => setTimeout(resolve, holdDraw() * maxMs));
 
-/** Adds the next text version of `name` and moves `labels` to it. */
-function addPrompt({ name, prompt, labels }) {
+/** A pseudo-random generator: the same seed gives the same sequence. */
+function mulberry32(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Adds the next version of `name` and moves `labels` to it. */
+function addPrompt({ name, type = "text", prompt, config = {}, labels = [] }) {
   const versions = prompts.get(name) ?? [];
   prompts.set(name, versions);
   for (const entry of versions) {
     entry.labels = entry.labels.filter((label) => !labels.includes(label));
   }
-  const version = versions.length + 1;
-  versions.push({ version, prompt, labels: [...labels] });
-  return version;
+  const entry = {
+    version: versions.length + 1,
+    type,
+    prompt,
+    config: config ?? {},
+    labels: [...labels],
+  };
+  versions.push(entry);
+  if (webhook) void postWebhook(name, entry);
+  return entry;
+}
+
+/** The prompt object the public API returns for one version. */
+function promptBody(name, entry) {
+  return {
+    id: `${name}@${entry.version}`,
+    name,
+    version: entry.version,
+    type: entry.type,
+    prompt: entry.prompt,
+    config: entry.config,
+    labels: entry.labels,
+    tags: [],
+    resolutionGraph: null,
+  };
+}
+
+/** Posts a `prompt-version` event, signed as Langfuse's `signature.ts` does. */
+async function postWebhook(name, entry) {
+  const body = JSON.stringify({
+    id: randomUUID(),
+    timestamp: new Date().toISOString(),
+    type: "prompt-version",
+    apiVersion: "v1",
+    action: "created",
+    prompt: {
+      id: `${name}@${entry.version}`,
+      name,
+      version: entry.version,
+      projectId: "fake",
+      createdBy: "API",
+      labels: entry.labels,
+      prompt: entry.prompt,
+      type: entry.type,
+      config: entry.config,
+      commitMessage: null,
+      tags: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  const t = Math.floor(Date.now() / 1_000);
+  const hex = createHmac("sha256", webhook.secret)
+    .update(`${t}.${body}`, "utf8")
+    .digest("hex");
+  try {
+    await fetch(webhook.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-langfuse-signature": `t=${t},v1=${hex}`,
+      },
+      body,
+    });
+  } catch {
+    // A webhook delivery that fails is not retried.
+  }
 }
 
 function readBody(req) {
@@ -69,36 +208,182 @@ function readBody(req) {
   });
 }
 
-function json(res, status, value) {
-  res.writeHead(status, { "content-type": "application/json" });
+function json(res, status, value, headers = {}) {
+  res.writeHead(status, { "content-type": "application/json", ...headers });
   res.end(JSON.stringify(value));
 }
 
-/** Records one request and returns its index in `stats.log`. */
-function recordSpans(body) {
-  const parsed = JSON.parse(body);
-  const spanIds = [];
-  stats.log.push({
-    bodyHash: createHash("sha256").update(body).digest("hex"),
-    spanIds,
-  });
-  for (const resource of parsed.resourceSpans) {
-    for (const scope of resource.scopeSpans) {
-      for (const span of scope.spans) {
-        const hash = createHash("sha256")
-          .update(JSON.stringify(span))
-          .digest("hex")
-          .slice(0, 16);
-        (stats.spans[span.spanId] ??= []).push(hash);
-        spanIds.push(span.spanId);
-        if (!observations.has(span.traceId)) {
-          observations.set(span.traceId, new Set());
+/** Raw span objects in the exporter's JSON body, including their whitespace. */
+function rawSpans(body) {
+  const spans = [];
+  const arrays = /"spans"\s*:\s*\[/g;
+  while (arrays.exec(body) !== null) {
+    let depth = 0;
+    let quoted = false;
+    let start;
+    for (let i = arrays.lastIndex; i < body.length; i++) {
+      const char = body[i];
+      if (quoted) {
+        if (char === "\\") i += 1;
+        else if (char === '"') quoted = false;
+      } else if (char === '"') {
+        quoted = true;
+      } else if (char === "{" || char === "[") {
+        if (depth === 0) start = i;
+        depth += 1;
+      } else if (char === "}" || char === "]") {
+        if (depth === 0) {
+          arrays.lastIndex = i + 1;
+          break;
         }
-        observations.get(span.traceId).add(span.spanId);
+        depth -= 1;
+        if (depth === 0) spans.push(body.slice(start, i + 1));
       }
     }
   }
-  return stats.log.length - 1;
+  return spans;
+}
+
+/** Adds one request to `stats.log` and returns its entry. */
+function logRequest(body) {
+  const entry = {
+    bodyHash: createHash("sha256").update(body).digest("hex"),
+    spanIds: [],
+    at: Date.now(),
+    status: null,
+  };
+  stats.log.push(entry);
+  return entry;
+}
+
+/**
+ * Records one request as an attempt. Returns its entry in `stats.log` and
+ * `accept`, which the route calls when it answers with a 2xx: only then the
+ * spans count as accepted and can be read back as observations. The hash
+ * kept per span id covers the bytes of that span object only. Resource and
+ * scope are built per request, so they are not part of it.
+ */
+function recordSpans(body) {
+  const parsed = JSON.parse(body);
+  const raw = rawSpans(body);
+  let next = 0;
+  const entry = logRequest(body);
+  const received = [];
+  for (const resource of parsed.resourceSpans) {
+    const resourceAttributes = attributeMap(resource.resource?.attributes);
+    for (const scope of resource.scopeSpans) {
+      for (const span of scope.spans) {
+        const hash = createHash("sha256").update(raw[next++]).digest("hex");
+        (stats.spans[span.spanId] ??= []).push(hash);
+        entry.spanIds.push(span.spanId);
+        received.push({ span, scope: scope.scope, resourceAttributes });
+      }
+    }
+  }
+  const accept = () => {
+    for (const observation of received) {
+      const { traceId, spanId } = observation.span;
+      stats.accepted[spanId] = (stats.accepted[spanId] ?? 0) + 1;
+      if (!observations.has(traceId)) observations.set(traceId, new Map());
+      observations.get(traceId).set(spanId, observation);
+    }
+  };
+  return { entry, accept };
+}
+
+/** OTLP attributes as a plain object of their values. */
+function attributeMap(attributes = []) {
+  const map = {};
+  for (const { key, value } of attributes) {
+    if ("stringValue" in value) map[key] = value.stringValue;
+    else if ("intValue" in value) map[key] = Number(value.intValue);
+    else if ("arrayValue" in value) {
+      map[key] = value.arrayValue.values.map((item) => item.stringValue);
+    }
+  }
+  return map;
+}
+
+const parseJson = (text) => (text === undefined ? undefined : JSON.parse(text));
+const nanosToIso = (nanos) =>
+  new Date(Number(BigInt(nanos) / 1_000_000n)).toISOString();
+
+/**
+ * A received span as `GET /api/public/v2/observations` returns it, with
+ * every field group. Metadata is flat, as the events table stores it: the
+ * observation and trace metadata's top-level keys, `resourceAttributes.*` and
+ * `scope.*`, and `attributes.*` for every span attribute when the scope name
+ * does not start with `langfuse-sdk`, which is what Langfuse does.
+ */
+function observationOf({ span, scope, resourceAttributes }) {
+  const a = attributeMap(span.attributes);
+  const usage = parseJson(a["langfuse.observation.usage_details"]);
+  const cost = parseJson(a["langfuse.observation.cost_details"]);
+  const metadata = {};
+  for (const [key, value] of Object.entries(resourceAttributes)) {
+    metadata[`resourceAttributes.${key}`] = value;
+  }
+  metadata["scope.name"] = scope.name;
+  metadata["scope.version"] = scope.version;
+  if (!scope.name.startsWith("langfuse-sdk")) {
+    for (const [key, value] of Object.entries(a)) {
+      metadata[`attributes.${key}`] = value;
+    }
+  }
+  Object.assign(
+    metadata,
+    parseJson(a["langfuse.observation.metadata"]),
+    parseJson(a["langfuse.trace.metadata"]),
+  );
+  const usageDetails =
+    usage === undefined
+      ? {}
+      : {
+          ...usage,
+          total:
+            usage.total ??
+            Object.values(usage).reduce((sum, value) => sum + value, 0),
+        };
+  return {
+    id: span.spanId,
+    traceId: span.traceId,
+    startTime: nanosToIso(span.startTimeUnixNano),
+    endTime: nanosToIso(span.endTimeUnixNano),
+    projectId: "fake",
+    parentObservationId: span.parentSpanId ?? null,
+    type: String(a["langfuse.observation.type"] ?? "span").toUpperCase(),
+    name: span.name,
+    level: a["langfuse.observation.level"] ?? "DEFAULT",
+    version: a["langfuse.version"] ?? null,
+    environment: a["langfuse.environment"] ?? "default",
+    userId: a["user.id"] ?? null,
+    sessionId: a["session.id"] ?? null,
+    input: a["langfuse.observation.input"] ?? null,
+    output: a["langfuse.observation.output"] ?? null,
+    metadata,
+    model: a["langfuse.observation.model.name"] ?? null,
+    usageDetails,
+    costDetails: cost ?? {},
+    totalCost: cost?.total ?? null,
+    promptId: null,
+    promptName: a["langfuse.observation.prompt.name"] ?? null,
+    promptVersion: a["langfuse.observation.prompt.version"] ?? null,
+    traceName: a["langfuse.trace.name"] ?? null,
+    tags: a["langfuse.trace.tags"] ?? [],
+    release: a["langfuse.release"] ?? null,
+    modelId: null,
+    inputPrice: null,
+    outputPrice: null,
+    totalPrice: null,
+    // Not part of the API: the experiment fields for `/experiment-items`.
+    experiment: {
+      id: a["langfuse.experiment.id"],
+      name: a["langfuse.experiment.name"],
+      datasetId: a["langfuse.experiment.dataset.id"] ?? null,
+      itemId: a["langfuse.experiment.item.id"],
+      rootObservationId: a["langfuse.experiment.item.root_observation_id"],
+    },
+  };
 }
 
 const DATA_TYPES = new Set(["NUMERIC", "BOOLEAN", "CATEGORICAL"]);
@@ -116,6 +401,23 @@ function validScore(body) {
   return typeof body.value === "number";
 }
 
+/** Whether a prompt body has the shape `CreatePromptSchema` accepts. */
+function validPrompt(body) {
+  if (typeof body.name !== "string" || body.name === "") return false;
+  if (body.labels !== undefined && !Array.isArray(body.labels)) return false;
+  if ((body.type ?? "text") === "text") return typeof body.prompt === "string";
+  return (
+    body.type === "chat" &&
+    Array.isArray(body.prompt) &&
+    body.prompt.every(
+      (message) =>
+        (typeof message.role === "string" &&
+          typeof message.content === "string") ||
+        (message.type === "placeholder" && typeof message.name === "string"),
+    )
+  );
+}
+
 /** Answers a public API request; returns false for an unknown route. */
 async function publicApi(req, res, url) {
   const route = url.pathname.replace(/^\/api\/public/, "");
@@ -123,6 +425,16 @@ async function publicApi(req, res, url) {
     .replace(/^\/scores\/.+/, "/scores/{id}")
     .replace(/^\/v2\/prompts\/.+/, "/v2/prompts/{name}")}`;
   stats.api[key] = (stats.api[key] ?? 0) + 1;
+  if (req.method === "GET" && route.startsWith("/v2/prompts")) {
+    stats.promptRequests.push({
+      route: key,
+      name:
+        route === "/v2/prompts"
+          ? url.searchParams.get("name")
+          : decodeURIComponent(route.slice("/v2/prompts/".length)),
+      at: Date.now(),
+    });
+  }
   if (req.method === "POST" && route === "/scores") {
     const body = JSON.parse(await readBody(req));
     if (!validScore(body)) return json(res, 400, { message: "invalid" });
@@ -187,6 +499,12 @@ async function publicApi(req, res, url) {
     for (const traceId of traceIds) observations.delete(traceId);
     return json(res, 200, { message: "Traces deleted successfully" });
   }
+  if (req.method === "POST" && route === "/v2/prompts") {
+    const body = JSON.parse(await readBody(req));
+    if (!validPrompt(body)) return json(res, 400, { message: "invalid" });
+    const entry = addPrompt(body);
+    return json(res, 201, promptBody(body.name, entry));
+  }
   if (req.method === "GET" && route === "/v2/prompts") {
     const name = url.searchParams.get("name");
     const page = Number(url.searchParams.get("page") ?? 1);
@@ -200,14 +518,22 @@ async function publicApi(req, res, url) {
       labels: [...new Set(prompts.get(item).flatMap((e) => e.labels))].sort(),
       tags: [],
       lastUpdatedAt: new Date().toISOString(),
-      type: "text",
-      lastConfig: {},
+      type: prompts.get(item).at(-1).type,
+      lastConfig: prompts.get(item).at(-1).config,
     }));
     const totalPages = Math.ceil(names.length / limit);
-    return json(res, 200, {
-      data,
-      meta: { page, limit, totalItems: names.length, totalPages },
-    });
+    const meta = { page, limit, totalPages, totalItems: names.length };
+    if (name !== null && listingHoldMs > 0) await holdUpTo(listingHoldMs);
+    // 4.78.0 repeats `meta` as `pagination` for older clients.
+    return json(res, 200, { data, meta, pagination: meta });
+  }
+  if (req.method === "DELETE" && route.startsWith("/v2/prompts/")) {
+    const name = decodeURIComponent(route.slice("/v2/prompts/".length));
+    if (!prompts.delete(name)) {
+      return json(res, 404, { message: "Prompt not found" });
+    }
+    res.writeHead(204);
+    return res.end();
   }
   if (req.method === "GET" && route.startsWith("/v2/prompts/")) {
     const name = decodeURIComponent(route.slice("/v2/prompts/".length));
@@ -221,44 +547,154 @@ async function publicApi(req, res, url) {
           : item.version === Number(version),
       );
     if (!entry) return json(res, 404, { message: "Prompt not found" });
+    if (promptHoldMs > 0) await holdUpTo(promptHoldMs);
     return json(res, 200, {
-      id: `${name}@${entry.version}`,
-      name,
-      version: entry.version,
-      type: "text",
-      prompt: entry.prompt,
-      config: {},
-      labels: entry.labels,
-      tags: [],
-      resolutionGraph: null,
+      ...promptBody(name, entry),
+      isActive: entry.labels.includes("production"),
     });
   }
   if (req.method === "GET" && route === "/v2/observations") {
     const traceId = url.searchParams.get("traceId");
-    const data = [...(observations.get(traceId) ?? [])].map((id) => ({
-      id,
-      traceId,
-    }));
+    const data = [...(observations.get(traceId)?.values() ?? [])].map(
+      (received) => {
+        const observation = observationOf(received);
+        delete observation.experiment;
+        return observation;
+      },
+    );
+    return json(res, 200, { data, meta: {} });
+  }
+  if (req.method === "GET" && route === "/experiment-items") {
+    const from = url.searchParams.get("fromStartTime");
+    if (from === null || Number.isNaN(Date.parse(from))) {
+      return json(res, 400, { message: "fromStartTime is required" });
+    }
+    const ids = url.searchParams.get("experimentId")?.split(",");
+    const data = [...observations.values()]
+      .flatMap((spans) => [...spans.values()].map(observationOf))
+      .filter(
+        ({ id, startTime, experiment }) =>
+          experiment.id !== undefined &&
+          experiment.rootObservationId === id &&
+          Date.parse(startTime) >= Date.parse(from) &&
+          (ids === undefined || ids.includes(experiment.id)),
+      )
+      .map(({ id, traceId, startTime, endTime, level, environment, ...o }) => ({
+        id,
+        traceId,
+        startTime,
+        endTime,
+        level,
+        environment,
+        experimentId: o.experiment.id,
+        experimentName: o.experiment.name,
+        experimentItemId: o.experiment.itemId ?? "",
+        experimentDatasetId: o.experiment.datasetId,
+      }));
     return json(res, 200, { data, meta: {} });
   }
   return false;
+}
+
+/**
+ * The counts of `stats`, without the per-span and per-request detail:
+ * distinct span ids `attempted` and `accepted`, span `deliveries` in every
+ * request and `acceptedDeliveries` in requests answered with a 2xx, and the
+ * ids whose span bytes differ between deliveries.
+ */
+function summary() {
+  let deliveries = 0;
+  let divergent = 0;
+  for (const hashes of Object.values(stats.spans)) {
+    deliveries += hashes.length;
+    if (new Set(hashes).size > 1) divergent += 1;
+  }
+  const accepted = Object.values(stats.accepted);
+  return {
+    requests: stats.requests,
+    inflight: stats.inflight,
+    badHeaders: stats.badHeaders,
+    attempted: Object.keys(stats.spans).length,
+    accepted: accepted.length,
+    deliveries,
+    acceptedDeliveries: accepted.reduce((sum, n) => sum + n, 0),
+    divergent,
+    faults: stats.faults,
+  };
+}
+
+/**
+ * Whether `header` is a Basic `Authorization` value with a public and a
+ * secret key, the shape Langfuse's `extractBasicAuthCredentials` reads.
+ */
+function basicAuth(header) {
+  if (!header?.startsWith("Basic ")) return false;
+  const value = header.split(" ")[1];
+  if (!value) return false;
+  try {
+    const [publicKey, secretKey] = atob(value).split(":");
+    return Boolean(publicKey && secretKey);
+  } catch {
+    // Not base64.
+    return false;
+  }
+}
+
+/** Answers 401 as Langfuse's public API does without valid credentials. */
+function unauthorized(res) {
+  json(res, 401, {
+    message: "Invalid authorization header",
+    error: "UnauthorizedError",
+  });
+}
+
+/** Waits `ms` while the request counts as in flight. */
+async function hold(entry, ms) {
+  const index = stats.log.indexOf(entry);
+  stats.inflight += 1;
+  stats.inflightLog.push(index);
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  stats.inflight -= 1;
+  stats.inflightLog = stats.inflightLog.filter((i) => i !== index);
 }
 
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://fake");
     if (req.method === "GET" && url.pathname === "/stats") {
-      return json(res, 200, stats);
+      return json(
+        res,
+        200,
+        url.searchParams.has("summary") ? summary() : stats,
+      );
     }
     if (req.method === "POST" && url.pathname === "/control/prompts") {
-      const version = addPrompt(JSON.parse(await readBody(req)));
-      return json(res, 200, { version });
+      const { version } = addPrompt(JSON.parse(await readBody(req)));
+      return json(res, 200, { version, createdAt: Date.now() });
+    }
+    if (req.method === "POST" && url.pathname === "/control/webhook") {
+      webhook = JSON.parse(await readBody(req));
+      return json(res, 200, {});
+    }
+    if (req.method === "POST" && url.pathname === "/control/prompt-hold") {
+      const hold = JSON.parse(await readBody(req));
+      promptHoldMs = hold.ms;
+      listingHoldMs = hold.listingMs;
+      holdDraw = mulberry32(1);
+      return json(res, 200, {});
     }
     if (req.method === "POST" && url.pathname === "/control") {
       mode = JSON.parse(await readBody(req));
+      draw = mulberry32(mode.seed ?? 1);
       return json(res, 200, mode);
     }
     if (url.pathname !== ROUTE) {
+      if (url.pathname.startsWith("/api/public/")) {
+        if (!basicAuth(req.headers.authorization)) {
+          stats.badHeaders += 1;
+          return unauthorized(res);
+        }
+      }
       if ((await publicApi(req, res, url)) === false) {
         json(res, 404, { error: "not found" });
       }
@@ -270,23 +706,51 @@ const server = createServer(async (req, res) => {
       return;
     }
     stats.requests += 1;
+    const authorized = basicAuth(req.headers.authorization);
+    const jsonBody = /application\/json/i.test(
+      req.headers["content-type"] ?? "",
+    );
     if (
-      !req.headers.authorization?.startsWith("Basic ") ||
+      !authorized ||
+      !jsonBody ||
       req.headers["x-langfuse-ingestion-version"] !== "4"
     ) {
       stats.badHeaders += 1;
     }
-    const body = await readBody(req);
-    const index = recordSpans(body);
-    if (mode.mode === "status") return json(res, mode.status, {});
-    if (mode.mode === "delay") {
-      stats.inflight += 1;
-      stats.inflightLog.push(index);
-      await new Promise((resolve) => setTimeout(resolve, mode.delayMs));
-      stats.inflight -= 1;
-      stats.inflightLog = stats.inflightLog.filter((i) => i !== index);
+    // Langfuse authenticates before it reads the body, then checks the
+    // content type. A refused request is logged without its spans.
+    if (!authorized) {
+      logRequest(await readBody(req)).status = 401;
+      return unauthorized(res);
     }
-    return json(res, 200, {});
+    if (!jsonBody) {
+      logRequest(await readBody(req)).status = 400;
+      return json(res, 400, { error: "Invalid content type" });
+    }
+    const { entry, accept } = recordSpans(await readBody(req));
+    const answer = (status, headers) => {
+      entry.status = status;
+      if (status >= 200 && status < 300) accept();
+      json(res, status, {}, headers);
+    };
+    if (mode.mode === "status") return answer(mode.status);
+    if (mode.mode === "delay") await hold(entry, mode.delayMs);
+    if (mode.mode === "faults") {
+      const r = draw();
+      if (r < mode.p500) {
+        stats.faults[500] += 1;
+        return answer(500);
+      }
+      if (r < mode.p500 + mode.p429) {
+        stats.faults[429] += 1;
+        return answer(429, { "retry-after": "1" });
+      }
+      if (r < mode.p500 + mode.p429 + mode.pDelay) {
+        stats.faults.delay += 1;
+        await hold(entry, mode.delayMs);
+      }
+    }
+    return answer(200);
   } catch {
     if (!res.headersSent) json(res, 500, {});
   }

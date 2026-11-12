@@ -45,6 +45,7 @@ const TRACE_IDS = {
   6: "a0000000000000000000000000000006",
   7: "a0000000000000000000000000000007",
   8: "a0000000000000000000000000000008",
+  10: "a0000000000000000000000000000010",
 };
 
 /** First span id number of a case, so cases never share ids. */
@@ -175,17 +176,17 @@ function startLoad(client, caseNo, { size, concurrency, paceMs = 0 }) {
   };
 }
 
-/** Span ids of a case the fake endpoint has received. */
+/** Span ids of a case the fake endpoint has accepted with a 2xx. */
 function received(stats, caseNo, total) {
   let count = 0;
   for (let n = firstId(caseNo); n < firstId(caseNo) + total; n++) {
-    if (stats.spans[hexId(n)]) count += 1;
+    if (stats.accepted[hexId(n)]) count += 1;
   }
   return count;
 }
 
 /**
- * Span ids of committed load mutations the fake endpoint has not received.
+ * Span ids of committed load mutations the fake endpoint has not accepted.
  * A mutation given up at `stop` leaves a gap in the ids, so the committed
  * ranges are checked one by one.
  */
@@ -193,23 +194,27 @@ function missing(stats, commits, size) {
   let count = 0;
   for (const { from } of commits) {
     for (let n = from; n < from + size; n++) {
-      if (!stats.spans[hexId(n)]) count += 1;
+      if (!stats.accepted[hexId(n)]) count += 1;
     }
   }
   return count;
 }
 
-/** Span ids whose deliveries did not all carry the same content. */
+/**
+ * Span ids whose span bytes differ between deliveries, refused ones
+ * included.
+ */
 function divergent(stats) {
   return Object.entries(stats.spans).filter(
     ([, hashes]) => new Set(hashes).size > 1,
   );
 }
 
-function deliveries(stats, caseNo, total) {
+/** Requests answered with a 2xx that carried a span id of a case. */
+function acceptedDeliveries(stats, caseNo, total) {
   let count = 0;
   for (let n = firstId(caseNo); n < firstId(caseNo) + total; n++) {
-    count += stats.spans[hexId(n)]?.length ?? 0;
+    count += stats.accepted[hexId(n)] ?? 0;
   }
   return count;
 }
@@ -352,6 +357,7 @@ async function main() {
         1_000,
       );
       // Recovery must send the in-flight batch again, with the same bytes.
+      // A resend counts whatever its answer, so `stats.spans` holds it.
       const afterKill = stats.log.slice(seenAtKill);
       for (const { bodyHash, spanIds } of inflight) {
         if (!afterKill.some((request) => request.bodyHash === bodyHash)) {
@@ -369,12 +375,12 @@ async function main() {
       );
       const diverging = divergent(stats);
       if (diverging.length > 0) {
-        throw new Error(`${diverging.length} span ids with different content`);
+        throw new Error(`${diverging.length} span ids with different bytes`);
       }
       const resent = inflight.reduce((sum, r) => sum + r.spanIds.length, 0);
       return (
-        `${total} span ids, ${deliveries(stats, 3, total)} deliveries, ` +
-        `${resent} in-flight spans resent with identical request bytes`
+        `${total} span ids, ${acceptedDeliveries(stats, 3, total)} accepted ` +
+        `deliveries, ${resent} in-flight spans resent with identical request bytes`
       );
     });
 
@@ -767,13 +773,277 @@ async function main() {
       );
     });
 
-    const diverging = divergent(await fake.stats());
+    await runCase("10 a name cut inside an emoji", async () => {
+      await client.mutation(api.recordCut, {
+        traceId: TRACE_IDS[10],
+        id: firstId(10),
+      });
+      await waitFor(
+        "the span",
+        async () => received(await fake.stats(), 10, 1) === 1,
+        60_000,
+      );
+      const response = await fetch(
+        `${fake.url}/api/public/v2/observations?traceId=${TRACE_IDS[10]}`,
+        {
+          headers: {
+            authorization: `Basic ${btoa("pk-lf-integration:sk-lf-integration")}`,
+          },
+        },
+      );
+      const [observation] = (await response.json()).data;
+      if (
+        observation?.name !== "cut \ufffd" ||
+        observation.input !== "whole 😀"
+      ) {
+        throw new Error(
+          `received name ${JSON.stringify(observation?.name)}, input ${JSON.stringify(observation?.input)}`,
+        );
+      }
+      return "the span arrived with U+FFFD in place of the lone surrogate";
+    });
+
+    /** Adds a text prompt with the `production` label for each name. */
+    const addPrompts = async (names) => {
+      for (let i = 0; i < names.length; i += 25) {
+        await Promise.all(
+          names
+            .slice(i, i + 25)
+            .map((name) =>
+              fake.addPrompt({ name, prompt: "Hello", labels: ["production"] }),
+            ),
+        );
+      }
+    };
+    /** The cached `production` version of each name, `null` on a miss. */
+    const cachedVersions = async (names) => {
+      const versions = [];
+      for (let i = 0; i < names.length; i += 50) {
+        versions.push(
+          ...(await client.query(api.promptVersions, {
+            names: names.slice(i, i + 50),
+          })),
+        );
+      }
+      return versions;
+    };
+    const promptNames = (prefix, count) =>
+      Array.from(
+        { length: count },
+        (_, i) => `integration/${prefix}-${String(i).padStart(3, "0")}`,
+      );
+    /** A reservation that lost to concurrent writes on every retry. */
+    const lostReservation = (log) =>
+      /^prompts(\.js)?:request$/.test(log.identifier) &&
+      String(log.error).includes("changed while this mutation was being run");
+    /** The first line of each failed execution, without those `allowed`. */
+    const failedExecutions = (executions, allowed = () => false) =>
+      executions
+        .filter((log) => log.error && !allowed(log))
+        .map(
+          (log) =>
+            `${log.identifier}: ${String(log.error).split("\n")[0].slice(0, 160)}`,
+        );
+    /** How many of `names` have a cached `production` version. */
+    const cachedCount = async (names) =>
+      (await cachedVersions(names)).filter((v) => v !== null).length;
+    /**
+     * Lists the endpoint's prompts once, before a case adds its own. Until a
+     * listing has ended, the component's tick starts one, and a listing
+     * tracks every name it finds: the names the case is about to reserve.
+     * After this one, the tick lists again an hour later.
+     */
+    const listPrompts = () => client.action(api.syncPrompts, {});
+    /** Listings of every name the endpoint has answered so far. */
+    const listings = async () =>
+      (await fake.stats()).promptRequests.filter(
+        (request) => request.name === null,
+      ).length;
+    /** Throws when the component listed the endpoint since `before`. */
+    const expectNoListing = async (before) => {
+      if ((await listings()) !== before) {
+        throw new Error("the component listed the endpoint during the case");
+      }
+    };
+
+    // The cache tracks 500 names. Case 11 ends with 41 and case 12 with 491.
+    await runCase(
+      "11 names are reserved while deleted prompts leave the cache",
+      async ({ finish }) => {
+        // 200 tracked prompts are deleted at the endpoint and synced again.
+        // Their refreshes run 8 at a time and the fake holds each for 40 ms
+        // on average, so names stop being tracked for about 1 s. A
+        // reservation of 40 new names in that time counts the tracked names.
+        // It loses to the refreshes while they delete what it counted, and
+        // goes through once `sync` ran it again or the deletions thinned
+        // out.
+        const gone = promptNames("gone", 200);
+        const fresh = promptNames("fresh", 40);
+        await listPrompts();
+        const listed = await listings();
+        await addPrompts([...gone, ...fresh]);
+        await client.action(api.syncPrompts, { names: gone });
+        await waitFor(
+          "every name in the cache",
+          async () => (await cachedCount(gone)) === gone.length,
+          120_000,
+          500,
+        );
+        const tracked = async () =>
+          (await client.query(api.promptHealth, {})).tracked;
+        const start = await tracked();
+        const authorization = `Basic ${btoa("pk-lf-integration:sk-lf-integration")}`;
+        for (let i = 0; i < gone.length; i += 25) {
+          const answers = await Promise.all(
+            gone
+              .slice(i, i + 25)
+              .map((name) =>
+                fetch(
+                  `${fake.url}/api/public/v2/prompts/${encodeURIComponent(name)}`,
+                  { method: "DELETE", headers: { authorization } },
+                ),
+              ),
+          );
+          const refused = answers.find((response) => response.status !== 204);
+          if (refused) {
+            throw new Error(
+              `the fake answered ${refused.status} to a deletion`,
+            );
+          }
+        }
+        let before;
+        let after;
+        await fake.holdPrompts(0, 80);
+        try {
+          await client.action(api.syncPrompts, { names: gone });
+          await waitFor(
+            "the first names to stop being tracked",
+            async () => (await tracked()) <= start - 8,
+            30_000,
+            20,
+          );
+          before = await tracked();
+          const added = await client.action(api.syncPrompts, { names: fresh });
+          after = await tracked();
+          if (added.tracked !== fresh.length || added.overflow !== 0) {
+            throw new Error(`prompts.sync returned ${JSON.stringify(added)}`);
+          }
+          await waitFor(
+            "the deleted names out of the cache and the new ones in it",
+            async () =>
+              (await tracked()) === start - gone.length + fresh.length &&
+              (await cachedCount(gone)) === 0 &&
+              (await cachedCount(fresh)) === fresh.length,
+            120_000,
+            500,
+          );
+        } finally {
+          await fake.holdPrompts(0);
+        }
+        await expectNoListing(listed);
+        // `sync` runs a reservation again when it lost to the refreshes; that
+        // attempt is logged as failed and is no failure of the case.
+        const executions = await finish();
+        const failed = failedExecutions(executions, lostReservation);
+        if (failed.length > 0) {
+          throw new Error(
+            `${failed.length} failed executions, first ${failed[0]}`,
+          );
+        }
+        // Names that stopped being tracked between the two reads around the
+        // reservation.
+        const during = before + fresh.length - after;
+        if (during < 1) {
+          throw new Error(
+            "the race was not exercised: no name stopped being tracked " +
+              "between the two reads around the reservation",
+          );
+        }
+        const again = executions.filter(
+          (log) => log.error && lostReservation(log),
+        ).length;
+        return (
+          `${fresh.length} names reserved; ${during} of ${gone.length} names ` +
+          `stopped being tracked between the two reads around the ` +
+          `reservation; ${again} reservations run again`
+        );
+      },
+    );
+
+    await runCase(
+      "12 names are reserved while refreshes run",
+      async ({ finish }) => {
+        // 300 refreshes run 8 at a time and the fake holds each prompt for
+        // 120 ms on average, so they write their `promptNames` rows for 4 s
+        // or longer, more than a mutation retries a write conflict. A
+        // reservation of 150 new names in that time counts the tracked
+        // names. It must not read the rows the refreshes write.
+        const running = promptNames("running", 300);
+        const added = promptNames("added", 150);
+        await listPrompts();
+        const listed = await listings();
+        await addPrompts([...running, ...added]);
+        let unpublished;
+        await fake.holdPrompts(240);
+        try {
+          await client.action(api.syncPrompts, { names: running });
+          await waitFor(
+            "the first refreshes to publish",
+            async () => (await cachedCount(running.slice(0, 50))) >= 1,
+            30_000,
+            20,
+          );
+          const sync = await client.action(api.syncPrompts, { names: added });
+          unpublished = 50 - (await cachedCount(running.slice(-50)));
+          if (sync.tracked !== added.length || sync.overflow !== 0) {
+            throw new Error(`prompts.sync returned ${JSON.stringify(sync)}`);
+          }
+          await waitFor(
+            "every name in the cache",
+            async () =>
+              (await cachedCount([...running, ...added])) ===
+              running.length + added.length,
+            120_000,
+            1_000,
+          );
+        } finally {
+          await fake.holdPrompts(0);
+        }
+        await expectNoListing(listed);
+        const failed = failedExecutions(await finish());
+        if (failed.length > 0) {
+          throw new Error(
+            `${failed.length} failed executions, first ${failed[0]}`,
+          );
+        }
+        if (unpublished < 1) {
+          throw new Error(
+            "the race was not exercised: the refreshes had published when the " +
+              "reservation returned",
+          );
+        }
+        return (
+          `${added.length} names reserved after the first refresh published ` +
+          `and while ${unpublished} of the last 50 had not; all cached`
+        );
+      },
+    );
+
+    const final = await fake.stats();
+    const diverging = divergent(final);
     results.push({
-      name: "all deliveries of a span identical",
+      name: "the span bytes of every delivery of an id identical",
       ok: diverging.length === 0,
       ms: 0,
       requests: 0,
-      detail: `${diverging.length} span ids with different content`,
+      detail: `${diverging.length} span ids with different bytes`,
+    });
+    results.push({
+      name: "every request with credentials and the required headers",
+      ok: final.badHeaders === 0,
+      ms: 0,
+      requests: 0,
+      detail: `${final.badHeaders} without`,
     });
   } catch (error) {
     results.push({

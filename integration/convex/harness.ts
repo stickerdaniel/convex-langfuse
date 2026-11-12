@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import { Langfuse } from "convex-langfuse";
 import { components } from "./_generated/api";
-import { mutation, query } from "./_generated/server";
+import { action, mutation, query } from "./_generated/server";
 
 /** Throws on every failure, so a mutation that did not enqueue fails. */
 const strict = new Langfuse(components.convexLangfuse, {
@@ -45,6 +45,50 @@ export const record = mutation({
   },
 });
 
+/**
+ * Records `count` spans like `record`, through the component's
+ * `tracing.record` directly, and returns its result unchanged, so a caller
+ * can count enqueued and refused records exactly.
+ */
+export const recordCounted = mutation({
+  args: { traceId: v.string(), from: v.number(), count: v.number() },
+  returns: v.object({
+    enqueued: v.number(),
+    dropped: v.optional(v.number()),
+    reason: v.optional(v.union(v.literal("disabled"), v.literal("backlog"))),
+  }),
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    return await ctx.runMutation(components.convexLangfuse.tracing.record, {
+      trace: { traceId: args.traceId, name: "integration" },
+      observations: Array.from({ length: args.count }, (_, i) => ({
+        id: spanId(args.from + i),
+        type: "span" as const,
+        name: `span-${args.from + i}`,
+        startTime: now,
+        endTime: now,
+      })),
+    });
+  },
+});
+
+/**
+ * Records one span whose name ends inside an emoji, as `slice` cuts it. The
+ * cut leaves a lone surrogate, which Convex refuses in a function argument.
+ */
+export const recordCut = mutation({
+  args: { traceId: v.string(), id: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { traceId, id }) => {
+    await strict.trace({ traceId, name: "integration" }).span(ctx, {
+      id: spanId(id),
+      name: "cut 😀".slice(0, -1),
+      input: "whole 😀",
+    });
+    return null;
+  },
+});
+
 /** Whether the component sees a complete export configuration. */
 export const enabled = query({
   args: {},
@@ -70,6 +114,50 @@ export const prompt = query({
   },
 });
 
+/**
+ * Tracks `names`, or every prompt the endpoint lists, as `prompts.sync`
+ * does.
+ */
+export const syncPrompts = action({
+  args: { names: v.optional(v.array(v.string())) },
+  returns: v.object({
+    status: v.union(
+      v.literal("ok"),
+      v.literal("incomplete"),
+      v.literal("disabled"),
+    ),
+    tracked: v.number(),
+    overflow: v.number(),
+  }),
+  handler: async (ctx, args) => await strict.prompts.sync(ctx, args),
+});
+
+/**
+ * The cached `production` version of each name, in order, `null` on a miss.
+ * The component calls run one at a time.
+ */
+export const promptVersions = query({
+  args: { names: v.array(v.string()) },
+  returns: v.array(v.union(v.number(), v.null())),
+  handler: async (ctx, { names }) => {
+    const versions: (number | null)[] = [];
+    for (const name of names) {
+      versions.push((await strict.prompts.get(ctx, { name }))?.version ?? null);
+    }
+    return versions;
+  },
+});
+
+/** The prompt part of the component's health. */
+export const promptHealth = query({
+  args: {},
+  returns: v.object({ tracked: v.number(), errors: v.number() }),
+  handler: async (ctx) => {
+    const { tracked, errors } = (await strict.health(ctx)).prompts;
+    return { tracked, errors };
+  },
+});
+
 /** Admission gate and backlog, as the component reports them. */
 export const backlog = query({
   args: {},
@@ -78,6 +166,9 @@ export const backlog = query({
     pendingAtLeast: v.number(),
     pendingCounted: v.number(),
     accepted: v.number(),
+    deadLettered: v.number(),
+    deadLettersAtLeast: v.number(),
+    backoffMs: v.number(),
   }),
   handler: async (ctx) => {
     const health = await strict.health(ctx);
@@ -86,6 +177,12 @@ export const backlog = query({
       pendingAtLeast: health.pendingAtLeast,
       pendingCounted: health.pendingCounted.rows,
       accepted: health.exporter.accepted,
+      deadLettered: health.exporter.deadLettered,
+      deadLettersAtLeast: health.deadLettersAtLeast,
+      backoffMs:
+        health.exporter.backoffUntil !== undefined && health.exporter.lastError
+          ? health.exporter.backoffUntil - health.exporter.lastError.at
+          : 0,
     };
   },
 });

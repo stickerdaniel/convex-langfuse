@@ -13,7 +13,10 @@
 //
 // Gate: a score with a synced `configId` is read back through
 // `GET /api/public/v3/scores?id=` within 90 s, and a trace deletion request
-// built by the component is accepted with a 2xx.
+// built by the component is accepted with a 2xx. The acceptance is read from
+// the exporter's counters, so it is checked only on a backend the script
+// started; on another backend, other writers move the same counters, and the
+// gate reports the request as enqueued.
 //
 // `--characterize` also runs, once idle and once while `--load` (2,000)
 // unrelated scores are posted through the component, `--reps` (20)
@@ -32,25 +35,20 @@
 // stay: Langfuse has no deletion for them, and the next run reuses them.
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi } from "convex/server";
+import { convexCli, sleep, stopAll, waitFor } from "../integration/backend.mjs";
 import {
-  Backend,
-  convexCli,
-  ensureBinary,
-  sleep,
-  startFake,
-  stopAll,
-  waitFor,
-} from "../integration/backend.mjs";
+  connectBackend,
+  ENVIRONMENT,
+  langfuseSettings,
+  publicApi,
+} from "./shared.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
-const ENVIRONMENT = "convex-langfuse-e2e";
 const api = anyApi.e2e;
 const { convex, setEnv, linkPackage } = convexCli(HERE);
 
@@ -78,21 +76,8 @@ const chunks = (items, size) =>
   );
 
 /** Reads from the Langfuse public API with the key pair. */
-function langfuseApi({ baseUrl, publicKey, secretKey }) {
-  const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString("base64")}`;
-  const get = async (path) => {
-    const response = await fetch(`${baseUrl}${path}`, {
-      headers: { Authorization: auth },
-    });
-    if (!response.ok) throw new Error(`GET ${path}: HTTP ${response.status}`);
-    return await response.json();
-  };
-  const send = async (method, path, body) =>
-    await fetch(`${baseUrl}${path}`, {
-      method,
-      headers: { Authorization: auth, "Content-Type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+function langfuseApi(settings) {
+  const { get, send } = publicApi(settings);
   return {
     /** Creates a score through the public API, without the component. */
     async createScore(score) {
@@ -117,21 +102,6 @@ function langfuseApi({ baseUrl, publicKey, secretKey }) {
       );
       return data.length;
     },
-  };
-}
-
-/** Connects to the configured backend or starts a local one. */
-async function connectBackend() {
-  const url = process.env.CONVEX_SELF_HOSTED_URL;
-  const adminKey = process.env.CONVEX_SELF_HOSTED_ADMIN_KEY;
-  if (url && adminKey) return { backend: { url, adminKey }, cleanup() {} };
-  const stateDir = mkdtempSync(join(tmpdir(), "convex-langfuse-e2e-"));
-  const backend = new Backend(await ensureBinary(), stateDir);
-  await backend.init();
-  await backend.start();
-  return {
-    backend,
-    cleanup: () => rmSync(stateDir, { recursive: true, force: true }),
   };
 }
 
@@ -199,28 +169,11 @@ const PATTERNS = {
 };
 
 async function main() {
-  let settings = {
-    baseUrl: process.env.LANGFUSE_BASE_URL?.replace(/\/+$/, ""),
-    publicKey: process.env.LANGFUSE_PUBLIC_KEY,
-    secretKey: process.env.LANGFUSE_SECRET_KEY,
-  };
-  if (options.fake) {
-    const fake = await startFake();
-    settings = {
-      baseUrl: fake.url,
-      publicKey: "pk-lf-fake",
-      secretKey: "sk-lf-fake",
-    };
-  }
-  if (!settings.baseUrl || !settings.publicKey || !settings.secretKey) {
-    throw new Error(
-      "set LANGFUSE_BASE_URL, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY, or pass --fake",
-    );
-  }
+  const settings = await langfuseSettings(options.fake);
   const langfuse = langfuseApi(settings);
 
   linkPackage();
-  const { backend, cleanup } = await connectBackend();
+  const { backend, owned, cleanup } = await connectBackend();
   const createdScores = [];
   const createdTraces = [];
   let client;
@@ -283,18 +236,27 @@ async function main() {
       traceIds: [traceId],
     });
     if (!deletion.enqueued) throw new Error("trace deletion not enqueued");
-    await drained(client, 120_000);
-    const after = await client.query(api.health, {});
-    if (
-      after.accepted !== before.accepted + 1 ||
-      after.deadLettersAtLeast !== before.deadLettersAtLeast ||
-      after.lastErrorAt !== before.lastErrorAt
-    ) {
-      throw new Error(
-        `trace deletion request not accepted: ${JSON.stringify({ before, after })}`,
+    if (owned) {
+      // Only this script writes to a backend it started, so the exporter's
+      // counters moved for its deletion request alone.
+      await drained(client, 120_000);
+      const after = await client.query(api.health, {});
+      if (
+        after.accepted !== before.accepted + 1 ||
+        after.deadLettersAtLeast !== before.deadLettersAtLeast ||
+        after.lastErrorAt !== before.lastErrorAt
+      ) {
+        throw new Error(
+          `trace deletion request not accepted: ${JSON.stringify({ before, after })}`,
+        );
+      }
+      gate.push("trace deletion request accepted with a 2xx");
+    } else {
+      gate.push(
+        "trace deletion request enqueued; acceptance not checked on a " +
+          "backend this script did not start",
       );
     }
-    gate.push("trace deletion request accepted with a 2xx");
     console.log(`gate passed: ${gate.join("; ")}`);
 
     if (options.characterize) {
