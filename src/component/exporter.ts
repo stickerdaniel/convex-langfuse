@@ -475,9 +475,10 @@ export const advance = internalMutation({
  * enqueued before it left the outbox: accepted, rejected, expired or
  * replaced. The time is just after the latest `availableAt` among the first
  * `CLAIM_WINDOW` of them, at most `SCORE_SETTLE_MS` ahead, so a request whose
- * older score writes are gone before their time is sent within that
- * interval. Each claim evaluates again. Score writes created after the
- * request and score deletions do not hold it back.
+ * older score writes are gone before their time is looked at again within
+ * that interval; backoff, the lease and scheduling apply to it as to every
+ * row. Each claim evaluates again. Score writes created after the request
+ * and score deletions do not hold it back.
  *
  * `advance` calls it only while a deletion request is first in line. It is
  * the one place where `advance` reads an outbox index range, so a score
