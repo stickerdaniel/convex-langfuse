@@ -14,9 +14,11 @@ import {
 import {
   CLIENT_CALL_BYTES,
   MAX_CALL_RECORDS,
+  MAX_DETAIL_KEYS,
   MAX_ROW_BYTES,
+  MAX_TAGS,
 } from "../shared/limits.js";
-import { byteLength, encodeSpan } from "../shared/otlp.js";
+import { byteLength, costDetails, encodeSpan } from "../shared/otlp.js";
 import type {
   Level,
   Observation,
@@ -96,7 +98,10 @@ export type ObservationInit = ObservationRef & {
 
 /**
  * What `redact` sees: one observation with its trace fields, before
- * serialization. Changes to the ids are ignored.
+ * serialization. Changes to the ids are ignored. The record, its trace and
+ * its observation are shallow copies: nested values such as `tags`, `input`
+ * or `metadata` are the caller's own objects, so build new ones instead of
+ * changing them in place.
  */
 export type ExportRecord = {
   kind: "observation";
@@ -115,8 +120,10 @@ export type ErrorCode =
   | "invalid_id"
   | "invalid_environment"
   | "invalid_metadata"
+  | "invalid_tags"
   | "unserializable"
   | "invalid_usage"
+  | "invalid_cost"
   | "row_too_large"
   | "redact_failed"
   | "backlog"
@@ -129,10 +136,15 @@ export type Health = FunctionReturnType<ComponentApi["outbox"]["health"]>;
 export type Recorded = { traceId: string; observationId: string };
 
 /**
- * One trace. Its recording methods enqueue in the caller's transaction and
- * return the ids, also for a record that was not sent. With `onError: "log"`
- * they never throw. The same key recorded twice gives two rows in Langfuse;
- * make the recording mutation idempotent or put the attempt in the key.
+ * One trace. Its recording methods return the ids, also for a record that
+ * was not sent. With `onError: "log"` they never throw. The same key recorded
+ * twice gives two rows in Langfuse; make the recording mutation idempotent or
+ * put the attempt in the key.
+ *
+ * In a mutation, every component call of a method is part of the caller's
+ * transaction: the observations commit or roll back with it. An action has
+ * no transaction: each component call commits on its own, so a `record` that
+ * needs several calls can enqueue the first and fail on a later one.
  */
 export interface Trace {
   /** The trace id, derived from the seed or given. */
@@ -220,6 +232,33 @@ function truncate(text: string, limit: number): string {
   return `${kept}…[truncated ${bytes.byteLength - cut} bytes]`;
 }
 
+/**
+ * The entries of a usage or cost record that `keep` accepts, under keys
+ * Convex accepts in a record: 1 to 1,024 printable ASCII characters, not
+ * starting with `$` or `_`. `invalid` tells that the value was not a plain
+ * object, had more than `MAX_DETAIL_KEYS` entries, or lost an entry.
+ */
+function details(
+  value: unknown,
+  keep: (value: number) => boolean,
+): { kept?: Record<string, number>; invalid: boolean } {
+  if (value === undefined) return { invalid: false };
+  if (!isPlainObject(value)) return { invalid: true };
+  const entries = Object.entries(value);
+  if (entries.length > MAX_DETAIL_KEYS) return { invalid: true };
+  const kept = entries.filter(
+    (entry): entry is [string, number] =>
+      /^[\x20-\x7e]{1,1024}$/.test(entry[0]) &&
+      !/^[$_]/.test(entry[0]) &&
+      typeof entry[1] === "number" &&
+      keep(entry[1]),
+  );
+  return {
+    ...(kept.length > 0 ? { kept: Object.fromEntries(kept) } : {}),
+    invalid: kept.length < entries.length,
+  };
+}
+
 async function resolveTraceId(init: TraceInit): Promise<string> {
   return init.traceId ?? (await traceIdFromSeed(init.seed));
 }
@@ -303,13 +342,17 @@ export class Langfuse {
 
   /**
    * Logs `code` with ids only, or throws it with `onError: "throw"`. Never
-   * logs field content or error messages, which can carry user data.
+   * logs field content or error messages, which can carry user data. An id
+   * the caller passed is logged only when it is a valid id: an invalid one
+   * can be any text.
    */
   #fail(code: ErrorCode, ids: Recorded): void {
     if (this.#options.onError === "throw") throw new CodeError(code);
     console.error(`[convex-langfuse] ${code}`, {
-      traceId: ids.traceId,
-      observationId: ids.observationId,
+      traceId: isTraceId(ids.traceId) ? ids.traceId : "",
+      observationId: isObservationId(ids.observationId)
+        ? ids.observationId
+        : "",
     });
   }
 
@@ -388,8 +431,8 @@ export class Langfuse {
     const endTime =
       type === "event" ? startTime : (fields.endTime ?? startTime);
 
-    // 3. redact on a copy, so a hook that edits in place leaves the caller's
-    // values alone.
+    // 3. redact on shallow copies of the record, its trace and its
+    // observation. Nested values stay the caller's objects.
     const { seed: _seed, traceId: _traceId, ...traceFields } = init;
     const record: ExportRecord = {
       kind: "observation",
@@ -460,12 +503,25 @@ export class Langfuse {
     };
 
     const { experiment } = fieldsOfTrace;
+    // Tags are sent as given: an array of at most `MAX_TAGS` strings.
+    let { tags } = fieldsOfTrace;
+    if (
+      tags !== undefined &&
+      !(
+        Array.isArray(tags) &&
+        tags.length <= MAX_TAGS &&
+        tags.every((tag) => typeof tag === "string")
+      )
+    ) {
+      problems.add("invalid_tags");
+      tags = undefined;
+    }
     const trace: TraceContext = {
       traceId,
       name: fieldsOfTrace.name,
       userId: fieldsOfTrace.userId,
       sessionId: fieldsOfTrace.sessionId,
-      tags: fieldsOfTrace.tags,
+      tags,
       metadata: jsonObject(fieldsOfTrace.metadata),
       environment: fieldsOfTrace.environment,
       release: fieldsOfTrace.release,
@@ -484,20 +540,31 @@ export class Langfuse {
     const metadata = jsonObject(observation.metadata);
     const modelParameters = jsonObject(observation.modelParameters);
 
-    // 7. Usage: non-negative safe integers only.
-    let usage: Record<string, number> | undefined;
-    if (observation.usage !== undefined) {
-      const entries = isPlainObject(observation.usage)
-        ? Object.entries(observation.usage)
-        : [];
-      const kept = entries.filter(
-        ([, value]) => Number.isSafeInteger(value) && value >= 0,
-      );
-      if (!isPlainObject(observation.usage) || kept.length < entries.length) {
-        problems.add("invalid_usage");
-      }
-      usage = kept.length > 0 ? Object.fromEntries(kept) : undefined;
-    }
+    // 7. Usage and cost: exactly the entries the encoder exports, under
+    // keys Convex accepts. The record sent to the component then holds
+    // nothing the encoded span does not, so the span size bounds it.
+    const usage = details(
+      observation.usage,
+      (value) => Number.isSafeInteger(value) && value >= 0,
+    );
+    if (usage.invalid) problems.add("invalid_usage");
+    const cost = details(observation.cost, Number.isFinite);
+    // A cost record whose sum is not finite exports nothing.
+    const exported = cost.kept && costDetails(cost.kept) !== undefined;
+    if (cost.invalid || (cost.kept && !exported)) problems.add("invalid_cost");
+    // Only a generation exports its prompt link.
+    const { prompt } = observation;
+    const promptLink =
+      observation.type === "generation" && prompt !== undefined
+        ? {
+            name: prompt.name,
+            ...(prompt.version !== undefined &&
+            Number.isSafeInteger(prompt.version) &&
+            prompt.version > 0
+              ? { version: prompt.version }
+              : {}),
+          }
+        : undefined;
 
     const encoded: Observation = {
       id: observationId,
@@ -518,9 +585,9 @@ export class Langfuse {
       version: observation.version,
       model: observation.model,
       modelParameters,
-      usage,
-      cost: observation.cost,
-      prompt: observation.prompt,
+      usage: usage.kept,
+      cost: exported ? cost.kept : undefined,
+      prompt: promptLink,
     };
     for (const code of problems) this.#fail(code, ids);
 

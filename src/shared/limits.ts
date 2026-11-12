@@ -12,7 +12,12 @@ export const MAX_CALL_BYTES = 4 * MIB;
 export const MAX_CALL_RECORDS = 50;
 /**
  * Encoded span bytes the client puts into one call. Below `MAX_CALL_BYTES`,
- * which leaves room for the environment and release the component stamps,
- * and below the 5 MiB argument limit of a Node action.
+ * which leaves room for the environment and release the component stamps.
+ * The client sends only what the encoder exports, so the arguments of a call
+ * stay close to this size and far below Convex's 16 MiB argument limit.
  */
 export const CLIENT_CALL_BYTES = 3 * MIB;
+/** Tags per trace. Convex accepts 8,192 array elements. */
+export const MAX_TAGS = 1_000;
+/** Entries of one usage or cost record. Convex accepts 1,024 object fields. */
+export const MAX_DETAIL_KEYS = 1_000;

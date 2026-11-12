@@ -7,7 +7,7 @@ import {
   type FunctionReference,
   type GenericMutationCtx,
 } from "convex/server";
-import { v } from "convex/values";
+import { getConvexSize, v } from "convex/values";
 import {
   afterEach,
   beforeEach,
@@ -24,6 +24,7 @@ import {
   installFakeLangfuse,
   type Tables,
 } from "../component/fakeLangfuse.test-util.js";
+import { MAX_CALL_BYTES } from "../shared/limits.js";
 import { byteLength, encodeSpan } from "../shared/otlp.js";
 import type { Observation, TraceContext } from "../shared/validators.js";
 import {
@@ -33,7 +34,10 @@ import {
   type ExportRecord,
   type Health,
   type LangfuseOptions,
+  type ObservationFields,
+  type ObservationType,
   type Trace,
+  type TraceFields,
 } from "./index.js";
 
 const schema = defineSchema({ notes: defineTable({ body: v.string() }) });
@@ -356,6 +360,9 @@ test("record splits 60 large observations into bounded calls", async () => {
     );
     expect(bytes).toBeLessThanOrEqual(3 * MIB);
   }
+  for (const call of calls) {
+    expect(getConvexSize(call)).toBeLessThanOrEqual(MAX_CALL_BYTES);
+  }
   expect((await tables(t)).outbox).toHaveLength(60);
   expect(consoleLines).toEqual([]);
 });
@@ -466,6 +473,158 @@ test("bad usage, metadata and input are left out of a sent record", async () => 
   expect(loggedCodes().sort()).toEqual(
     ["invalid_metadata", "invalid_usage", "unserializable"].sort(),
   );
+});
+
+describe("a component call carries only what the span exports", () => {
+  type Sent = { trace?: TraceFields; fields?: Partial<ObservationFields> };
+
+  /** Records one observation and returns the arguments of its component call. */
+  async function sent(
+    type: ObservationType,
+    { trace, fields }: Sent,
+  ): Promise<RecordArgs> {
+    const t = createTest();
+    const calls: RecordArgs[] = [];
+    await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s", ...trace })
+        .record(spying(ctx, calls), [{ type, key: "k", name: "n", ...fields }]),
+    );
+    expect(calls).toHaveLength(1);
+    expect((await tables(t)).outbox).toHaveLength(1);
+    // Measured with Convex's own size function, not with the span encoder.
+    expect(getConvexSize(calls[0]!)).toBeLessThan(KIB);
+    return calls[0]!;
+  }
+
+  const many = (value: number) =>
+    Object.fromEntries(
+      Array.from({ length: 1_025 }, (_, i) => [`k${i}`, value]),
+    );
+
+  test("a prompt on a span is left out", async () => {
+    const { observations } = await sent("span", {
+      fields: { prompt: { name: "p".repeat(17 * MIB), version: 2 } },
+    });
+    expect(observations[0]!.prompt).toBeUndefined();
+    expect(consoleLines).toEqual([]);
+  });
+
+  test("a generation keeps its prompt without an invalid version", async () => {
+    const { observations } = await sent("generation", {
+      fields: { prompt: { name: "persona", version: 1.5 } },
+    });
+    expect(observations[0]!.prompt).toEqual({ name: "persona" });
+    expect(consoleLines).toEqual([]);
+  });
+
+  test.each([
+    { name: "8,193 tags", tags: Array.from({ length: 8_193 }, () => "t") },
+    { name: "a tag that is not a string", tags: ["a", 1 as unknown as string] },
+  ])("$name: the tags are left out", async ({ tags }) => {
+    const { trace } = await sent("span", { trace: { tags } });
+    expect(trace.tags).toBeUndefined();
+    expect(loggedCodes()).toEqual(["invalid_tags"]);
+  });
+
+  test.each([
+    { name: "1,025 entries", usage: many(1), kept: undefined },
+    {
+      name: "keys Convex refuses",
+      usage: {
+        ok: 2,
+        _private: 1,
+        $x: 1,
+        é: 1,
+        "": 1,
+        ["k".repeat(1_025)]: 1,
+      },
+      kept: { ok: 2 },
+    },
+  ])("usage with $name keeps the valid entries", async ({ usage, kept }) => {
+    const { observations } = await sent("generation", { fields: { usage } });
+    expect(observations[0]!.usage).toEqual(kept);
+    expect(loggedCodes()).toEqual(["invalid_usage"]);
+  });
+
+  test.each([
+    { name: "1,025 infinite entries", cost: many(Infinity), kept: undefined },
+    { name: "an infinite sum", cost: { a: 1e308, b: 1e308 }, kept: undefined },
+    {
+      name: "one entry that is not a number",
+      cost: { input: 0.5, bad: NaN },
+      kept: { input: 0.5 },
+    },
+  ])("cost with $name keeps what the span exports", async ({ cost, kept }) => {
+    const { observations } = await sent("generation", { fields: { cost } });
+    expect(observations[0]!.cost).toEqual(kept);
+    expect(loggedCodes()).toEqual(["invalid_cost"]);
+  });
+});
+
+describe("a record that needs several component calls", () => {
+  // 120 events are three calls of 50, 50 and 20.
+  const events = Array.from({ length: 120 }, (_, i) => ({
+    type: "event" as const,
+    key: `e-${i}`,
+    name: `e-${i}`,
+  }));
+
+  /** A ctx whose second component call fails before it reaches the component. */
+  function failingSecondCall(
+    ctx: AppCtx,
+    attempts: { count: number },
+  ): RunMutationCtx {
+    return {
+      runMutation: async (reference, ...args) => {
+        attempts.count += 1;
+        if (attempts.count === 2) throw new Error("second call");
+        return await ctx.runMutation(reference, ...args);
+      },
+    };
+  }
+
+  test('onError "log": the other calls are sent and every id is returned', async () => {
+    const t = createTest();
+    const attempts = { count: 0 };
+    const { traceId, observationIds } = await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s" })
+        .record(failingSecondCall(ctx, attempts), events),
+    );
+
+    expect(attempts.count).toBe(3);
+    expect(observationIds).toHaveLength(120);
+    expect([...(await spans(t)).keys()].sort()).toEqual(
+      [...observationIds.slice(0, 50), ...observationIds.slice(100)].sort(),
+    );
+    expect(consoleError.mock.calls).toEqual([
+      [
+        "[convex-langfuse] enqueue_failed",
+        { traceId, observationId: observationIds[50] },
+      ],
+    ]);
+  });
+
+  test('onError "throw": stops at the failed call, earlier calls stay', async () => {
+    const t = createTest();
+    const attempts = { count: 0 };
+    const trace = client({ content: "full", onError: "throw" }).trace({
+      seed: "s",
+    });
+    const error = await inMutation(t, async (ctx) =>
+      trace
+        .record(failingSecondCall(ctx, attempts), events)
+        .catch((error: unknown) => error),
+    );
+
+    expect((error as Error).message).toBe("enqueue_failed");
+    expect(attempts.count).toBe(2);
+    const first = await Promise.all(
+      events.slice(0, 50).map(({ key }) => trace.observationId(key)),
+    );
+    expect([...(await spans(t)).keys()].sort()).toEqual(first.sort());
+  });
 });
 
 describe("an invalid record is not sent", () => {
@@ -689,7 +848,14 @@ test("log lines carry a code and ids only", async () => {
         modelParameters: { blob: MARKER.repeat(100 * KIB) },
       },
       { ...base, type: "span", key: "" },
+      { ...base, type: "span", key: "cost", cost: { [MARKER]: Infinity } },
     ]);
+    await langfuse
+      .trace({ traceId: `trace ${MARKER}` })
+      .span(ctx, { ...base, id: `observation ${MARKER}` });
+    await langfuse
+      .trace({ seed: MARKER, tags: [MARKER, 1 as unknown as string] })
+      .span(ctx, { ...base, key: "tags" });
     await langfuse
       .trace({ seed: MARKER, environment: MARKER })
       .span(ctx, { ...base, key: "environment" });
@@ -721,6 +887,9 @@ test("log lines carry a code and ids only", async () => {
     "unserializable",
     "row_too_large",
     "invalid_id",
+    "invalid_cost",
+    "invalid_id",
+    "invalid_tags",
     "invalid_environment",
     "redact_failed",
     "enqueue_failed",
@@ -734,7 +903,7 @@ test("log lines carry a code and ids only", async () => {
       "traceId",
     ]);
     const { traceId, observationId } = ids as Record<string, string>;
-    expect(traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(traceId).toMatch(/^([0-9a-f]{32})?$/);
     expect(observationId).toMatch(/^([0-9a-f]{16})?$/);
   }
   expect(JSON.stringify(consoleLines)).not.toContain(MARKER);

@@ -46,8 +46,9 @@ function usageDetails(usage: Record<string, number>): string | undefined {
  * a total cost only when every key is `input` or `output`; with any other key
  * and no `total`, the observation would show no cost. Writes no cost at all
  * when the sum is not finite, because JSON would turn that total into `null`.
+ * The client calls it to learn whether a cost record is exported.
  */
-function costDetails(cost: Record<string, number>): string | undefined {
+export function costDetails(cost: Record<string, number>): string | undefined {
   const kept = Object.fromEntries(
     Object.entries(cost).filter(([, value]) => Number.isFinite(value)),
   );
