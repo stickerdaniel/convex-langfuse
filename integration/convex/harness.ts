@@ -45,6 +45,33 @@ export const record = mutation({
   },
 });
 
+/**
+ * Records `count` spans like `record`, through the component's
+ * `tracing.record` directly, and returns its result unchanged, so a caller
+ * can count enqueued and refused records exactly.
+ */
+export const recordCounted = mutation({
+  args: { traceId: v.string(), from: v.number(), count: v.number() },
+  returns: v.object({
+    enqueued: v.number(),
+    dropped: v.optional(v.number()),
+    reason: v.optional(v.union(v.literal("disabled"), v.literal("backlog"))),
+  }),
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    return await ctx.runMutation(components.convexLangfuse.tracing.record, {
+      trace: { traceId: args.traceId, name: "integration" },
+      observations: Array.from({ length: args.count }, (_, i) => ({
+        id: spanId(args.from + i),
+        type: "span" as const,
+        name: `span-${args.from + i}`,
+        startTime: now,
+        endTime: now,
+      })),
+    });
+  },
+});
+
 /** Whether the component sees a complete export configuration. */
 export const enabled = query({
   args: {},
@@ -78,6 +105,9 @@ export const backlog = query({
     pendingAtLeast: v.number(),
     pendingCounted: v.number(),
     accepted: v.number(),
+    deadLettered: v.number(),
+    deadLettersAtLeast: v.number(),
+    backoffMs: v.number(),
   }),
   handler: async (ctx) => {
     const health = await strict.health(ctx);
@@ -86,6 +116,12 @@ export const backlog = query({
       pendingAtLeast: health.pendingAtLeast,
       pendingCounted: health.pendingCounted.rows,
       accepted: health.exporter.accepted,
+      deadLettered: health.exporter.deadLettered,
+      deadLettersAtLeast: health.deadLettersAtLeast,
+      backoffMs:
+        health.exporter.backoffUntil !== undefined && health.exporter.lastError
+          ? health.exporter.backoffUntil - health.exporter.lastError.at
+          : 0,
     };
   },
 });

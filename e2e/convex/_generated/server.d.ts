@@ -34,6 +34,7 @@ type Env = {
   readonly LANGFUSE_PUBLIC_KEY: string | undefined;
   readonly LANGFUSE_SECRET_KEY: string | undefined;
   readonly LANGFUSE_TRACING_ENVIRONMENT: string | undefined;
+  readonly LANGFUSE_WEBHOOK_SECRET: string | undefined;
 };
 
 /**

@@ -32,25 +32,20 @@
 // stay: Langfuse has no deletion for them, and the next run reuses them.
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi } from "convex/server";
+import { convexCli, sleep, stopAll, waitFor } from "../integration/backend.mjs";
 import {
-  Backend,
-  convexCli,
-  ensureBinary,
-  sleep,
-  startFake,
-  stopAll,
-  waitFor,
-} from "../integration/backend.mjs";
+  connectBackend,
+  ENVIRONMENT,
+  langfuseSettings,
+  publicApi,
+} from "./shared.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
-const ENVIRONMENT = "convex-langfuse-e2e";
 const api = anyApi.e2e;
 const { convex, setEnv, linkPackage } = convexCli(HERE);
 
@@ -78,21 +73,8 @@ const chunks = (items, size) =>
   );
 
 /** Reads from the Langfuse public API with the key pair. */
-function langfuseApi({ baseUrl, publicKey, secretKey }) {
-  const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString("base64")}`;
-  const get = async (path) => {
-    const response = await fetch(`${baseUrl}${path}`, {
-      headers: { Authorization: auth },
-    });
-    if (!response.ok) throw new Error(`GET ${path}: HTTP ${response.status}`);
-    return await response.json();
-  };
-  const send = async (method, path, body) =>
-    await fetch(`${baseUrl}${path}`, {
-      method,
-      headers: { Authorization: auth, "Content-Type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+function langfuseApi(settings) {
+  const { get, send } = publicApi(settings);
   return {
     /** Creates a score through the public API, without the component. */
     async createScore(score) {
@@ -117,21 +99,6 @@ function langfuseApi({ baseUrl, publicKey, secretKey }) {
       );
       return data.length;
     },
-  };
-}
-
-/** Connects to the configured backend or starts a local one. */
-async function connectBackend() {
-  const url = process.env.CONVEX_SELF_HOSTED_URL;
-  const adminKey = process.env.CONVEX_SELF_HOSTED_ADMIN_KEY;
-  if (url && adminKey) return { backend: { url, adminKey }, cleanup() {} };
-  const stateDir = mkdtempSync(join(tmpdir(), "convex-langfuse-e2e-"));
-  const backend = new Backend(await ensureBinary(), stateDir);
-  await backend.init();
-  await backend.start();
-  return {
-    backend,
-    cleanup: () => rmSync(stateDir, { recursive: true, force: true }),
   };
 }
 
@@ -199,24 +166,7 @@ const PATTERNS = {
 };
 
 async function main() {
-  let settings = {
-    baseUrl: process.env.LANGFUSE_BASE_URL?.replace(/\/+$/, ""),
-    publicKey: process.env.LANGFUSE_PUBLIC_KEY,
-    secretKey: process.env.LANGFUSE_SECRET_KEY,
-  };
-  if (options.fake) {
-    const fake = await startFake();
-    settings = {
-      baseUrl: fake.url,
-      publicKey: "pk-lf-fake",
-      secretKey: "sk-lf-fake",
-    };
-  }
-  if (!settings.baseUrl || !settings.publicKey || !settings.secretKey) {
-    throw new Error(
-      "set LANGFUSE_BASE_URL, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY, or pass --fake",
-    );
-  }
+  const settings = await langfuseSettings(options.fake);
   const langfuse = langfuseApi(settings);
 
   linkPackage();

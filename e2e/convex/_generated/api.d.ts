@@ -9,6 +9,8 @@
  */
 
 import type * as e2e from "../e2e.js";
+import type * as prompts from "../prompts.js";
+import type * as traces from "../traces.js";
 
 import type {
   ApiFromModules,
@@ -18,6 +20,8 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   e2e: typeof e2e;
+  prompts: typeof prompts;
+  traces: typeof traces;
 }>;
 
 /**

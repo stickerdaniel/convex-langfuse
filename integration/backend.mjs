@@ -96,15 +96,31 @@ export async function ensureBinary() {
 // ── Processes ──────────────────────────────────────────────────────────────
 
 const children = new Set();
+const processGroups = new WeakSet();
 
-function track(child) {
+/** Stops an owned process, including its children when it owns a group. */
+function stop(child) {
+  if (!processGroups.has(child)) return child.kill("SIGKILL");
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+}
+
+function track(child, group = false) {
   children.add(child);
-  child.once("exit", () => children.delete(child));
+  if (group) processGroups.add(child);
+  child.once("exit", () => {
+    // A backend's Node executor survives its parent unless killed too.
+    if (group) stop(child);
+    children.delete(child);
+  });
   return child;
 }
 
 export function stopAll() {
-  for (const child of children) child.kill("SIGKILL");
+  for (const child of children) stop(child);
 }
 process.on("exit", stopAll);
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -161,8 +177,9 @@ export class Backend {
           "--disable-beacon",
           join(this.stateDir, "backend.sqlite3"),
         ],
-        { cwd: this.stateDir, stdio: ["ignore", log, log] },
+        { cwd: this.stateDir, stdio: ["ignore", log, log], detached: true },
       ),
+      true,
     );
     await waitFor(
       "the backend",
@@ -178,10 +195,10 @@ export class Backend {
     );
   }
 
-  /** Kills the process without letting it shut down cleanly. */
+  /** Kills the backend and its executor without a clean shutdown. */
   async kill() {
     const exited = new Promise((resolve) => this.process.once("exit", resolve));
-    this.process.kill("SIGKILL");
+    stop(this.process);
     await exited;
   }
 
@@ -248,6 +265,25 @@ export async function startFake() {
     },
     async stats() {
       return await (await fetch(`${url}/stats`)).json();
+    },
+    /** Counts only, without the per-span and per-request detail. */
+    async summary() {
+      return await (await fetch(`${url}/stats?summary=1`)).json();
+    },
+    /** Makes the fake sign and post a webhook event per created prompt. */
+    async webhook(target) {
+      const response = await fetch(`${url}/control/webhook`, {
+        method: "POST",
+        body: JSON.stringify(target),
+      });
+      if (!response.ok) throw new Error("fake endpoint control failed");
+    },
+    /** Stops the fake process. */
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGKILL");
+      await exited;
     },
   };
 }
