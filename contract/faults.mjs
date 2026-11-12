@@ -6,9 +6,11 @@
 // Starts one suite like `run.mjs`, then applies each fault below to the
 // source in turn, rebuilds `dist/`, deploys the host app again and runs the
 // cases that cover the fault. A fault passes the check when at least one of
-// its cases fails. The source is restored after each fault and rebuilt at
-// the end, also when the run is interrupted. Exits non-zero when a fault
-// went unnoticed or the run failed.
+// its cases fails on the read-back field the fault changes; a case that
+// fails for another reason, such as a missing row, does not count. The
+// source is restored after each fault and rebuilt at the end, also when the
+// run is interrupted. Exits non-zero when a fault went unnoticed or the run
+// failed.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -19,7 +21,11 @@ import { reportLogs, startSuite } from "./run.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
-/** Each fault replaces `from` by `to` in `file`; `from` occurs once. */
+/**
+ * Each fault replaces `from` by `to` in `file`; `from` occurs once. A case
+ * of `cases` catches the fault when its failure names a difference in the
+ * read-back field `field`.
+ */
 const FAULTS = [
   {
     name: "usage under a wrong attribute name",
@@ -27,6 +33,7 @@ const FAULTS = [
     from: 'usage: "langfuse.observation.usage_details",',
     to: 'usage: "langfuse.observation.usage",',
     cases: ["usage keys and the derived total"],
+    field: "usageDetails",
   },
   {
     name: "a dropped cost entry",
@@ -34,6 +41,7 @@ const FAULTS = [
     from: "Object.entries(cost).filter(",
     to: "Object.entries(cost).slice(1).filter(",
     cases: ["explicit cost for a model of the run"],
+    field: "costDetails",
   },
   {
     name: "a prompt version off by one",
@@ -41,6 +49,7 @@ const FAULTS = [
     from: "{ intValue: String(link.version) }",
     to: "{ intValue: String(link.version + 1) }",
     cases: ["prompt link and history"],
+    field: "promptVersion",
   },
 ];
 
@@ -98,15 +107,26 @@ async function main() {
         await suite.redeploy();
         const results = await suite.runCases(fault.cases);
         restore();
-        const caught = results.filter((result) => !result.ok);
-        outcomes.push({ fault, caught });
+        // `differences` of run.mjs words a difference as `<field>: expected`.
+        const names = (onField) =>
+          results
+            .filter(
+              (result) =>
+                !result.ok &&
+                result.detail.includes(`${fault.field}: expected`) === onField,
+            )
+            .map((result) => result.name);
+        outcomes.push({ fault, caught: names(true), other: names(false) });
       }
       build();
-      for (const { fault, caught } of outcomes) {
+      for (const { fault, caught, other } of outcomes) {
         suite.print(
           caught.length > 0
-            ? `caught: ${fault.name}, by ${caught.map((r) => r.name).join(", ")}`
-            : `NOT CAUGHT: ${fault.name}`,
+            ? `caught: ${fault.name}, by ${caught.join(", ")}`
+            : `NOT CAUGHT: ${fault.name}` +
+                (other.length > 0
+                  ? `; failed without a difference in ${fault.field}: ${other.join(", ")}`
+                  : ""),
         );
       }
       failed = outcomes.some(({ caught }) => caught.length === 0);

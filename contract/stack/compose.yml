@@ -149,7 +149,17 @@ services:
 
   redis:
     image: ${REDIS_IMAGE}
-    command: --requirepass ${REDIS_PASSWORD} --maxmemory-policy noeviction
+    # The server reads its configuration from stdin, so the password is in
+    # the container's environment and not among the server's arguments.
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        exec redis-server - <<EOF
+        requirepass $$REDIS_PASSWORD
+        maxmemory-policy noeviction
+        EOF
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
     healthcheck:

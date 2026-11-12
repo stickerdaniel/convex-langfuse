@@ -17,10 +17,12 @@
 // Every run has an id. Every trace seed, prompt name, score id, model name
 // and the environment carry it, and the stack runs as its own Compose
 // project, so two runs at the same time share nothing. Every key, password
-// and secret is generated per run and passed to Docker through the
-// environment only. A run prints one line per case, writes its logs to
-// `contract/logs/<run id>/` after scanning them for every generated secret,
-// and removes what it started, also when it is interrupted.
+// and secret is generated per run. Those of the stack reach Docker and the
+// containers through the environment only. The Convex backend takes its
+// instance secret as an argument (`integration/backend.mjs`), which a local
+// process can read while the run lasts. A run prints one line per case,
+// writes its logs to `contract/logs/<run id>/` after scanning them for every
+// generated secret, and removes what it started, also when it is interrupted.
 
 import { execFile, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -212,8 +214,9 @@ async function stackMemoryMib(project) {
 /**
  * Polls `read` until `check` of its result returns no difference or
  * `deadlineMs` passes. Returns the last result. On a timeout it throws with
- * the differences and the last response. Records the time it needed in
- * `steps`.
+ * the differences and the last response read; a read that throws keeps the
+ * response before it. A result that matches after the deadline is a timeout
+ * too. Records the time it needed in `steps`.
  */
 async function poll(steps, what, read, check, deadlineMs) {
   const startedAt = Date.now();
@@ -221,22 +224,25 @@ async function poll(steps, what, read, check, deadlineMs) {
   let problems;
   for (;;) {
     try {
-      last = await read();
-      problems = check(last);
+      const response = await read();
+      last = response;
+      problems = check(response);
     } catch (error) {
-      last = undefined;
       problems = [String(error?.message ?? error)];
     }
-    if (problems.length === 0) {
-      steps.push({ step: what, ms: Date.now() - startedAt, deadlineMs });
-      return last;
-    }
-    if (Date.now() - startedAt > deadlineMs) {
+    const ms = Date.now() - startedAt;
+    if (ms > deadlineMs) {
       steps.push({ step: what, ms: null, deadlineMs });
+      const late = `matched only after ${(ms / 1_000).toFixed(1)} s`;
       throw new Error(
-        `${what}: not within ${deadlineMs / 1_000} s: ${problems.join("; ")}\n` +
+        `${what}: not within ${deadlineMs / 1_000} s: ` +
+          `${problems.join("; ") || late}\n` +
           `last response: ${JSON.stringify(last)?.slice(0, 4_000)}`,
       );
+    }
+    if (problems.length === 0) {
+      steps.push({ step: what, ms, deadlineMs });
+      return last;
     }
     await sleep(500);
   }
@@ -590,7 +596,8 @@ export async function startSuite({ stackFile, version }) {
 
   /**
    * Runs the cases named in `names`, or all, prints one line per case with
-   * its oracle and time, and returns the results.
+   * its oracle and time, and returns the results. `detail` of a failed case
+   * is its error message.
    */
   const runCases = async (names) => {
     const results = [];
@@ -610,7 +617,13 @@ export async function startSuite({ stackFile, version }) {
       steps.push(
         ...context.steps.map((step) => ({ case: item.name, ...step })),
       );
-      results.push({ name: item.name, oracle: item.oracle, ok, seconds });
+      results.push({
+        name: item.name,
+        oracle: item.oracle,
+        ok,
+        seconds,
+        detail,
+      });
       print(
         `${ok ? "pass" : "FAIL"}  ${item.name}  [${item.oracle}]  ${seconds} s` +
           (detail ? `  ${detail}` : ""),

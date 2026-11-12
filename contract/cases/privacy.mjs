@@ -153,6 +153,7 @@ export default [
     async run({
       runId,
       mutation,
+      query,
       observations,
       proxy,
       poll,
@@ -185,8 +186,9 @@ export default [
           observationIds: [observationIdFromKey(traceId, "span")],
         }),
       );
-      // The outbox sends in order: once a later sentinel arrived, anything
-      // the dropped record had enqueued would have been sent too.
+      // The outbox sends in order: once a later sentinel arrived and the
+      // outbox is empty, anything the dropped record had enqueued was sent
+      // and shows on the proxy.
       const sentinelSeed = `contract:${runId}:after-dropped`;
       const sentinel = traceIdFromSeed(sentinelSeed);
       await mutation("record", {
@@ -200,6 +202,13 @@ export default [
         "the sentinel in Langfuse",
         () => observations(sentinel, "core"),
         (rows) => (rows.length === 1 ? [] : [`${rows.length} observations`]),
+        VISIBLE_MS,
+      );
+      await poll(
+        "the outbox empty",
+        () => query("health", {}),
+        ({ pendingAtLeast }) =>
+          pendingAtLeast === 0 ? [] : [`${pendingAtLeast} rows pending`],
         VISIBLE_MS,
       );
       const sent = proxy.records.filter((record) =>

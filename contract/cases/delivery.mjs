@@ -175,12 +175,21 @@ export default [
           proxy.records.filter(
             (r) => r.path === OTLP_PATH && r.body.includes(spanId),
           ),
+        // Langfuse accepted the original with 200 before the proxy dropped
+        // the answer. A refused original would make the retry the only
+        // accepted write, which is no resend.
         (records) =>
           records.length >= 2 &&
           records[0].dropped &&
+          records[0].status === 200 &&
           records.some((r) => !r.dropped && r.status === 200)
             ? []
-            : [`${records.length} requests with the span`],
+            : [
+                `${records.length} requests with the span: ` +
+                  records
+                    .map((r) => `${r.status}${r.dropped ? " dropped" : ""}`)
+                    .join(", "),
+              ],
         VISIBLE_MS,
       );
       const copies = new Set(

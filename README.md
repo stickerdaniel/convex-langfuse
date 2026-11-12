@@ -598,7 +598,8 @@ Cloud is not part of the suite.
 
 Observed on Langfuse 4.78.0:
 
-- A span that was sent twice came back as two observations with equal content.
+- A span that was sent twice came back as two observations with the same id and
+  the same recorded fields.
 - A score metadata value that is a numeric string reads back as a number.
 - Observation metadata also holds `scope.name`, `scope.version` and
   `resourceAttributes.service.name`.
