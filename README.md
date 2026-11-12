@@ -212,9 +212,9 @@ Notes on the fields:
 - `tags` are at most 8,192 strings.
 - A string cut inside an emoji holds a lone surrogate, which Convex refuses. The
   client sends U+FFFD in its place.
-- With `cost` set, Langfuse uses your numbers and infers nothing from the model
-  name. Without it, Langfuse prices the usage from its model table. Cost values
-  are non-negative numbers.
+- A `cost` with at least one usable entry replaces Langfuse's own pricing.
+  Without one, Langfuse may infer a cost when its model table has a price for
+  the model. Cost values are non-negative numbers.
 - `prompt` links a generation to a prompt version in Langfuse; a link without a
   name or without a positive integer version is left out. Other observation
   types ignore it.
@@ -281,7 +281,7 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Code                  | Meaning                                                      | Record sent        |
 | --------------------- | ------------------------------------------------------------ | ------------------ |
 | `invalid_id`          | A trace id, observation id, seed or key is invalid           | no                 |
-| `invalid_environment` | The environment name breaks Langfuse's rule                  | no                 |
+| `invalid_environment` | The trace's or the default environment name is invalid       | no                 |
 | `row_too_large`       | The encoded observation exceeds 900 KiB                      | no                 |
 | `redact_failed`       | `redact` threw                                               | no                 |
 | `backlog`             | The outbox is full, see [Delivery](#delivery)                | no                 |

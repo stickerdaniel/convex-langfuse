@@ -70,15 +70,21 @@ export function costDetails(cost: Record<string, number>): string | undefined {
 }
 
 /**
- * Whether a prompt link is exported: a non-empty name and a positive integer
- * version. Langfuse rejects a generation that carries only one of the two
- * attributes, so the encoder writes both or neither.
+ * Whether `prompt` is a link to export: an object with a non-empty string
+ * name and a positive integer version. It checks at runtime, because a
+ * caller without types can pass anything. Langfuse rejects a generation that
+ * carries only one of the two attributes, so the encoder writes both or
+ * neither.
  */
-export function isPromptLink(prompt: Prompt): boolean {
+export function isPromptLink(prompt: unknown): prompt is Prompt {
+  if (typeof prompt !== "object" || prompt === null) return false;
+  const { name, version } = prompt as { name?: unknown; version?: unknown };
   return (
-    prompt.name !== "" &&
-    Number.isSafeInteger(prompt.version) &&
-    prompt.version > 0
+    typeof name === "string" &&
+    name !== "" &&
+    typeof version === "number" &&
+    Number.isSafeInteger(version) &&
+    version > 0
   );
 }
 

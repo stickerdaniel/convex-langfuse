@@ -3,6 +3,7 @@ import type {
   GenericActionCtx,
   GenericDataModel,
 } from "convex/server";
+import { ConvexError } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
   isEnvironmentName,
@@ -410,8 +411,15 @@ export class Langfuse {
           trace: first.trace,
           observations: call.map(({ observation }) => observation),
         });
-      } catch {
-        this.#fail("enqueue_failed", ids);
+      } catch (error) {
+        // A bad `LANGFUSE_TRACING_ENVIRONMENT` refuses every call without an
+        // environment of its own, so that refusal keeps its code.
+        this.#fail(
+          error instanceof ConvexError && error.data === "invalid_environment"
+            ? "invalid_environment"
+            : "enqueue_failed",
+          ids,
+        );
         continue;
       }
       if (result.reason === "backlog") this.#fail("backlog", ids);

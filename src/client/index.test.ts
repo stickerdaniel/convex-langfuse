@@ -526,6 +526,17 @@ describe("a component call carries only what the span exports", () => {
       name: "no version",
       prompt: { name: "persona" } as { name: string; version: number },
     },
+    {
+      name: "no name",
+      prompt: { version: 2 } as { name: string; version: number },
+    },
+    {
+      name: "a name that is no string",
+      prompt: { name: 7, version: 2 } as unknown as {
+        name: string;
+        version: number;
+      },
+    },
   ])("a prompt link with $name is left out", async ({ prompt }) => {
     const { observations } = await sent("generation", { fields: { prompt } });
     expect(observations[0]!.prompt).toBeUndefined();
@@ -641,6 +652,34 @@ describe("redact and the experiment's root observation", () => {
     expect(sent?.rootObservationId).toBe(
       await observationIdFromKey(traceId, "root"),
     );
+  });
+});
+
+describe("a bad default environment", () => {
+  beforeEach(() => {
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "Production");
+  });
+
+  test("a trace without an environment logs invalid_environment", async () => {
+    const t = createTest();
+    await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s" })
+        .span(ctx, { key: "k", name: "n" }),
+    );
+    expect(loggedCodes()).toEqual(["invalid_environment"]);
+    expect((await tables(t)).outbox).toHaveLength(0);
+  });
+
+  test("a trace with a valid environment of its own is enqueued", async () => {
+    const t = createTest();
+    await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s", environment: "staging" })
+        .span(ctx, { key: "k", name: "n" }),
+    );
+    expect(consoleLines).toEqual([]);
+    expect((await tables(t)).outbox).toHaveLength(1);
   });
 });
 

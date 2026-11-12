@@ -347,6 +347,9 @@ describe("prompt", () => {
     { name: "a fractional version", prompt: { name: "p", version: 1.5 } },
     { name: "a negative version", prompt: { name: "p", version: -1 } },
     { name: "an empty name", prompt: { name: "", version: 4 } },
+    { name: "a missing name", prompt: { version: 4 } },
+    { name: "a name that is no string", prompt: { name: 7, version: 4 } },
+    { name: "null", prompt: null },
   ])("writes neither attribute for $name", ({ prompt }) => {
     // A caller without types can pass anything.
     const span = encode({
