@@ -422,27 +422,31 @@ function largeRecord(caseNo, count, totalBytes) {
 
 /**
  * Runs record mutations of `size` spans each, `concurrency` at a time, until
- * `stop`, which returns the commit time of every mutation. `commits` is the
- * number committed so far. A mutation refused by the local backend's write
- * throughput limit is sent again after a pause.
+ * `stop`, which joins the workers and returns `{ at, from }` of every
+ * committed mutation: its commit time and its first span id number. With
+ * `paceMs`, a worker starts at most one mutation per `paceMs`. `commits` is
+ * the number committed so far. A mutation refused by the local backend's
+ * write throughput limit is sent again after a pause, until `stop`. `stop`
+ * can be called again and throws the first other failure every time.
  */
-function startLoad(client, caseNo, { size, concurrency }) {
+function startLoad(client, caseNo, { size, concurrency, paceMs = 0 }) {
   const commits = [];
   let next = 0;
   let running = true;
   let failure;
   const worker = async () => {
     while (running) {
+      const startedAt = Date.now();
       const args = {
         traceId: TRACE_IDS[caseNo],
         from: firstId(caseNo) + next++ * size,
         count: size,
       };
-      for (;;) {
+      while (running) {
         try {
           // The strict client throws when a span was not enqueued.
           await client.mutation(api.record, args, { skipQueue: true });
-          commits.push(Date.now());
+          commits.push({ at: Date.now(), from: args.from });
           break;
         } catch (error) {
           if (!/TooManyWrites/.test(String(error))) {
@@ -453,6 +457,7 @@ function startLoad(client, caseNo, { size, concurrency }) {
           await sleep(1_000);
         }
       }
+      await sleep(Math.max(0, startedAt + paceMs - Date.now()));
     }
   };
   const workers = Promise.all(Array.from({ length: concurrency }, worker));
@@ -472,6 +477,21 @@ function received(stats, caseNo, total) {
   let count = 0;
   for (let n = firstId(caseNo); n < firstId(caseNo) + total; n++) {
     if (stats.spans[hexId(n)]) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Span ids of committed load mutations the fake endpoint has not received.
+ * A mutation given up at `stop` leaves a gap in the ids, so the committed
+ * ranges are checked one by one.
+ */
+function missing(stats, commits, size) {
+  let count = 0;
+  for (const { from } of commits) {
+    for (let n = from; n < from + size; n++) {
+      if (!stats.spans[hexId(n)]) count += 1;
+    }
   }
   return count;
 }
@@ -693,13 +713,16 @@ async function main() {
         );
       } finally {
         rmSync(marker, { force: true });
+        // Joins the workers also after a failed deploy, so none of them
+        // enqueues into the later cases. A load failure is thrown below.
+        await load.stop().catch(() => {});
       }
       const commits = await load.stop();
-      const before = commits.filter((at) => at < deployStart).length;
+      const before = commits.filter(({ at }) => at < deployStart).length;
       const during = commits.filter(
-        (at) => at >= deployStart && at <= deployEnd,
+        ({ at }) => at >= deployStart && at <= deployEnd,
       ).length;
-      const after = commits.filter((at) => at > deployEnd).length;
+      const after = commits.filter(({ at }) => at > deployEnd).length;
       if (before === 0 || during === 0 || after === 0) {
         throw new Error(
           `commits before/during/after the deploy: ${before}/${during}/${after}`,
@@ -708,7 +731,7 @@ async function main() {
       const total = commits.length * 10;
       await waitFor(
         "every span id after the redeploy",
-        async () => received(await fake.stats(), 4, total) === total,
+        async () => missing(await fake.stats(), commits, 10) === 0,
         180_000,
       );
       return (
@@ -791,9 +814,9 @@ async function main() {
       const acceptedAt = async () =>
         (await client.query(api.backlog, {})).accepted;
       const requestsAt = async () => (await fake.stats()).requests;
-      const LOAD_MUTATIONS = 2_000;
-      const LOAD_MS = 15_000;
+      const WINDOWS = 3;
       const WINDOW_MS = 5_000;
+      const PACE_MS = 100;
       const load6 = { commits: () => 0, windows: [] };
       let drainedAt;
 
@@ -851,22 +874,26 @@ async function main() {
         };
       };
 
+      let load;
       try {
-        // Eight workers enqueue without a pause, so the exporter always
-        // claims next to a live insert range and competes with the enqueues
-        // for the backend. The load ends after LOAD_MUTATIONS mutations or
-        // LOAD_MS, whichever comes first: its rows stay below the gate's
-        // threshold, so no mutation is refused on any machine.
+        // Eight workers enqueue throughout, so the exporter always claims
+        // next to a live insert range and competes with the enqueues for the
+        // backend. The load runs for WINDOWS windows of WINDOW_MS. Each
+        // worker starts at most one mutation of 10 spans per PACE_MS, so
+        // about 12,400 rows arrive in all, below the gate's threshold of
+        // 25,000 even if none were exported, and no mutation is refused on
+        // any machine.
         load6.requestsStart = await requestsAt();
         load6.loadStart = Date.now();
-        const load = startLoad(client, 6, { size: 10, concurrency: 8 });
+        load = startLoad(client, 6, {
+          size: 10,
+          concurrency: 8,
+          paceMs: PACE_MS,
+        });
         load6.commits = load.commits;
         let last = await acceptedAt();
         let windowStart = Date.now();
-        while (
-          load.commits() < LOAD_MUTATIONS &&
-          Date.now() - load6.loadStart < LOAD_MS
-        ) {
+        while (load6.windows.length < WINDOWS) {
           await sleep(100);
           if (Date.now() - windowStart < WINDOW_MS) continue;
           const now = await acceptedAt();
@@ -874,15 +901,10 @@ async function main() {
           last = now;
           windowStart = Date.now();
         }
-        // A load shorter than one window still has to show progress, so it
-        // is sampled while the workers still enqueue.
-        if (load6.windows.length === 0) {
-          load6.windows.push((await acceptedAt()) - last);
-        }
         const commits = await load.stop();
         load6.loadEnd = Date.now();
         load6.requestsEnd = await requestsAt();
-        // The exporter must keep accepting rows while the load runs.
+        // The exporter must keep accepting rows in every window of the load.
         if (load6.windows.some((accepted) => accepted === 0)) {
           throw new Error(
             `rows accepted per window: ${load6.windows.join(", ")}`,
@@ -891,7 +913,7 @@ async function main() {
         const total = commits.length * 10;
         await waitFor(
           "every span id",
-          async () => received(await fake.stats(), 6, total) === total,
+          async () => missing(await fake.stats(), commits, 10) === 0,
           300_000,
         );
         drainedAt = Date.now();
@@ -920,6 +942,8 @@ async function main() {
           `${total} distinct span ids`
         );
       } catch (error) {
+        // A failure while the load runs must not leave it running.
+        await load?.stop().catch(() => {});
         const { text } = await diagnostics();
         throw new Error(`${error?.message ?? error}; ${text}`);
       }

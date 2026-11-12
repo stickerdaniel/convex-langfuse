@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { api, internal } from "./_generated/api.js";
+import { api, components, internal } from "./_generated/api.js";
 import {
   BACKOFF_CAP_MS,
   BREAKER_REJECTED_SPANS,
   LEASE_MS,
   MEASURE_INTERVAL_MS,
   REQUEST_TIMEOUT_MS,
+  WORKER_NAME,
 } from "./constants.js";
 import {
   drive,
@@ -113,9 +114,12 @@ describe("export", () => {
     await record(0, 1);
     await drive(t, fake, { until: requestCount(14) });
 
+    // In whole seconds; the fixed jitter takes 0.1 % off each backoff.
+    const seconds = gaps().map((gap) => Math.round(gap / 1_000));
+    expect(seconds.slice(0, 3)).toEqual([2, 4, 8]);
+    // From 2^9 s on the cap holds.
+    expect(seconds.slice(-5)).toEqual([300, 300, 300, 300, 300]);
     expect(Math.max(...gaps())).toBeLessThanOrEqual(BACKOFF_CAP_MS);
-    // The cap is reached: 2^9 s would exceed it.
-    expect(gaps().at(-1)).toBeGreaterThan(256_000);
   });
 
   test("401 and 302 back off as config errors until kick, and a 200 resets", async () => {
@@ -291,6 +295,25 @@ describe("fencing", () => {
     await record(1, 1);
     await drive(t, fake);
 
+    expect(fake.requests.map((request) => request.spanIds)).toEqual([
+      [spanId(0)],
+      [spanId(1)],
+    ]);
+  });
+
+  test("a row recorded after the loop went idle is exported through its enqueue", async () => {
+    await record(0, 1);
+    await drive(t, fake);
+    // Fully idle: the loop and its monitor are gone, nothing is scheduled.
+    expect(
+      await t.run(async (ctx) =>
+        ctx.runQuery(components.batchWorker.lib.status, { name: WORKER_NAME }),
+      ),
+    ).toEqual({ kind: "idle" });
+    expect(vi.getTimerCount()).toBe(0);
+
+    await record(1, 1);
+    await drive(t, fake);
     expect(fake.requests.map((request) => request.spanIds)).toEqual([
       [spanId(0)],
       [spanId(1)],

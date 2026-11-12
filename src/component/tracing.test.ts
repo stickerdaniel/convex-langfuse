@@ -124,6 +124,59 @@ describe("record", () => {
     ).toBe("row_too_large");
   });
 
+  test("an invalid default environment refuses a call without its own", async () => {
+    enableExport();
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "Production");
+    const t = initConvexTest();
+    expect(
+      await refusalCode(
+        t.mutation(api.tracing.record, {
+          trace: TRACE,
+          observations: [observation(0)],
+        }),
+      ),
+    ).toBe("invalid_environment");
+    expect((await tables(t)).outbox).toHaveLength(0);
+
+    expect(
+      await t.mutation(api.tracing.record, {
+        trace: { ...TRACE, environment: "staging" },
+        observations: [observation(1)],
+      }),
+    ).toEqual({ enqueued: 1 });
+  });
+
+  test("env defaults do not count against the 4 MiB of a call", async () => {
+    enableExport();
+    // The largest release Convex allows, 6 JSON bytes per character.
+    vi.stubEnv("LANGFUSE_RELEASE", "\u001f".repeat(8_192));
+    const t = initConvexTest({ transactionLimits: true });
+    // 50 spans of just under 3 MiB, as the client splits them.
+    const each = Math.floor((3 * 1024 * 1024) / 50);
+    expect(
+      await t.mutation(api.tracing.record, {
+        trace: TRACE,
+        observations: Array.from({ length: 50 }, (_, n) =>
+          observationOfBytes(n, each),
+        ),
+      }),
+    ).toEqual({ enqueued: 50 });
+    expect((await tables(t)).outbox).toHaveLength(50);
+
+    const over = Math.ceil(MAX_CALL_BYTES / 50) + 1;
+    expect(
+      await refusalCode(
+        t.mutation(api.tracing.record, {
+          trace: TRACE,
+          observations: Array.from({ length: 50 }, (_, n) =>
+            observationOfBytes(n, over),
+          ),
+        }),
+      ),
+    ).toBe("call_too_large");
+    expect((await tables(t)).outbox).toHaveLength(50);
+  });
+
   test("a 4 MiB call and the largest claims stay inside transaction limits", async () => {
     enableExport();
     const t = initConvexTest({ transactionLimits: true });

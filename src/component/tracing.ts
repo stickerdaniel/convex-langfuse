@@ -80,9 +80,10 @@ function withDefaults(trace: TraceContext): TraceContext {
  * Returns `reason: "disabled"` without writing when the component has no
  * export configuration, and `reason: "backlog"` without writing while the
  * admission gate is closed. Throws a `ConvexError` with a `RecordErrorCode`
- * for invalid ids, more than `MAX_CALL_RECORDS` observations, a span over
- * `MAX_ROW_BYTES` before the env defaults are added, or spans over
- * `MAX_CALL_BYTES` in total.
+ * for invalid ids, an invalid environment after the default is applied, more
+ * than `MAX_CALL_RECORDS` observations, a span over `MAX_ROW_BYTES` or spans
+ * over `MAX_CALL_BYTES` in total, both measured before the env defaults are
+ * added.
  *
  * Reads only the gate document and the batch-worker state, never the
  * exporter document, so it does not conflict with the running exporter.
@@ -105,12 +106,18 @@ export const record = mutation({
         reason: "backlog" as const,
       };
     }
-    validate(trace, observations);
+    // The environment Langfuse files the trace under, default included.
+    const stamped = withDefaults(trace);
+    validate(stamped, observations);
     if (observations.length === 0) return { enqueued: 0 };
 
-    const stamped = withDefaults(trace);
-    // The client measures a span without the env defaults, so the row limit
-    // applies without them too. They add the same bytes to every span.
+    // The client measures a span without the env defaults, so the row and
+    // call limits apply without them too. They add the same bytes to every
+    // span: at most 98 bytes for a valid environment of 40 characters, and
+    // at most 49,206 bytes for a release, because a Convex env value holds
+    // 8,192 bytes and a control character takes 6 bytes in JSON. One call
+    // then stores at most 4 MiB + 50 * 49,304 = 6,659,504 bytes of payloads,
+    // below the 16 MiB a transaction writes.
     const stampBytes =
       byteLength(encodeSpan(stamped, PROBE)) -
       byteLength(encodeSpan(trace, PROBE));
@@ -121,7 +128,9 @@ export const record = mutation({
       return { ref: `${trace.traceId}:${observation.id}`, data, bytes };
     });
     const total = spans.reduce((sum, span) => sum + span.bytes, 0);
-    if (total > MAX_CALL_BYTES) refuse("call_too_large");
+    if (total - spans.length * stampBytes > MAX_CALL_BYTES) {
+      refuse("call_too_large");
+    }
 
     const availableAt = Date.now();
     for (const { ref, data, bytes } of spans) {

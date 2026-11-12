@@ -510,12 +510,40 @@ describe("a component call carries only what the span exports", () => {
     expect(consoleLines).toEqual([]);
   });
 
-  test("a generation keeps its prompt without an invalid version", async () => {
+  test("a generation keeps a complete prompt link", async () => {
     const { observations } = await sent("generation", {
-      fields: { prompt: { name: "persona", version: 1.5 } },
+      fields: { prompt: { name: "persona", version: 2 } },
     });
-    expect(observations[0]!.prompt).toEqual({ name: "persona" });
+    expect(observations[0]!.prompt).toEqual({ name: "persona", version: 2 });
     expect(consoleLines).toEqual([]);
+  });
+
+  test.each([
+    { name: "a fractional version", prompt: { name: "persona", version: 1.5 } },
+    { name: "an empty name", prompt: { name: "", version: 2 } },
+    // A caller without types can leave the version out.
+    {
+      name: "no version",
+      prompt: { name: "persona" } as { name: string; version: number },
+    },
+  ])("a prompt link with $name is left out", async ({ prompt }) => {
+    const { observations } = await sent("generation", { fields: { prompt } });
+    expect(observations[0]!.prompt).toBeUndefined();
+    expect(loggedCodes()).toEqual(["invalid_prompt"]);
+  });
+
+  test("a negative cost entry is left out of the cost and its total", async () => {
+    const { trace, observations } = await sent("generation", {
+      fields: { cost: { input: -0.002, output: 0.005 } },
+    });
+    expect(observations[0]!.cost).toEqual({ output: 0.005 });
+    expect(
+      attribute(
+        encodeSpan(trace, observations[0]!),
+        "langfuse.observation.cost_details",
+      ),
+    ).toBe('{"output":0.005,"total":0.005}');
+    expect(loggedCodes()).toEqual(["invalid_cost"]);
   });
 
   test.each([
@@ -559,6 +587,205 @@ describe("a component call carries only what the span exports", () => {
     const { observations } = await sent("generation", { fields: { cost } });
     expect(observations[0]!.cost).toEqual(kept);
     expect(loggedCodes()).toEqual(["invalid_cost"]);
+  });
+});
+
+describe("redact and the experiment's root observation", () => {
+  const experiment = {
+    id: "exp-1",
+    name: "E",
+    rootObservation: { key: "root" },
+  };
+
+  /** The experiment of the component call after `redact` ran. */
+  async function sentExperiment(
+    redact: (record: ExportRecord) => ExportRecord,
+  ): Promise<TraceContext["experiment"]> {
+    const t = createTest();
+    const calls: RecordArgs[] = [];
+    await inMutation(t, async (ctx) =>
+      client({ content: "full", redact })
+        .trace({ seed: "s", experiment })
+        .span(spying(ctx, calls), { key: "k", name: "n" }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(consoleLines).toEqual([]);
+    return calls[0]!.trace.experiment;
+  }
+
+  test("a removed root ref is not sent", async () => {
+    const sent = await sentExperiment((record) => {
+      const { rootObservation: _root, ...rest } = record.trace.experiment!;
+      return { ...record, trace: { ...record.trace, experiment: rest } };
+    });
+    expect(sent).toEqual({ id: "exp-1", name: "E" });
+  });
+
+  test("a removed experiment is not sent", async () => {
+    const sent = await sentExperiment((record) => {
+      const { experiment: _experiment, ...trace } = record.trace;
+      return { ...record, trace };
+    });
+    expect(sent).toBeUndefined();
+  });
+
+  test("a changed root ref keeps the original id", async () => {
+    const sent = await sentExperiment((record) => ({
+      ...record,
+      trace: {
+        ...record.trace,
+        experiment: { ...experiment, rootObservation: { key: "other" } },
+      },
+    }));
+    const traceId = await traceIdFromSeed("s");
+    expect(sent?.rootObservationId).toBe(
+      await observationIdFromKey(traceId, "root"),
+    );
+  });
+});
+
+describe("a string cut inside an emoji", () => {
+  // What `"cut 😀".slice(0, -1)` leaves: a lone surrogate, which Convex
+  // refuses in a function argument.
+  const CUT = "cut 😀".slice(0, -1);
+  const FIXED = "cut \ufffd";
+
+  /** Every string in `value`, at any depth. */
+  function strings(value: unknown): string[] {
+    if (typeof value === "string") return [value];
+    if (typeof value !== "object" || value === null) return [];
+    return Object.values(value).flatMap(strings);
+  }
+
+  test("is sent with U+FFFD in its place, in every field", async () => {
+    const t = createTest();
+    const calls: RecordArgs[] = [];
+    await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({
+          seed: "s",
+          name: CUT,
+          userId: CUT,
+          sessionId: CUT,
+          release: CUT,
+          tags: [CUT, "whole 😀"],
+          experiment: { id: CUT, name: CUT },
+        })
+        .generation(spying(ctx, calls), {
+          key: "k",
+          name: CUT,
+          input: CUT,
+          output: `${CUT} and more`,
+          statusMessage: CUT,
+          version: CUT,
+          model: CUT,
+          prompt: { name: CUT, version: 1 },
+        }),
+    );
+
+    const [{ trace, observations }] = calls as [RecordArgs];
+    expect(trace).toMatchObject({
+      name: FIXED,
+      userId: FIXED,
+      sessionId: FIXED,
+      release: FIXED,
+      tags: [FIXED, "whole 😀"],
+      experiment: { id: FIXED, name: FIXED },
+    });
+    expect(observations[0]).toMatchObject({
+      name: FIXED,
+      input: FIXED,
+      output: `${FIXED} and more`,
+      statusMessage: FIXED,
+      version: FIXED,
+      model: FIXED,
+      prompt: { name: FIXED, version: 1 },
+    });
+    for (const text of strings(calls)) expect(text).not.toMatch(/\p{Cs}/u);
+    expect((await tables(t)).outbox).toHaveLength(1);
+    expect(consoleLines).toEqual([]);
+  });
+});
+
+describe("serialization follows JSON.stringify", () => {
+  /** The stored input of one span recorded with `input`. */
+  async function storedInput(input: unknown): Promise<string | undefined> {
+    const t = createTest();
+    const { observationId } = await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s" })
+        .span(ctx, { key: "k", name: "n", input }),
+    );
+    return attribute(
+      (await spans(t)).get(observationId)!,
+      "langfuse.observation.input",
+    );
+  }
+
+  test("toJSON gets its key and a boxed number is unboxed", async () => {
+    const input = {
+      sensitive: {
+        toJSON(key: string) {
+          return key === "sensitive" ? "[REDACTED]" : "secret-internal";
+        },
+      },
+      amount: new Number(8),
+    };
+    expect(await storedInput(input)).toBe(
+      '{"amount":8,"sensitive":"[REDACTED]"}',
+    );
+  });
+
+  test("dates, nested arrays and undefined members", async () => {
+    const input = {
+      list: [[1, undefined, () => 1], []],
+      gone: undefined,
+      at: new Date(0),
+    };
+    expect(await storedInput(input)).toBe(
+      '{"at":"1970-01-01T00:00:00.000Z","list":[[1,null,null],[]]}',
+    );
+  });
+
+  test.each([
+    { name: "a number", json: 42 },
+    { name: "an array", json: [1] },
+    { name: "null", json: null },
+  ])("metadata whose toJSON returns $name is left out", async ({ json }) => {
+    const t = createTest();
+    const calls: RecordArgs[] = [];
+    const metadata = { toJSON: () => json };
+    await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s", metadata })
+        .generation(spying(ctx, calls), {
+          key: "k",
+          name: "n",
+          metadata,
+          modelParameters: metadata,
+        }),
+    );
+    const [{ trace, observations }] = calls as [RecordArgs];
+    expect(trace.metadata).toBeUndefined();
+    expect(observations[0]!.metadata).toBeUndefined();
+    expect(observations[0]!.modelParameters).toBeUndefined();
+    expect(loggedCodes()).toEqual(["invalid_metadata"]);
+  });
+
+  test("metadata whose toJSON returns an object is sent", async () => {
+    const t = createTest();
+    const calls: RecordArgs[] = [];
+    await inMutation(t, async (ctx) =>
+      client({ content: "full" })
+        .trace({ seed: "s" })
+        .span(spying(ctx, calls), {
+          key: "k",
+          name: "n",
+          metadata: { toJSON: () => ({ b: 1, a: 2 }) },
+        }),
+    );
+    expect(calls[0]!.observations[0]!.metadata).toBe('{"a":2,"b":1}');
+    expect(consoleLines).toEqual([]);
   });
 });
 

@@ -18,11 +18,18 @@ import {
   MAX_ROW_BYTES,
   MAX_TAGS,
 } from "../shared/limits.js";
-import { byteLength, costDetails, encodeSpan } from "../shared/otlp.js";
+import {
+  byteLength,
+  costDetails,
+  encodeSpan,
+  isCostValue,
+  isPromptLink,
+} from "../shared/otlp.js";
 import type {
   Level,
   Observation,
   ObservationType,
+  Prompt,
   TraceContext,
 } from "../shared/validators.js";
 
@@ -89,7 +96,8 @@ export type ObservationFields = {
   modelParameters?: Record<string, unknown>;
   usage?: Record<string, number>;
   cost?: Record<string, number>;
-  prompt?: { name: string; version?: number };
+  /** Exported only on a generation, with a non-empty name and a positive integer version. */
+  prompt?: { name: string; version: number };
 };
 
 export type ObservationInit = ObservationRef & {
@@ -98,10 +106,11 @@ export type ObservationInit = ObservationRef & {
 
 /**
  * What `redact` sees: one observation with its trace fields, before
- * serialization. Changes to the ids are ignored. The record, its trace and
- * its observation are shallow copies: nested values such as `tags`, `input`
- * or `metadata` are the caller's own objects, so build new ones instead of
- * changing them in place.
+ * serialization. Changes to the ids are ignored, and so is a changed
+ * `experiment.rootObservation`; a removed one is not exported. The record,
+ * its trace and its observation are shallow copies: nested values such as
+ * `tags`, `input` or `metadata` are the caller's own objects, so build new
+ * ones instead of changing them in place.
  */
 export type ExportRecord = {
   kind: "observation";
@@ -124,6 +133,7 @@ export type ErrorCode =
   | "unserializable"
   | "invalid_usage"
   | "invalid_cost"
+  | "invalid_prompt"
   | "row_too_large"
   | "redact_failed"
   | "backlog"
@@ -183,39 +193,46 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-/** A copy with object keys sorted at every depth. Throws on a cycle. */
-function sortKeys(value: unknown, ancestors: Set<object>): unknown {
+/** A copy of a parsed JSON value with object keys sorted at every depth. */
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
   if (typeof value !== "object" || value === null) return value;
-  if (ancestors.has(value)) throw new TypeError("cycle");
-  ancestors.add(value);
-  try {
-    if ("toJSON" in value && typeof value.toJSON === "function") {
-      const json: unknown = value.toJSON();
-      if (json !== value) return sortKeys(json, ancestors);
-    }
-    if (Array.isArray(value)) {
-      return value.map((item: unknown) => sortKeys(item, ancestors));
-    }
-    return Object.fromEntries(
-      Object.entries(value)
-        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-        .map(([key, item]: [string, unknown]) => [
-          key,
-          sortKeys(item, ancestors),
-        ]),
-    );
-  } finally {
-    ancestors.delete(value);
-  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, item]: [string, unknown]) => [key, sortKeys(item)]),
+  );
 }
 
 /**
- * JSON with object keys sorted recursively, so equal values give equal
- * strings. `undefined` when JSON has no representation for the value. Throws
- * on a cycle or a bigint.
+ * `value` as `JSON.stringify` converts it, with object keys sorted at every
+ * depth, so equal values give equal strings. The conversion is the native
+ * one: `toJSON` gets its key, boxed primitives are unboxed and members
+ * without a JSON form are dropped. `undefined` when JSON has no
+ * representation for the value. Throws on a cycle or a bigint.
  */
-function stableJson(value: unknown): string | undefined {
-  return JSON.stringify(sortKeys(value, new Set())) as string | undefined;
+function sortedJson(value: unknown): unknown {
+  const text = JSON.stringify(value) as string | undefined;
+  return text === undefined ? undefined : sortKeys(JSON.parse(text));
+}
+
+/**
+ * A copy with every lone surrogate replaced by U+FFFD, in strings at any
+ * depth. A string cut inside an emoji holds one. Convex refuses an argument
+ * with such a string, which would fail the whole component call.
+ */
+function wellFormed<T>(value: T): T;
+function wellFormed(value: unknown): unknown {
+  // In Unicode mode a surrogate pair is one code point, so the category
+  // "surrogate" matches only the lone ones.
+  if (typeof value === "string") return value.replace(/\p{Cs}/gu, "\ufffd");
+  if (Array.isArray(value)) return value.map((item) => wellFormed(item));
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, wellFormed(item)]),
+    );
+  }
+  return value;
 }
 
 /**
@@ -419,8 +436,9 @@ export class Langfuse {
     const problems = new Set<ErrorCode>();
 
     // 1. Ids. An empty seed or key resolves to "", which fails validation.
+    // `redact` cannot change them, so they resolve before it runs.
     const parentId = await tryResolveRef(traceId, item.parent);
-    const rootObservationId = await tryResolveRef(
+    const rootId = await tryResolveRef(
       traceId,
       init.experiment?.rootObservation,
     );
@@ -474,7 +492,10 @@ export class Langfuse {
       if (value === undefined) return undefined;
       let text: string | undefined;
       try {
-        text = typeof value === "string" ? value : stableJson(value);
+        text =
+          typeof value === "string"
+            ? value
+            : (JSON.stringify(sortedJson(value)) as string | undefined);
       } catch {
         text = undefined;
       }
@@ -484,25 +505,29 @@ export class Langfuse {
       }
       return truncate(text, maxFieldBytes);
     };
+    // Langfuse drops metadata that is not a JSON object, so the check runs
+    // on the converted value.
     const jsonObject = (value: unknown): string | undefined => {
       if (value === undefined) return undefined;
-      if (!isPlainObject(value)) {
-        problems.add("invalid_metadata");
-        return undefined;
-      }
-      let text: string | undefined;
+      let json: unknown;
       try {
-        text = stableJson(value);
+        json = sortedJson(value);
       } catch {
         problems.add("unserializable");
         return undefined;
       }
-      return text !== undefined && byteLength(text) > maxFieldBytes
-        ? DROPPED_METADATA
-        : text;
+      if (typeof json !== "object" || json === null || Array.isArray(json)) {
+        problems.add("invalid_metadata");
+        return undefined;
+      }
+      const text = JSON.stringify(json);
+      return byteLength(text) > maxFieldBytes ? DROPPED_METADATA : text;
     };
 
     const { experiment } = fieldsOfTrace;
+    // A removed root ref is not exported; a changed one keeps its first id.
+    const rootObservationId =
+      experiment?.rootObservation === undefined ? undefined : rootId;
     // Tags are sent as given: an array of at most `MAX_TAGS` strings.
     let { tags } = fieldsOfTrace;
     if (
@@ -516,7 +541,9 @@ export class Langfuse {
       problems.add("invalid_tags");
       tags = undefined;
     }
-    const trace: TraceContext = {
+    // Every string sent to the component is well-formed UTF-16, and the
+    // sizes below are measured on these values.
+    const trace: TraceContext = wellFormed({
       traceId,
       name: fieldsOfTrace.name,
       userId: fieldsOfTrace.userId,
@@ -533,7 +560,7 @@ export class Langfuse {
         rootObservationId,
         metadata: jsonObject(experiment.metadata),
       },
-    };
+    });
 
     const input = content(observation.input);
     const output = content(observation.output);
@@ -548,25 +575,22 @@ export class Langfuse {
       (value) => Number.isSafeInteger(value) && value >= 0,
     );
     if (usage.invalid) problems.add("invalid_usage");
-    const cost = details(observation.cost, Number.isFinite);
+    const cost = details(observation.cost, isCostValue);
     // A cost record whose sum is not finite exports nothing.
     const exported = cost.kept && costDetails(cost.kept) !== undefined;
     if (cost.invalid || (cost.kept && !exported)) problems.add("invalid_cost");
-    // Only a generation exports its prompt link.
+    // Only a generation exports its prompt link, and only a complete one.
     const { prompt } = observation;
-    const promptLink =
-      observation.type === "generation" && prompt !== undefined
-        ? {
-            name: prompt.name,
-            ...(prompt.version !== undefined &&
-            Number.isSafeInteger(prompt.version) &&
-            prompt.version > 0
-              ? { version: prompt.version }
-              : {}),
-          }
-        : undefined;
+    let promptLink: Prompt | undefined;
+    if (observation.type === "generation" && prompt !== undefined) {
+      if (isPromptLink(prompt)) {
+        promptLink = { name: prompt.name, version: prompt.version };
+      } else {
+        problems.add("invalid_prompt");
+      }
+    }
 
-    const encoded: Observation = {
+    const encoded: Observation = wellFormed({
       id: observationId,
       parentId,
       type: observation.type,
@@ -588,7 +612,7 @@ export class Langfuse {
       usage: usage.kept,
       cost: exported ? cost.kept : undefined,
       prompt: promptLink,
-    };
+    });
     for (const code of problems) this.#fail(code, ids);
 
     // 8. Validation.
