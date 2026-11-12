@@ -22,10 +22,11 @@ Three more suites run on a local Convex backend, which the first run downloads
 at the pinned release:
 
 ```sh
-# 10 cases with a fake Langfuse endpoint, about 10 minutes. CI runs it.
+# 11 cases with a fake Langfuse endpoint, about 10 minutes. CI runs it.
 npm run test:integration
 
-# Load, outage, backlog threshold and prompt refresh drivers, about 45 minutes.
+# Load, outage, backlog threshold and prompt refresh drivers, about 70 minutes.
+# They measure latency and rates, so they need an otherwise idle machine.
 npm run test:load
 
 # One driver: load, outage, threshold, threshold --kill or prompts.
@@ -33,7 +34,10 @@ node integration/load.mjs outage
 ```
 
 The scripts under `e2e/` check traces, scores and prompts against a Langfuse
-instance of your own. They create data with unique names and delete it again.
+instance of your own. They create traces, scores and prompts with unique names.
+At the end they request the deletion of their traces through the component and
+delete their prompts. The score config `convex-langfuse-e2e-rating` stays in the
+project.
 
 ```sh
 export LANGFUSE_BASE_URL=https://langfuse.example.com
