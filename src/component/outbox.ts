@@ -17,6 +17,7 @@ import {
   RETRY_DEAD_LETTERS_MAX,
   WORKER_NAME,
 } from "./constants.js";
+import type { Kind } from "./schema.js";
 import { exportConfig } from "./settings.js";
 
 /** The exporter singleton, or `null` before the first dispatch. */
@@ -60,6 +61,18 @@ export async function pingExporter(ctx: MutationCtx): Promise<void> {
   });
 }
 
+/**
+ * The kinds whose rows count toward the pending backlog the admission gate
+ * decides on: every enqueue of such a row writes a receipt, and every such
+ * row that leaves the outbox adds to the removed totals. Trace deletion
+ * requests do not count; `traces.remove` bounds them with a quota of its own.
+ */
+export const COUNTED_KINDS: readonly Kind[] = [
+  "span",
+  "scoreCreate",
+  "scoreDelete",
+];
+
 /** The pending backlog the admission gate decides on. */
 export type Pending = { pendingRows: number; pendingBytes: number };
 
@@ -69,14 +82,14 @@ export type Removed = Pick<Doc<"exporter">, "removedRows" | "removedBytes">;
 const vAmount = v.object({ rows: v.number(), bytes: v.number() });
 
 /**
- * The removed totals after `rows` left the outbox. Every deleted span row
- * counts, whether a count step has consumed its receipt or not. The caller
- * stores the result on the exporter document.
+ * The removed totals after `rows` left the outbox. Every deleted row of a
+ * counted kind counts, whether a count step has consumed its receipt or not.
+ * The caller stores the result on the exporter document.
  */
 export function withRemoved(removed: Removed, rows: Doc<"outbox">[]): Removed {
   let { removedRows, removedBytes } = removed;
   for (const row of rows) {
-    if (row.kind !== "span") continue;
+    if (!COUNTED_KINDS.includes(row.kind)) continue;
     removedRows += 1;
     removedBytes += row.bytes;
   }
@@ -148,15 +161,32 @@ export async function scheduleCount(
   await ctx.scheduler.runAfter(0, internal.outbox.count, { chain });
 }
 
+/** Whether the outbox holds a row of a counted kind: one lookup per kind. */
+async function holdsCounted(ctx: QueryCtx): Promise<boolean> {
+  for (const kind of COUNTED_KINDS) {
+    const row = await ctx.db
+      .query("outbox")
+      .withIndex("by_kind", (q) => q.eq("kind", kind))
+      .first();
+    if (row) return true;
+  }
+  return false;
+}
+
 /**
  * Sets the gate from the pending backlog, `counter.added*` minus
  * `exporter.removed*`. It reads both totals and the gate in this transaction,
- * so every gate move follows from one consistent state. It is also the
- * safety net for drift, for example after rows were deleted by hand: when the
- * backlog is positive or the gate is closed although the outbox is empty, it
- * opens the gate and sets the removed totals to the added ones. A negative
- * backlog stays, because its receipts are still to be consumed. It reads the
- * outbox only in that case.
+ * so every gate move follows from one consistent state.
+ *
+ * It is also the safety net for drift, for example after rows were deleted
+ * by hand. When the totals differ or the gate is closed, it looks for a row
+ * of a counted kind in the outbox; it reads the outbox only in that case.
+ * Without one, the gate decides on a backlog of zero and opens, whatever the
+ * totals say; trace deletion requests do not keep it closed. When in
+ * addition no receipt is left, the removed totals are set to the added ones,
+ * in either direction. While a receipt is left, the totals are not written:
+ * a replacement receipt can be negative, so they may still converge, and the
+ * count step that consumes it schedules `reconcileGate` again.
  *
  * It reads the counter and the exporter document, so it runs in the sweep or
  * in `reconcileGate`, never inside a count step or `advance`.
@@ -172,12 +202,9 @@ export async function reconcile(ctx: MutationCtx): Promise<void> {
     pendingRows: added.rows - (exporter?.removedRows ?? 0),
     pendingBytes: added.bytes - (exporter?.removedBytes ?? 0),
   };
-  const positive = pending.pendingRows > 0 || pending.pendingBytes > 0;
-  if (
-    (positive || (await gateClosed(ctx))) &&
-    !(await ctx.db.query("outbox").first())
-  ) {
-    if (positive) {
+  const differ = pending.pendingRows !== 0 || pending.pendingBytes !== 0;
+  if ((differ || (await gateClosed(ctx))) && !(await holdsCounted(ctx))) {
+    if (differ && !(await ctx.db.query("receipts").first())) {
       const { _id } = exporter ?? (await getOrCreateExporter(ctx));
       await ctx.db.patch("exporter", _id, {
         removedRows: added.rows,
@@ -270,9 +297,13 @@ const vLastError = v.object({
 /**
  * Export state for dashboards and alerts. `pendingAtLeast` and
  * `deadLettersAtLeast` are lower bounds capped at `HEALTH_COUNT_CAP`.
- * `pendingCounted` is the backlog the gate uses: rows and bytes of consumed
- * receipts minus those of removed rows, never below zero. It trails new rows
- * until a count step consumes their receipts. `oldestPendingAt` is the
+ * `pendingCounted` is the backlog the gate uses: rows and bytes of spans and
+ * score ops from consumed receipts minus those of removed rows, never below
+ * zero. It differs from the outbox until a count step consumes the receipts
+ * of recent enqueues; once every receipt is consumed it is exact. A
+ * replacement of a waiting score op writes a receipt that can lower the
+ * bytes, so before it is consumed the bytes can also be too high.
+ * `oldestPendingAt` is the
  * creation time of the oldest pending row. `backoffUntil` is set only while a
  * backoff is active.
  */
@@ -339,21 +370,37 @@ export const health = query({
 });
 
 /**
- * Moves up to `limit` (default 100, at most `RETRY_DEAD_LETTERS_MAX`) dead
- * letters, oldest first, back to the outbox and wakes the exporter. Writes
- * one receipt for the moved rows, so the next count step counts them once.
- * Does nothing while the gate is closed. Run it from the dashboard or CLI
- * after fixing what made Langfuse reject them.
+ * Moves up to `limit` (default 100, at most `RETRY_DEAD_LETTERS_MAX`) span
+ * and trace deletion dead letters, oldest first, back to the outbox and
+ * wakes the exporter. Writes one receipt for the moved rows of counted
+ * kinds, so the next count step counts them once. While the gate is closed it moves trace
+ * deletion requests only. Score dead letters stay: the app re-sends the
+ * score. Run it from the dashboard or CLI after fixing what made Langfuse
+ * reject them.
  */
 export const retryDeadLetters = internalMutation({
   args: { limit: v.optional(v.number()) },
   returns: v.object({ moved: v.number() }),
   handler: async (ctx, { limit = 100 }) => {
-    if (await gateClosed(ctx)) return { moved: 0 };
-    const deadLetters = await ctx.db
-      .query("deadLetters")
-      .withIndex("by_failedAt")
-      .take(Math.min(RETRY_DEAD_LETTERS_MAX, Math.max(0, Math.floor(limit))));
+    const take = Math.min(
+      RETRY_DEAD_LETTERS_MAX,
+      Math.max(0, Math.floor(limit)),
+    );
+    const kinds = (await gateClosed(ctx))
+      ? (["traceDelete"] as const)
+      : (["span", "traceDelete"] as const);
+    const candidates: Doc<"deadLetters">[] = [];
+    for (const kind of kinds) {
+      candidates.push(
+        ...(await ctx.db
+          .query("deadLetters")
+          .withIndex("by_kind_failedAt", (q) => q.eq("kind", kind))
+          .take(take)),
+      );
+    }
+    const deadLetters = candidates
+      .sort((a, b) => a.failedAt - b.failedAt)
+      .slice(0, take);
     const now = Date.now();
     for (const { _id, kind, ref, bytes, payloadId } of deadLetters) {
       await ctx.db.insert("outbox", {
@@ -365,14 +412,17 @@ export const retryDeadLetters = internalMutation({
       });
       await ctx.db.delete("deadLetters", _id);
     }
-    if (deadLetters.length > 0) {
+    const counted = deadLetters.filter((row) =>
+      COUNTED_KINDS.includes(row.kind),
+    );
+    if (counted.length > 0) {
       await ctx.db.insert("receipts", {
-        rows: deadLetters.length,
-        bytes: deadLetters.reduce((sum, row) => sum + row.bytes, 0),
+        rows: counted.length,
+        bytes: counted.reduce((sum, row) => sum + row.bytes, 0),
         seq: ctx.db.vars.commitTs,
       });
-      await pingExporter(ctx);
     }
+    if (deadLetters.length > 0) await pingExporter(ctx);
     return { moved: deadLetters.length };
   },
 });

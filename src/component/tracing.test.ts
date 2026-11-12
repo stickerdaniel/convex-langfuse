@@ -1,4 +1,3 @@
-import { ConvexError } from "convex/values";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, components, internal } from "./_generated/api.js";
 import { MAX_CALL_BYTES, MAX_ROW_BYTES, WORKER_NAME } from "./constants.js";
@@ -10,6 +9,7 @@ import {
   insertRows,
   observation,
   PUBLIC_KEY,
+  refusalCode,
   SECRET_KEY,
   spanOfBytes,
   startRunByHand,
@@ -30,16 +30,6 @@ afterEach(() => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
-
-async function refusalCode(promise: Promise<unknown>): Promise<unknown> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof ConvexError) return error.data;
-    throw error;
-  }
-  throw new Error("expected a refusal");
-}
 
 /** An observation whose encoded span has exactly `bytes` bytes. */
 function observationOfBytes(n: number, bytes: number) {
@@ -201,7 +191,7 @@ describe("record", () => {
     const step = await fresh.mutation(internal.exporter.advance, {
       generation: 1,
     });
-    expect(step.done === false && step.spans).toHaveLength(50);
+    expect("spans" in step && step.spans).toHaveLength(50);
 
     // One 900 KiB row, claimed alone.
     const single = initConvexTest({ transactionLimits: true });
@@ -210,7 +200,7 @@ describe("record", () => {
     const alone = await single.mutation(internal.exporter.advance, {
       generation: 1,
     });
-    expect(alone.done === false && alone.spans).toHaveLength(1);
+    expect("spans" in alone && alone.spans).toHaveLength(1);
   });
 });
 
@@ -230,6 +220,7 @@ describe("disabled", () => {
       counter: [],
       exporter: [],
       gate: [],
+      scoreKeys: [],
     });
     const worker = await t.run(async (ctx) =>
       ctx.runQuery(components.batchWorker.lib.status, { name: WORKER_NAME }),

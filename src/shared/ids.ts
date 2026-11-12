@@ -1,14 +1,7 @@
 // Deterministic Langfuse ids. Uses only Web Crypto and TextEncoder, so it runs
 // in the Convex default runtime, Node and Bun.
 
-const encoder = new TextEncoder();
-
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(text));
-  return Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
+import { sha256Hex } from "./hash.js";
 
 /**
  * Trace id for a seed: the first 32 hex characters of SHA-256 over the UTF-8

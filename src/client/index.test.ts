@@ -22,12 +22,16 @@ import {
   drive,
   enableExport,
   installFakeLangfuse,
+  refusalCode,
+  serveConfigs,
   type Tables,
 } from "../component/fakeLangfuse.test-util.js";
-import { MAX_CALL_BYTES } from "../shared/limits.js";
+import { MAX_CALL_BYTES, MAX_ROW_BYTES } from "../shared/limits.js";
 import { byteLength, encodeSpan } from "../shared/otlp.js";
+import { scoreBytes } from "../shared/scores.js";
 import type { Observation, TraceContext } from "../shared/validators.js";
 import {
+  defineScores,
   Langfuse,
   observationIdFromKey,
   traceIdFromSeed,
@@ -36,6 +40,7 @@ import {
   type LangfuseOptions,
   type ObservationFields,
   type ObservationType,
+  type ScoreDefinitions,
   type Trace,
   type TraceFields,
 } from "./index.js";
@@ -623,12 +628,18 @@ describe("redact and the experiment's root observation", () => {
 
   /** The experiment of the component call after `redact` ran. */
   async function sentExperiment(
-    redact: (record: ExportRecord) => ExportRecord,
+    redact: (
+      record: Extract<ExportRecord, { kind: "observation" }>,
+    ) => ExportRecord,
   ): Promise<TraceContext["experiment"]> {
     const t = createTest();
     const calls: RecordArgs[] = [];
     await inMutation(t, async (ctx) =>
-      client({ content: "full", redact })
+      client({
+        content: "full",
+        redact: (record) =>
+          record.kind === "observation" ? redact(record) : record,
+      })
         .trace({ seed: "s", experiment })
         .span(spying(ctx, calls), { key: "k", name: "n" }),
     );
@@ -1064,10 +1075,16 @@ test("observations whose redacted trace context differs keep their own context",
   const t = createTest();
   const langfuse = client({
     content: "full",
-    redact: (record) => ({
-      ...record,
-      trace: { ...record.trace, name: `trace of ${record.observation.name}` },
-    }),
+    redact: (record) =>
+      record.kind === "observation"
+        ? {
+            ...record,
+            trace: {
+              ...record.trace,
+              name: `trace of ${record.observation.name}`,
+            },
+          }
+        : record,
   });
   const { traceId, observationIds } = await inMutation(t, async (ctx) =>
     langfuse.trace({ seed: "s", name: "original" }).record(ctx, [
@@ -1186,4 +1203,428 @@ test("log lines carry a code and ids only", async () => {
     expect(observationId).toMatch(/^([0-9a-f]{16})?$/);
   }
   expect(JSON.stringify(consoleLines)).not.toContain(MARKER);
+});
+
+describe("scores", () => {
+  const SCORES = defineScores({
+    helpful: { dataType: "BOOLEAN" },
+    rating: { dataType: "NUMERIC", min: 1, max: 5 },
+    tone: { dataType: "CATEGORICAL", categories: ["formal", "casual"] },
+  });
+
+  function scoring(options: Partial<LangfuseOptions> = {}) {
+    return new Langfuse(app.components.convexLangfuse, {
+      content: "full",
+      ...options,
+      scores: SCORES,
+    });
+  }
+
+  /** A ctx that counts the component calls it forwards. */
+  function counting(ctx: AppCtx, calls: unknown[]): RunMutationCtx {
+    return {
+      runMutation: async (reference, ...args) => {
+        calls.push(args[0]);
+        return await ctx.runMutation(reference, ...args);
+      },
+    };
+  }
+
+  /** Stored score request bodies, in enqueue order. */
+  async function scoreBodies(t: TestApp): Promise<Record<string, unknown>[]> {
+    const { outbox, payloads } = await tables(t);
+    return outbox
+      .filter((row) => row.kind === "scoreCreate")
+      .map(
+        (row) =>
+          JSON.parse(
+            payloads.find((payload) => payload._id === row.payloadId)!.data,
+          ) as Record<string, unknown>,
+      );
+  }
+
+  test("a score written in an app mutation is posted once with the caller's id and timestamp, true as 1", async () => {
+    const fake = installFakeLangfuse();
+    const t = createTest();
+    const timestamp = Date.parse("2026-11-11T11:00:00.000Z");
+    const { scoreId } = await inMutation(t, (ctx) =>
+      scoring().score(ctx, {
+        name: "helpful",
+        value: true,
+        trace: { seed: "chat" },
+        observation: { key: "llm" },
+        id: "score-1",
+        timestamp,
+        comment: "good",
+        metadata: { b: 1, a: 2 },
+      }),
+    );
+    await drive(t, fake);
+
+    expect(scoreId).toBe("score-1");
+    const posts = fake.requests.filter(
+      (r) => r.method === "POST" && r.path === "/api/public/scores",
+    );
+    expect(posts).toHaveLength(1);
+    const traceId = await traceIdFromSeed("chat");
+    expect(JSON.parse(posts[0]!.body)).toEqual({
+      id: "score-1",
+      timestamp: "2026-11-11T11:00:00.000Z",
+      name: "helpful",
+      value: 1,
+      dataType: "BOOLEAN",
+      traceId,
+      observationId: await observationIdFromKey(traceId, "llm"),
+      comment: "good",
+      metadata: { a: 2, b: 1 },
+    });
+  });
+
+  test("without an id the score gets a new UUID and the current time", async () => {
+    const t = createTest();
+    const { scoreId } = await inMutation(t, (ctx) =>
+      scoring().score(ctx, {
+        name: "tone",
+        value: "casual",
+        trace: { seed: "chat" },
+      }),
+    );
+    expect(scoreId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await scoreBodies(t)).toMatchObject([
+      {
+        id: scoreId,
+        timestamp: "2026-11-11T12:00:00.000Z",
+        value: "casual",
+        dataType: "CATEGORICAL",
+      },
+    ]);
+  });
+
+  test("an out-of-range number and an unknown category are refused before the component call", async () => {
+    const t = createTest();
+    const calls: unknown[] = [];
+    await inMutation(t, async (ctx) => {
+      const langfuse = scoring();
+      const trace = { seed: "chat" };
+      await langfuse.score(counting(ctx, calls), {
+        name: "rating",
+        value: 6,
+        trace,
+      });
+      await langfuse.score(counting(ctx, calls), {
+        name: "tone",
+        value: "rude" as "formal",
+        trace,
+      });
+      await langfuse.score(counting(ctx, calls), {
+        name: "rating",
+        value: 5,
+        trace,
+      });
+    });
+    expect(loggedCodes()).toEqual(["invalid_score", "invalid_score"]);
+    expect(calls).toHaveLength(1);
+    expect(await scoreBodies(t)).toMatchObject([{ name: "rating", value: 5 }]);
+  });
+
+  test('content: "none" removes the comment, and redact returning null enqueues nothing', async () => {
+    const t = createTest();
+    await inMutation(t, async (ctx) => {
+      const args = {
+        name: "helpful" as const,
+        value: false,
+        trace: { seed: "chat" },
+        comment: "the user said something private",
+      };
+      await scoring({ content: "none" }).score(ctx, args);
+      await scoring({ redact: () => null }).score(ctx, args);
+    });
+    const bodies = await scoreBodies(t);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).not.toHaveProperty("comment");
+    expect(bodies[0]).toMatchObject({ value: 0, dataType: "BOOLEAN" });
+  });
+
+  test("a refused score logs its code and a trace id only when it is valid, never the score id", async () => {
+    const MARKER = "MARKER-5c0e";
+    const t = createTest();
+    await inMutation(t, async (ctx) => {
+      const langfuse = scoring();
+      await langfuse.score(ctx, {
+        name: "rating",
+        value: 6,
+        trace: { seed: MARKER },
+        // A valid score id can hold user content too.
+        id: "user@example.com",
+        timestamp: 1_000,
+        comment: MARKER,
+      });
+      // Ids that are no ids can be any text.
+      await langfuse.score(ctx, {
+        name: "rating",
+        value: 5,
+        trace: { traceId: `trace ${MARKER}` },
+        id: MARKER.repeat(20),
+        timestamp: 1_000,
+      });
+      await langfuse.deleteScore(ctx, { id: MARKER.repeat(20) });
+    });
+
+    expect(consoleError.mock.calls).toEqual([
+      [
+        "[convex-langfuse] invalid_score",
+        { traceId: await traceIdFromSeed(MARKER) },
+      ],
+      ["[convex-langfuse] invalid_id", { traceId: "" }],
+      ["[convex-langfuse] invalid_score", { traceId: "" }],
+    ]);
+    const logged = JSON.stringify([consoleError.mock.calls, consoleLines]);
+    expect(logged).not.toContain(MARKER);
+    expect(logged).not.toContain("user@example.com");
+    expect((await tables(t)).outbox).toHaveLength(0);
+  });
+
+  test("a comment with a lone surrogate arrives with U+FFFD in its place", async () => {
+    const t = createTest();
+    await inMutation(t, (ctx) =>
+      scoring().score(ctx, {
+        name: "helpful",
+        value: true,
+        trace: { seed: "chat" },
+        comment: "cut 😀".slice(0, -1),
+      }),
+    );
+    expect(loggedCodes()).toEqual([]);
+    expect(await scoreBodies(t)).toMatchObject([{ comment: "cut �" }]);
+  });
+
+  test("a name, an id, a categorical value and a deleted id with a lone surrogate are refused before the component call", async () => {
+    const t = createTest();
+    const calls: unknown[] = [];
+    const lone = "cut 😀".slice(0, -1);
+    await inMutation(t, async (ctx) => {
+      const langfuse = client({ content: "full" });
+      const trace = { seed: "chat" };
+      await langfuse.score(counting(ctx, calls), {
+        name: lone,
+        value: 1,
+        trace,
+      });
+      await langfuse.score(counting(ctx, calls), {
+        name: "rating",
+        value: 1,
+        trace,
+        id: lone,
+        timestamp: 1_000,
+      });
+      await langfuse.score(counting(ctx, calls), {
+        name: "tone",
+        value: lone,
+        trace,
+      });
+      await langfuse.deleteScore(counting(ctx, calls), { id: lone });
+    });
+    expect(loggedCodes()).toEqual([
+      "invalid_score",
+      "invalid_score",
+      "invalid_score",
+      "invalid_score",
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  test("syncScoreConfigs refuses a category label with a lone surrogate", async () => {
+    const fake = installFakeLangfuse();
+    const t = createTest();
+    const langfuse = new Langfuse(app.components.convexLangfuse, {
+      content: "full",
+      scores: defineScores({
+        tone: {
+          dataType: "CATEGORICAL",
+          categories: ["ok", "cut 😀".slice(0, -1)],
+        },
+      }),
+    });
+    expect(
+      await refusalCode(t.action((ctx) => langfuse.syncScoreConfigs(ctx))),
+    ).toBe("invalid_score_definitions");
+    expect(fake.requests).toEqual([]);
+  });
+
+  test("a bad default environment refuses a score, which logs invalid_environment", async () => {
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "Production");
+    const t = createTest();
+    await inMutation(t, (ctx) =>
+      scoring().score(ctx, {
+        name: "helpful",
+        value: true,
+        trace: { seed: "chat" },
+      }),
+    );
+    expect(loggedCodes()).toEqual(["invalid_environment"]);
+    expect((await tables(t)).outbox).toEqual([]);
+  });
+
+  test("a synced config id is attached while the definition is unchanged, not after its range or categories changed, and again after the next sync", async () => {
+    const fake = installFakeLangfuse();
+    serveConfigs(fake, []);
+    const t = createTest();
+    const withScores = (scores: ScoreDefinitions) =>
+      new Langfuse(app.components.convexLangfuse, { content: "full", scores });
+    const current = withScores(SCORES);
+    const range = withScores({
+      ...SCORES,
+      rating: { dataType: "NUMERIC", min: 0, max: 10 },
+    });
+    const categories = withScores({
+      ...SCORES,
+      tone: { dataType: "CATEGORICAL", categories: ["formal", "neutral"] },
+    });
+    const trace = { seed: "chat" };
+
+    // helpful, rating and tone get created-1, created-2 and created-3.
+    await t.action((ctx) => current.syncScoreConfigs(ctx));
+    await inMutation(t, async (ctx) => {
+      await current.score(ctx, { name: "rating", value: 3, trace });
+      await current.score(ctx, { name: "tone", value: "formal", trace });
+      await range.score(ctx, { name: "rating", value: 3, trace });
+      await categories.score(ctx, { name: "tone", value: "formal", trace });
+    });
+    // The changed range gets a config of its own, created-4.
+    await t.action((ctx) => range.syncScoreConfigs(ctx));
+    await inMutation(t, (ctx) =>
+      range.score(ctx, { name: "rating", value: 3, trace }),
+    );
+
+    expect((await scoreBodies(t)).map((body) => body.configId)).toEqual([
+      "created-2",
+      "created-3",
+      undefined,
+      undefined,
+      "created-4",
+    ]);
+  });
+
+  test("a score of exactly the row limit is enqueued with a 40-character default environment and a config id, and one byte more is refused by the client", async () => {
+    const environment = "e".repeat(40);
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", environment);
+    const fake = installFakeLangfuse();
+    serveConfigs(fake, []);
+    const t = createTest();
+    const langfuse = scoring({ maxFieldBytes: MAX_ROW_BYTES });
+    await t.action((ctx) => langfuse.syncScoreConfigs(ctx));
+    const traceId = await traceIdFromSeed("chat");
+    const timestamp = Date.parse("2026-11-11T11:00:00.000Z");
+    const base = scoreBytes({
+      id: "score-1",
+      timestamp,
+      name: "helpful",
+      value: 1,
+      dataType: "BOOLEAN",
+      traceId,
+      comment: "",
+    });
+    const calls: unknown[] = [];
+    await inMutation(t, async (ctx) => {
+      for (const [id, bytes] of [
+        ["score-1", MAX_ROW_BYTES],
+        ["score-2", MAX_ROW_BYTES + 1],
+      ] as const) {
+        await langfuse.score(counting(ctx, calls), {
+          name: "helpful",
+          value: true,
+          trace: { traceId },
+          id,
+          timestamp,
+          comment: "x".repeat(bytes - base),
+        });
+      }
+    });
+    expect(loggedCodes()).toEqual(["score_too_large"]);
+    expect(calls).toHaveLength(1);
+    expect(await scoreBodies(t)).toMatchObject([
+      { id: "score-1", environment, configId: expect.any(String) },
+    ]);
+  });
+
+  test("deleteScore enqueues a deletion of the id", async () => {
+    const fake = installFakeLangfuse();
+    const t = createTest();
+    await inMutation(t, (ctx) => scoring().deleteScore(ctx, { id: "score/1" }));
+    await drive(t, fake);
+    expect(fake.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "DELETE /api/public/scores/score%2F1",
+    ]);
+  });
+});
+
+describe("deleteTraces", () => {
+  const hexTraceId = (n: number) => (n + 1).toString(16).padStart(32, "0");
+
+  test("sends the ids as one DELETE /api/public/traces", async () => {
+    const fake = installFakeLangfuse();
+    const t = createTest();
+    const other = hexTraceId(7);
+    expect(
+      await inMutation(t, (ctx) =>
+        client({ content: "full" }).deleteTraces(ctx, {
+          traces: [{ seed: "chat" }, { traceId: other }],
+        }),
+      ),
+    ).toEqual({ enqueued: true });
+    await drive(t, fake);
+    expect(fake.requests).toHaveLength(1);
+    expect(`${fake.requests[0]!.method} ${fake.requests[0]!.path}`).toBe(
+      "DELETE /api/public/traces",
+    );
+    expect(JSON.parse(fake.requests[0]!.body)).toEqual({
+      traceIds: [await traceIdFromSeed("chat"), other],
+    });
+  });
+
+  test("splits 250 ids into 3 requests in order", async () => {
+    const fake = installFakeLangfuse();
+    const t = createTest();
+    const ids = Array.from({ length: 250 }, (_, i) => hexTraceId(i));
+    await inMutation(t, (ctx) =>
+      client({ content: "full" }).deleteTraces(ctx, {
+        traces: ids.map((traceId) => ({ traceId })),
+      }),
+    );
+    await drive(t, fake);
+    const sent = fake.requests.map(
+      (r) => (JSON.parse(r.body) as { traceIds: string[] }).traceIds,
+    );
+    expect(sent.map((chunk) => chunk.length)).toEqual([100, 100, 50]);
+    expect(sent.flat()).toEqual(ids);
+  });
+
+  test('throws when the component call fails, also with onError: "log"', async () => {
+    const t = createTest();
+    await expect(
+      inMutation(t, () =>
+        client({ content: "full", onError: "log" }).deleteTraces(
+          {
+            runMutation: async () => {
+              throw new Error("component failed");
+            },
+          },
+          { traces: [{ seed: "chat" }] },
+        ),
+      ),
+    ).rejects.toThrow("component failed");
+  });
+
+  test("returns enqueued: false on a disabled component", async () => {
+    vi.stubEnv("LANGFUSE_BASE_URL", "");
+    const t = createTest();
+    expect(
+      await inMutation(t, (ctx) =>
+        client({ content: "full" }).deleteTraces(ctx, {
+          traces: [{ seed: "chat" }],
+        }),
+      ),
+    ).toEqual({ enqueued: false, reason: "disabled" });
+    expect((await tables(t)).outbox).toEqual([]);
+  });
 });

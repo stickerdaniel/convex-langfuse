@@ -21,3 +21,9 @@ export function exportConfig(): ExportConfig | null {
   if (!publicKey || !secretKey || !baseUrl) return null;
   return { publicKey, secretKey, baseUrl };
 }
+
+/** The `Authorization` header value for the key pair. */
+export function basicAuth({ publicKey, secretKey }: ExportConfig): string {
+  const bytes = new TextEncoder().encode(`${publicKey}:${secretKey}`);
+  return `Basic ${btoa(String.fromCharCode(...bytes))}`;
+}

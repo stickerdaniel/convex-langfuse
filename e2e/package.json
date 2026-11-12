@@ -1,0 +1,10 @@
+{
+  "name": "convex-langfuse-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Host app for the end-to-end scripts against a Langfuse instance. The scripts link `convex-langfuse` to the repository root.",
+  "dependencies": {
+    "convex": "1.49.0",
+    "convex-langfuse": "file:.."
+  }
+}

@@ -3,7 +3,7 @@ import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { expectTypeOf, test } from "vitest";
 import componentTest from "../test.js";
-import { Langfuse, type Recorded } from "./index.js";
+import { defineScores, Langfuse, type Recorded } from "./index.js";
 
 // An app with a table of its own: its ctx types carry a concrete data model.
 const app = defineTestApp({
@@ -32,6 +32,72 @@ test("a trace is named by a seed or an id, an observation by a key or an id", ()
       const trace = langfuse.trace({ seed: "s" });
       // @ts-expect-error not both
       await trace.span(ctx, { key: "k", id: "i", name: "n" });
+    },
+  });
+});
+
+test("a defined score takes only values of its type", () => {
+  const langfuse = new Langfuse(component, {
+    content: "full",
+    scores: defineScores({
+      helpful: { dataType: "BOOLEAN" },
+      rating: { dataType: "NUMERIC", min: 1, max: 5 },
+      tone: { dataType: "CATEGORICAL", categories: ["formal", "casual"] },
+    }),
+  });
+  const trace = { seed: "s" };
+  app.mutation({
+    args: {},
+    handler: async (ctx) => {
+      await langfuse.score(ctx, { name: "helpful", value: true, trace });
+      await langfuse.score(ctx, { name: "rating", value: 4, trace });
+      await langfuse.score(ctx, { name: "tone", value: "casual", trace });
+      // @ts-expect-error a boolean score takes a boolean
+      await langfuse.score(ctx, { name: "helpful", value: 1, trace });
+      // @ts-expect-error a numeric score takes a number
+      await langfuse.score(ctx, { name: "rating", value: "4", trace });
+      // @ts-expect-error a categorical score takes one of its categories
+      await langfuse.score(ctx, { name: "tone", value: "rude", trace });
+      // @ts-expect-error only defined names
+      await langfuse.score(ctx, { name: "unknown", value: 1, trace });
+      expectTypeOf(
+        await langfuse.score(ctx, {
+          name: "rating",
+          value: 4,
+          trace,
+          id: "id",
+          timestamp: 1,
+        }),
+      ).toEqualTypeOf<{ scoreId: string }>();
+      // @ts-expect-error an id requires a timestamp
+      await langfuse.score(ctx, { name: "rating", value: 4, trace, id: "id" });
+    },
+  });
+});
+
+test("without definitions a score takes any name and a boolean, number or string", () => {
+  const langfuse = new Langfuse(component, { content: "full" });
+  app.mutation({
+    args: {},
+    handler: async (ctx) => {
+      await langfuse.score(ctx, {
+        name: "a",
+        value: true,
+        trace: { seed: "s" },
+      });
+      await langfuse.score(ctx, {
+        name: "b",
+        value: "x",
+        trace: { traceId: "t" },
+      });
+      // @ts-expect-error not an object
+      await langfuse.score(ctx, { name: "c", value: {}, trace: { seed: "s" } });
+    },
+  });
+  app.action({
+    args: {},
+    handler: async (ctx) => {
+      await langfuse.syncScoreConfigs(ctx);
     },
   });
 });
