@@ -26,7 +26,8 @@ at the pinned release:
 npm run test:integration
 
 # Load, outage, backlog threshold and prompt refresh drivers, about 70 minutes.
-# They measure latency and rates, so they need an otherwise idle machine.
+# They measure latency and rates, so they need an otherwise idle machine. The
+# "Load drivers" workflow runs each on a hosted runner when started by hand.
 npm run test:load
 
 # One driver: load, outage, threshold, threshold --kill or prompts.
