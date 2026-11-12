@@ -290,11 +290,15 @@ export async function startFake() {
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
     },
-    /** Makes the fake answer each prompt by name after `ms`; 0 ends it. */
-    async holdPrompts(ms) {
+    /**
+     * Makes the fake answer each prompt by name after a random time up to
+     * `ms`, and each listing of one name, the first request of a refresh,
+     * after a random time up to `listingMs`. 0 answers at once again.
+     */
+    async holdPrompts(ms, listingMs = 0) {
       const response = await fetch(`${url}/control/prompt-hold`, {
         method: "POST",
-        body: JSON.stringify({ ms }),
+        body: JSON.stringify({ ms, listingMs }),
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
     },

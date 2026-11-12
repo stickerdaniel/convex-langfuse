@@ -99,8 +99,17 @@ const observations = new Map();
 const prompts = new Map();
 /** Where created prompt versions are posted, or `null`. */
 let webhook = null;
-/** A prompt by name is answered after this many milliseconds. */
+/**
+ * A prompt by name and the listing of one name are answered after a random
+ * time up to this many milliseconds each, so the answers of refreshes that
+ * run side by side do not arrive in step.
+ */
 let promptHoldMs = 0;
+let listingHoldMs = 0;
+let holdDraw = mulberry32(1);
+/** Waits a random time up to `maxMs`. */
+const holdUpTo = (maxMs) =>
+  new Promise((resolve) => setTimeout(resolve, holdDraw() * maxMs));
 
 /** A pseudo-random generator: the same seed gives the same sequence. */
 function mulberry32(seed) {
@@ -514,6 +523,7 @@ async function publicApi(req, res, url) {
     }));
     const totalPages = Math.ceil(names.length / limit);
     const meta = { page, limit, totalPages, totalItems: names.length };
+    if (name !== null && listingHoldMs > 0) await holdUpTo(listingHoldMs);
     // 4.78.0 repeats `meta` as `pagination` for older clients.
     return json(res, 200, { data, meta, pagination: meta });
   }
@@ -537,9 +547,7 @@ async function publicApi(req, res, url) {
           : item.version === Number(version),
       );
     if (!entry) return json(res, 404, { message: "Prompt not found" });
-    if (promptHoldMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, promptHoldMs));
-    }
+    if (promptHoldMs > 0) await holdUpTo(promptHoldMs);
     return json(res, 200, {
       ...promptBody(name, entry),
       isActive: entry.labels.includes("production"),
@@ -669,7 +677,10 @@ const server = createServer(async (req, res) => {
       return json(res, 200, {});
     }
     if (req.method === "POST" && url.pathname === "/control/prompt-hold") {
-      promptHoldMs = JSON.parse(await readBody(req)).ms;
+      const hold = JSON.parse(await readBody(req));
+      promptHoldMs = hold.ms;
+      listingHoldMs = hold.listingMs;
+      holdDraw = mulberry32(1);
       return json(res, 200, {});
     }
     if (req.method === "POST" && url.pathname === "/control") {
