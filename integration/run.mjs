@@ -9,6 +9,7 @@
 // and runs the cases against the fake endpoint in `fake-langfuse.mjs`. Prints a result table and exits non-zero
 // when a case fails. Every process it starts is stopped before it exits.
 
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -672,6 +673,99 @@ async function main() {
     await runCase("8 node action at twice the split budget", () =>
       recordFromNode(8, 60, 2 * CLIENT_CALL_BYTES),
     );
+
+    await runCase("9 prompt webhook under httpPrefix", async () => {
+      const name = "integration/greeting";
+      const secret = `lf-whsec_${randomBytes(32).toString("hex")}`;
+      await convex(backend, ["env", "set", "LANGFUSE_WEBHOOK_SECRET", secret]);
+      const url = `${backend.siteUrl}/langfuse/prompt-webhook`;
+      const post = (body, signature) =>
+        fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(signature ? { "x-langfuse-signature": signature } : {}),
+          },
+          body,
+        });
+      // Signed as `generateWebhookSignature` in Langfuse's `signature.ts`.
+      const sign = (body) => {
+        const t = Math.floor(Date.now() / 1_000);
+        const hex = createHmac("sha256", secret)
+          .update(`${t}.${body}`, "utf8")
+          .digest("hex");
+        return `t=${t},v1=${hex}`;
+      };
+      const event = (version) =>
+        JSON.stringify({
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          type: "prompt-version",
+          apiVersion: "v1",
+          action: version === 1 ? "created" : "updated",
+          prompt: { name, version, labels: ["production"] },
+        });
+      // The route answers 404 until the component sees the secret.
+      const deliver = async (version) => {
+        const body = event(version);
+        const response = await waitFor(
+          "a signed delivery to be answered",
+          async () => {
+            const response = await post(body, sign(body));
+            return response.status !== 404 && response;
+          },
+          30_000,
+        );
+        const text = await response.text();
+        if (response.status !== 200 || text !== "") {
+          throw new Error(
+            `signed delivery answered ${response.status} with ${text.length} bytes`,
+          );
+        }
+      };
+      const cached = (version) =>
+        waitFor(
+          `version ${version} in the cache`,
+          async () => {
+            const prompt = await client.query(api.prompt, { name });
+            return prompt?.version === version && prompt;
+          },
+          30_000,
+        );
+
+      await fake.addPrompt({
+        name,
+        prompt: "Hello v1",
+        labels: ["production"],
+      });
+      await deliver(1);
+      const first = await cached(1);
+      const body = event(1);
+      const unsigned = await post(body);
+      const zeros = `t=${Math.floor(Date.now() / 1_000)},v1=${"0".repeat(64)}`;
+      const wrong = await post(body, zeros);
+      if (unsigned.status !== 401 || wrong.status !== 401) {
+        throw new Error(
+          `unsigned ${unsigned.status}, wrongly signed ${wrong.status}`,
+        );
+      }
+
+      await fake.addPrompt({
+        name,
+        prompt: "Hello v2",
+        labels: ["production"],
+      });
+      await deliver(2);
+      const second = await cached(2);
+      if (first.text !== "Hello v1" || second.text !== "Hello v2") {
+        throw new Error(`cached ${first.text} and ${second.text}`);
+      }
+      const fetched = (await fake.stats()).api["GET /v2/prompts/{name}"] ?? 0;
+      return (
+        `signed deliveries 200 with an empty body, unsigned and wrongly ` +
+        `signed 401; versions 1 and 2 cached after ${fetched} prompt fetches`
+      );
+    });
 
     const diverging = divergent(await fake.stats());
     results.push({

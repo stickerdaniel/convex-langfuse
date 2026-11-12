@@ -52,6 +52,24 @@ export const enabled = query({
   handler: async (ctx) => (await strict.health(ctx)).enabled,
 });
 
+/** The cached `production` prompt of `name`, as the client decodes it. */
+export const prompt = query({
+  args: { name: v.string() },
+  returns: v.union(
+    v.null(),
+    v.object({ version: v.optional(v.number()), text: v.string() }),
+  ),
+  handler: async (ctx, { name }) => {
+    const cached = await strict.prompts.get(ctx, { name });
+    if (!cached) return null;
+    return {
+      version: cached.version,
+      text:
+        cached.type === "text" ? cached.prompt : JSON.stringify(cached.prompt),
+    };
+  },
+});
+
 /** Admission gate and backlog, as the component reports them. */
 export const backlog = query({
   args: {},

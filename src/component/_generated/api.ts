@@ -11,7 +11,9 @@
 import type * as constants from "../constants.js";
 import type * as crons from "../crons.js";
 import type * as exporter from "../exporter.js";
+import type * as http from "../http.js";
 import type * as outbox from "../outbox.js";
+import type * as prompts from "../prompts.js";
 import type * as retention from "../retention.js";
 import type * as scoreKeys from "../scoreKeys.js";
 import type * as scores from "../scores.js";
@@ -30,7 +32,9 @@ const fullApi: ApiFromModules<{
   constants: typeof constants;
   crons: typeof crons;
   exporter: typeof exporter;
+  http: typeof http;
   outbox: typeof outbox;
+  prompts: typeof prompts;
   retention: typeof retention;
   scoreKeys: typeof scoreKeys;
   scores: typeof scores;

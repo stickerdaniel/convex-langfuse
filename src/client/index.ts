@@ -33,7 +33,7 @@ import type {
   Level,
   Observation,
   ObservationType,
-  Prompt,
+  Prompt as PromptLink,
   TraceContext,
 } from "../shared/validators.js";
 
@@ -121,6 +121,146 @@ export type ScoreInit<S extends ScoreDefinitions | undefined = undefined> =
 export type SyncResult = FunctionReturnType<
   ComponentApi["scores"]["syncConfigs"]
 >;
+
+/** A chat message as the Langfuse SDKs model it: a message or a placeholder. */
+export type ChatMessage =
+  | { role: string; content: string }
+  | { type: "placeholder"; name: string };
+
+/**
+ * A cached prompt. `version` is absent for a fallback. `source` tells where
+ * the bytes came from: link an observation to the prompt (`prompt: { name,
+ * version }`) only when it is `"langfuse"`. `snapshotId` names the immutable
+ * snapshot, so equal ids mean equal bytes.
+ */
+export type Prompt = {
+  name: string;
+  version?: number;
+  source: "langfuse" | "fallback";
+  snapshotId: string;
+  /** The prompt's config, parsed from JSON. */
+  config: unknown;
+} & (
+  | { type: "text"; prompt: string }
+  | { type: "chat"; prompt: ChatMessage[] }
+);
+
+/** What `prompts.pin` stores and pins when the cache holds no prompt. */
+export type PromptFallback =
+  | { type: "text"; prompt: string; config?: Record<string, unknown> }
+  | { type: "chat"; prompt: ChatMessage[]; config?: Record<string, unknown> };
+
+/** A prompt name with a label (default `production`) or a version, not both. */
+export type PromptSelector = { name: string } & (
+  | { label?: string; version?: never }
+  | { version: number; label?: never }
+);
+
+/** The result of `prompts.sync`, as the component returns it. */
+export type PromptSyncResult = FunctionReturnType<
+  ComponentApi["prompts"]["sync"]
+>;
+
+/**
+ * The component's prompt cache. It holds what Langfuse served, refreshed by
+ * the signed webhook and at least every 15 minutes, and never fetches on a
+ * read. Template compilation is not part of the component: compile `prompt`
+ * with the variables of the call site.
+ */
+export interface Prompts {
+  /**
+   * The cached prompt for a label (default `production`) or a version, or
+   * `null` on a miss. From a query, it is reactive: the query reruns when a
+   * refresh moves the label. Throws on a label and a version together.
+   */
+  get(ctx: RunQueryCtx, selector: PromptSelector): Promise<Prompt | null>;
+  /**
+   * The prompt a scope, such as a conversation, uses for a name. The first
+   * call resolves like `get`, stores `fallback` on a miss, and pins the
+   * result for `ttlMs` (default 7 days); every later call for the scope and
+   * name returns the same bytes until the pin expires, whatever its label,
+   * version or fallback. Returns `null` on a miss without a fallback. Runs
+   * in the caller's transaction.
+   */
+  pin(
+    ctx: RunMutationCtx,
+    args: PromptSelector & {
+      scope: string;
+      fallback?: PromptFallback;
+      ttlMs?: number;
+    },
+  ): Promise<Prompt | null>;
+  /**
+   * Turns the cache on and schedules refreshes: for `names`, or for every
+   * prompt of the project. Run it from an action after deploying; the
+   * refreshes apply in the background within seconds. Without it or a
+   * webhook delivery, the cache stays empty.
+   */
+  sync(
+    ctx: RunActionCtx,
+    args?: { names?: string[] },
+  ): Promise<PromptSyncResult>;
+}
+
+type StoredPrompt = NonNullable<
+  FunctionReturnType<ComponentApi["prompts"]["get"]>
+>;
+
+/** A prompt as the component stores it, with its JSON parsed. */
+function decodePrompt(stored: StoredPrompt): Prompt {
+  const { name, version, source, snapshotId } = stored;
+  const base = {
+    name,
+    ...(version === undefined ? {} : { version }),
+    source,
+    snapshotId,
+    config: JSON.parse(stored.config) as unknown,
+  };
+  return stored.type === "chat"
+    ? {
+        ...base,
+        type: "chat",
+        prompt: JSON.parse(stored.prompt) as ChatMessage[],
+      }
+    : { ...base, type: "text", prompt: stored.prompt };
+}
+
+function promptsOf(component: ComponentApi): Prompts {
+  return {
+    async get(ctx, { name, label, version }) {
+      const stored = await ctx.runQuery(component.prompts.get, {
+        name,
+        label,
+        version,
+      });
+      return stored && decodePrompt(stored);
+    },
+    async pin(ctx, { scope, name, label, version, fallback, ttlMs }) {
+      const stored = await ctx.runMutation(component.prompts.pin, {
+        scope,
+        name,
+        label,
+        version,
+        ttlMs,
+        fallback: fallback && {
+          type: fallback.type,
+          prompt:
+            fallback.type === "chat"
+              ? JSON.stringify(fallback.prompt)
+              : fallback.prompt,
+          config:
+            fallback.config === undefined
+              ? undefined
+              : JSON.stringify(fallback.config),
+        },
+      });
+      return stored && decodePrompt(stored);
+    },
+    async sync(ctx, args = {}) {
+      return await ctx.runAction(component.prompts.sync, args);
+    },
+  };
+}
 
 /** An observation named by a key, hashed together with the trace id, or by its id. */
 export type ObservationRef =
@@ -564,10 +704,13 @@ export class Langfuse<
   readonly #options: LangfuseOptions<S>;
   /** `definitionFingerprint` per defined score name, computed once. */
   readonly #fingerprints = new Map<string, Promise<string>>();
+  /** The prompt cache: `get`, `pin` and `sync`. */
+  readonly prompts: Prompts;
 
   constructor(component: ComponentApi, options: LangfuseOptions<S>) {
     this.#component = component;
     this.#options = options;
+    this.prompts = promptsOf(component);
   }
 
   /**
@@ -1029,7 +1172,7 @@ export class Langfuse<
     const exported = cost.kept && costDetails(cost.kept) !== undefined;
     if (cost.invalid || (cost.kept && !exported)) problems.add("invalid_cost");
     // Only a generation exports its prompt link, and only a complete one.
-    let link: Prompt | undefined;
+    let link: PromptLink | undefined;
     if (observation.type === "generation" && observation.prompt !== undefined) {
       link = promptLink(observation.prompt);
       if (!link) problems.add("invalid_prompt");

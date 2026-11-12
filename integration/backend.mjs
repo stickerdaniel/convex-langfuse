@@ -123,6 +123,11 @@ export class Backend {
     return `http://127.0.0.1:${this.port}`;
   }
 
+  /** Where HTTP actions are served. */
+  get siteUrl() {
+    return `http://127.0.0.1:${this.sitePort}`;
+  }
+
   async init() {
     this.port = await freePort();
     this.sitePort = await freePort();
@@ -230,6 +235,14 @@ export async function startFake() {
       const response = await fetch(`${url}/control`, {
         method: "POST",
         body: JSON.stringify(mode),
+      });
+      if (!response.ok) throw new Error("fake endpoint control failed");
+    },
+    /** Adds the next text version of a prompt with `labels`. */
+    async addPrompt(prompt) {
+      const response = await fetch(`${url}/control/prompts`, {
+        method: "POST",
+        body: JSON.stringify(prompt),
       });
       if (!response.ok) throw new Error("fake endpoint control failed");
     },

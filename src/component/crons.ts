@@ -10,5 +10,6 @@ crons.interval(
   internal.scores.resyncTick,
   {},
 );
+crons.interval("prompt refresh", { minutes: 5 }, internal.prompts.tick, {});
 
 export default crons;

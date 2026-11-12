@@ -20,6 +20,12 @@ export const vScoreDataType = v.union(
   v.literal("CATEGORICAL"),
 );
 
+export const vPromptType = v.union(v.literal("text"), v.literal("chat"));
+export const vPromptSource = v.union(
+  v.literal("langfuse"),
+  v.literal("fallback"),
+);
+
 export default defineSchema({
   // Pending exports. The payload lives in its own table, so claims and
   // retention read only these small rows. Every deletion of an `outbox` or
@@ -167,5 +173,79 @@ export default defineSchema({
     /** JSON of the definitions of the last sync call, for the hourly resync. */
     definitions: v.string(),
     lastResult: v.optional(v.union(v.literal("ok"), v.literal("incomplete"))),
+  }),
+
+  /**
+   * One resolved prompt with its provenance, immutable once written. Equal
+   * content from another version, another source or another resolution
+   * graph is another snapshot; the same result again reuses the row.
+   */
+  promptSnapshots: defineTable({
+    /**
+     * SHA-256 hex of the JSON array `[name, source, version ?? null, type,
+     * prompt, config, resolutionGraph ?? null]`.
+     */
+    key: v.string(),
+    name: v.string(),
+    /** Absent for a fallback snapshot. */
+    version: v.optional(v.number()),
+    source: vPromptSource,
+    type: vPromptType,
+    /** The text, or canonical JSON of the chat message array. */
+    prompt: v.string(),
+    /** Canonical JSON. */
+    config: v.string(),
+    /** Canonical JSON: object keys sorted, dependency lists sorted. */
+    resolutionGraph: v.optional(v.string()),
+    fetchedAt: v.number(),
+  })
+    .index("by_key", ["key"])
+    .index("by_name_version", ["name", "version"])
+    .index("by_fetchedAt", ["fetchedAt"]),
+
+  /** The snapshot a label of a prompt name resolves to, from the last refresh. */
+  promptLabels: defineTable({
+    name: v.string(),
+    label: v.string(),
+    snapshotId: v.id("promptSnapshots"),
+  })
+    .index("by_name_label", ["name", "label"])
+    .index("by_snapshot", ["snapshotId"]),
+
+  /** A tracked prompt name and its refresh fence. */
+  promptNames: defineTable({
+    name: v.string(),
+    /** Fences refreshes: only the refresh with the current generation applies. */
+    generation: v.number(),
+    /** Every other prompt name in the resolution graphs of its labels. */
+    dependsOn: v.array(v.string()),
+    /** Last time a refresh was reserved. */
+    attemptedAt: v.number(),
+    /** Last time a refresh was applied. */
+    refreshedAt: v.optional(v.number()),
+    /** Fixed code of the last refresh's first failure. */
+    error: v.optional(v.string()),
+  })
+    .index("by_name", ["name"])
+    .index("by_attemptedAt", ["attemptedAt"]),
+
+  /** The snapshot a scope uses for a prompt name until `expiresAt`. */
+  promptPins: defineTable({
+    scope: v.string(),
+    name: v.string(),
+    snapshotId: v.id("promptSnapshots"),
+    expiresAt: v.number(),
+  })
+    .index("by_scope_name", ["scope", "name"])
+    .index("by_expiresAt", ["expiresAt"])
+    .index("by_snapshot", ["snapshotId"]),
+
+  /**
+   * Singleton, created by the first `prompts.sync` or webhook. Without it the
+   * refresh tick does nothing.
+   */
+  promptSync: defineTable({
+    lastListAt: v.optional(v.number()),
+    lastWebhookAt: v.optional(v.number()),
   }),
 });
