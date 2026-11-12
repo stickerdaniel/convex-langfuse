@@ -140,6 +140,15 @@ export const sweep = internalMutation({
       }
     }
 
+    // The prompt rows read here besides snapshots count against no budget;
+    // their size bounds keep them small. This run reads at most
+    // `RETENTION_BATCH` expired pins and, per snapshot of the page, one
+    // label, one pin, one version pointer and its name's row. A pin holds a
+    // scope (`MAX_PROMPT_SCOPE_BYTES`) and a name (`MAX_PROMPT_NAME_BYTES`)
+    // of 256 bytes each; a label row a name and a label, which Langfuse
+    // limits to 36 characters; a version pointer a name; a name row at most
+    // about 10 KiB. With the deletions of pins and pointers, that is below
+    // 3 MiB, within the half of 16 MiB that `RETENTION_BATCH_BYTES` leaves.
     const expiredPins = await deleteExpiredPins(ctx, now);
     // Snapshot collection spends what the payloads left of the budget. Once
     // they spent it, collection waits for the next run.

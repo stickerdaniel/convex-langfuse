@@ -17,6 +17,7 @@ import {
   MAX_CALL_RECORDS,
   MAX_DELETE_IDS,
   MAX_DETAIL_KEYS,
+  MAX_PROMPT_SCOPE_BYTES,
   MAX_ROW_BYTES,
   MAX_SCORE_ID_BYTES,
   MAX_TAGS,
@@ -170,15 +171,18 @@ export type PromptSyncResult = FunctionReturnType<
  * old, plus 99.8 s. Template compilation is not part of the component:
  * compile `prompt` with the variables of the call site.
  *
- * A name, label or scope with a lone surrogate is refused with a
- * `ConvexError` before the component call: `invalid_prompt_name`,
- * `invalid_prompt_selector` or `invalid_prompt_scope`.
+ * A name, label or scope with a lone surrogate, and a scope over 256 UTF-8
+ * bytes, are refused with a `ConvexError` before the component call:
+ * `invalid_prompt_name`, `invalid_prompt_selector` or `invalid_prompt_scope`.
  */
 export interface Prompts {
   /**
    * The cached prompt for a label (default `production`) or a version, or
-   * `null` on a miss. From a query, it is reactive: the query reruns when a
-   * refresh moves the label. Throws on a label and a version together.
+   * `null` on a miss. A version is served as the last refresh resolved it,
+   * while a label or a pin still holds that snapshot; a pin on an older
+   * resolution of the version does not keep the version readable. From a
+   * query, it is reactive: the query reruns when a refresh moves the label.
+   * Throws on a label and a version together.
    */
   get(ctx: RunQueryCtx, selector: PromptSelector): Promise<Prompt | null>;
   /**
@@ -187,8 +191,8 @@ export interface Prompts {
    * result for `ttlMs` (default 7 days); every later call for the scope and
    * name returns the same bytes until the pin expires, whatever its label,
    * version or fallback. Returns `null` on a miss without a fallback. Runs
-   * in the caller's transaction. A lone surrogate in the fallback's text or
-   * config is stored as U+FFFD.
+   * in the caller's transaction. A scope has at most 256 UTF-8 bytes. A lone
+   * surrogate in the fallback's text or config is stored as U+FFFD.
    */
   pin(
     ctx: RunMutationCtx,
@@ -201,10 +205,10 @@ export interface Prompts {
   /**
    * Turns the cache on and schedules refreshes: for `names`, or for every
    * prompt of the project. Run it from an action after deploying; the
-   * refreshes apply in the background within seconds. Without it or a
-   * webhook delivery, the cache stays empty. A listing that stops at its
-   * page cap of 50 pages returns `incomplete`. A name has 1 to 256 UTF-8
-   * bytes; `invalid_prompt_name` refuses another.
+   * refreshes run in the background. Without it or a webhook delivery, the
+   * cache stays empty. A listing that stops at its page cap of 50 pages
+   * returns `incomplete`. A name has 1 to 256 UTF-8 bytes;
+   * `invalid_prompt_name` refuses another.
    */
   sync(
     ctx: RunActionCtx,
@@ -238,7 +242,8 @@ function decodePrompt(stored: StoredPrompt): Prompt {
 /**
  * Refuses a name, label or scope with a lone surrogate before the component
  * call, which Convex would refuse: a replaced character would name another
- * prompt or scope.
+ * prompt or scope. Refuses a scope over `MAX_PROMPT_SCOPE_BYTES` too, as the
+ * component does.
  */
 function checkPromptArgs({
   name,
@@ -253,7 +258,10 @@ function checkPromptArgs({
   if (label !== undefined && hasLoneSurrogate(label)) {
     throw new ConvexError("invalid_prompt_selector");
   }
-  if (scope !== undefined && hasLoneSurrogate(scope)) {
+  if (
+    scope !== undefined &&
+    (hasLoneSurrogate(scope) || byteLength(scope) > MAX_PROMPT_SCOPE_BYTES)
+  ) {
     throw new ConvexError("invalid_prompt_scope");
   }
 }

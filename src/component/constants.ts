@@ -10,6 +10,7 @@ export {
   MAX_CALL_BYTES,
   MAX_CALL_RECORDS,
   MAX_DELETE_IDS,
+  MAX_PROMPT_SCOPE_BYTES,
   MAX_ROW_BYTES,
   MAX_SCORE_ID_BYTES,
 } from "../shared/limits.js";
@@ -131,8 +132,9 @@ export const PROMPT_REFRESH_INTERVAL_MS = 13 * MINUTE;
 export const PROMPT_REFRESH_SPACING_MS = 200;
 /**
  * Longest a refresh action can run: the action timeout of the Convex
- * backend (`V8_ACTION_USER_TIMEOUT`). Until then, a reserved refresh that
- * has not published counts as running.
+ * backend (`V8_ACTION_USER_TIMEOUT`). The snapshots a refresh staged stay
+ * protected from collection this long after its first `store`, which runs
+ * inside the action, so the protection outlasts the action.
  */
 export const PROMPT_REFRESH_MAX_MS = 30 * MINUTE;
 /** The tick lists the project's prompts again once the last listing is this old. */
@@ -145,8 +147,9 @@ export const PROMPT_PAGE_LIMIT = 100;
 export const MAX_PROMPT_NAMES = 500;
 /**
  * UTF-8 bytes of a tracked prompt name and of a name in `dependsOn`. With
- * `MAX_PROMPT_DEPENDENCIES`, a `promptNames` row has at most about 9 KiB, so
- * the tick and the webhook can read all `MAX_PROMPT_NAMES` rows.
+ * `MAX_PROMPT_DEPENDENCIES` and the `MAX_PROMPT_LABELS` staged snapshot
+ * ids, a `promptNames` row has at most about 10 KiB, so the tick and the
+ * webhook can read all `MAX_PROMPT_NAMES` rows.
  */
 export const MAX_PROMPT_NAME_BYTES = 256;
 /** Names in the `dependsOn` of one tracked name. */
@@ -157,6 +160,18 @@ export const MAX_PROMPT_LABELS = 50;
 export const PROMPT_STEP_LABELS = 4;
 /** Summed UTF-8 bytes of prompt, config and resolution graph of a snapshot. */
 export const MAX_SNAPSHOT_BYTES = 900 * KIB;
+/**
+ * Bytes of one prompt API response that a refresh or a listing reads. A
+ * text prompt arrives as a JSON string, where escaping a quote, a backslash
+ * or a line break doubles its bytes; chat messages, config and resolution
+ * graph arrive as JSON of the size they are stored at. So a snapshot of
+ * `MAX_SNAPSHOT_BYTES` takes at most 2 × 900 KiB = 1800 KiB of a response,
+ * and 248 KiB are left for the other fields. A text prompt of control
+ * characters, which escape to 6 bytes, can exceed the cap. A refresh reads
+ * `PROMPT_STEP_LABELS` responses at once, so it holds the text of at most
+ * 4 × 2 MiB = 8 MiB of responses at a time, plus the values parsed from it.
+ */
+export const MAX_PROMPT_RESPONSE_BYTES = 2 * MIB;
 /**
  * Bytes of a snapshot document: `MAX_SNAPSHOT_BYTES` of content plus its
  * key, its name of at most `MAX_PROMPT_NAME_BYTES` and the small fields.

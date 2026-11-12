@@ -133,31 +133,56 @@ test("pin stores a chat fallback on a miss and returns it decoded", async () => 
   ).toEqual(pinned);
 });
 
+type Ctx = RunQueryCtx & RunMutationCtx & RunActionCtx;
+
+/** A ctx that records the arguments of every component call it forwards. */
+function recording(ctx: Ctx, calls: unknown[]): Ctx {
+  return {
+    runQuery: async (reference, ...args) => {
+      calls.push(args[0]);
+      return await ctx.runQuery(reference, ...args);
+    },
+    runMutation: async (reference, ...args) => {
+      calls.push(args[0]);
+      return await ctx.runMutation(reference, ...args);
+    },
+    runAction: async (reference, ...args) => {
+      calls.push(args[0]);
+      return await ctx.runAction(reference, ...args);
+    },
+  };
+}
+
+test("pin with a scope of 257 UTF-8 bytes throws invalid_prompt_scope and makes no component call; one of 256 is pinned", async () => {
+  const t = createTest();
+  const longest = "é".repeat(128);
+  const calls: unknown[] = [];
+  const result = await t.action(async (ctx) => {
+    const spy = recording(ctx, calls);
+    const fallback = { type: "text" as const, prompt: "Fallback" };
+    const code = await refusalCode(
+      langfuse.prompts.pin(spy, { scope: `${longest}s`, name: "n", fallback }),
+    );
+    const callsAfterRefusal = calls.length;
+    const pinned = await langfuse.prompts.pin(spy, {
+      scope: longest,
+      name: "n",
+      fallback,
+    });
+    return { code, callsAfterRefusal, prompt: pinned?.prompt };
+  });
+  expect(result).toEqual({
+    code: "invalid_prompt_scope",
+    callsAfterRefusal: 0,
+    prompt: "Fallback",
+  });
+});
+
 describe("a lone surrogate", () => {
   // What `"cut 😀".slice(0, -1)` leaves: a lone surrogate, which Convex
   // refuses in a function argument.
   const CUT = "cut 😀".slice(0, -1);
   const FIXED = "cut \ufffd";
-
-  type Ctx = RunQueryCtx & RunMutationCtx & RunActionCtx;
-
-  /** A ctx that records the arguments of every component call it forwards. */
-  function recording(ctx: Ctx, calls: unknown[]): Ctx {
-    return {
-      runQuery: async (reference, ...args) => {
-        calls.push(args[0]);
-        return await ctx.runQuery(reference, ...args);
-      },
-      runMutation: async (reference, ...args) => {
-        calls.push(args[0]);
-        return await ctx.runMutation(reference, ...args);
-      },
-      runAction: async (reference, ...args) => {
-        calls.push(args[0]);
-        return await ctx.runAction(reference, ...args);
-      },
-    };
-  }
 
   test("in a name, a label or a scope throws its code and makes no component call", async () => {
     const t = createTest();

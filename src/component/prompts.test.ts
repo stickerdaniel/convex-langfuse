@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api.js";
-import type { Doc } from "./_generated/dataModel.js";
+import type { Doc, Id } from "./_generated/dataModel.js";
 import {
   MAX_PROMPT_DEPENDENCIES,
   MAX_PROMPT_LABELS,
   MAX_PROMPT_NAME_BYTES,
   MAX_PROMPT_NAMES,
+  MAX_PROMPT_RESPONSE_BYTES,
+  MAX_PROMPT_SCOPE_BYTES,
   MAX_SNAPSHOT_BYTES,
   PIN_TTL_MS,
   PROMPT_LIST_MAX_PAGES,
   PROMPT_REFRESH_INTERVAL_MS,
+  PROMPT_REFRESH_MAX_MS,
   PROMPT_REFRESH_SPACING_MS,
   PROMPT_STEP_LABELS,
   RETENTION_BATCH,
@@ -31,6 +34,7 @@ import {
   webhookBody,
 } from "./fakePrompts.test-util.js";
 import { initConvexTest } from "./setup.test.js";
+import { byteLength } from "../shared/otlp.js";
 
 // Captured before a test installs fake timers.
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
@@ -545,6 +549,23 @@ describe("pins", () => {
     expect(await pin("s1", "intro")).toEqual(fallback);
   });
 
+  test("a scope of 257 UTF-8 bytes is refused with invalid_prompt_scope and stores nothing; one of 256 is pinned", async () => {
+    const longest = "é".repeat(MAX_PROMPT_SCOPE_BYTES / 2);
+    const fallback = { type: "text" as const, prompt: "Fallback" };
+    const before = await promptTables();
+    expect(await refusalCode(pin(`${longest}s`, "intro", { fallback }))).toBe(
+      "invalid_prompt_scope",
+    );
+    expect(await promptTables()).toEqual(before);
+
+    expect(await pin(longest, "intro", { fallback })).toMatchObject({
+      prompt: "Fallback",
+    });
+    expect((await promptTables()).promptPins.map((row) => row.scope)).toEqual([
+      longest,
+    ]);
+  });
+
   test("a miss without a fallback returns null and stores nothing", async () => {
     const before = await promptTables();
     expect(await pin("s1", "intro")).toBeNull();
@@ -659,6 +680,85 @@ describe("snapshots", () => {
     expect((await promptTables()).promptSnapshots).toEqual([]);
     expect((await nameRow("big"))?.error).toBe("oversize");
     expect((await promptHealth()).errors).toBe(1);
+  });
+
+  /**
+   * Caches `big`, then answers its next fetch with a body of four times the
+   * cap, pulled only as the reader asks, and refreshes it. Returns the bytes
+   * the body handed out.
+   */
+  async function refreshOversize(
+    headers?: Record<string, string>,
+  ): Promise<number> {
+    prompts.add("big", "small");
+    await sync(["big"]);
+    expect(await get("big")).toMatchObject({ prompt: "small" });
+
+    const chunk = new Uint8Array(64 * 1024).fill(0x20);
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (sent >= 4 * MAX_PROMPT_RESPONSE_BYTES) return controller.close();
+          sent += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    prompts.override = (request) =>
+      request.path.startsWith("/api/public/v2/prompts/big?")
+        ? { status: 200, headers, body }
+        : undefined;
+    await notify("big");
+    expect(await get("big")).toBeNull();
+    expect((await promptTables()).promptLabels).toEqual([]);
+    expect((await nameRow("big"))?.error).toBe("oversize");
+    return sent;
+  }
+
+  test("a label whose response body passes the cap is removed as oversize, and the body is read no further than the cap", async () => {
+    const sent = await refreshOversize();
+    expect(sent).toBeGreaterThan(MAX_PROMPT_RESPONSE_BYTES);
+    expect(sent).toBeLessThanOrEqual(MAX_PROMPT_RESPONSE_BYTES + 64 * 1024);
+  });
+
+  test("a label whose Content-Length passes the cap is removed as oversize without reading the body", async () => {
+    const declared = String(MAX_PROMPT_RESPONSE_BYTES + 1);
+    expect(await refreshOversize({ "content-length": declared })).toBe(0);
+  });
+
+  test("a response just under the cap with a snapshot of the largest size is cached", async () => {
+    // A line break takes two bytes in the response; with the config `{}`
+    // the snapshot has exactly `MAX_SNAPSHOT_BYTES`.
+    const prompt = "\n".repeat(MAX_SNAPSHOT_BYTES - 2);
+    const body = {
+      id: "big@1",
+      name: "big",
+      version: 1,
+      type: "text",
+      prompt,
+      config: {},
+      labels: ["production"],
+      tags: [],
+      resolutionGraph: null,
+      commitMessage: "",
+    };
+    body.commitMessage = "x".repeat(
+      MAX_PROMPT_RESPONSE_BYTES - 1 - byteLength(JSON.stringify(body)),
+    );
+    expect(byteLength(JSON.stringify(body))).toBe(
+      MAX_PROMPT_RESPONSE_BYTES - 1,
+    );
+    prompts.add("big", "listed");
+    prompts.override = (request) =>
+      request.path.startsWith("/api/public/v2/prompts/big?")
+        ? { status: 200, body }
+        : undefined;
+    await sync(["big"]);
+    const cached = await get("big");
+    expect(cached?.config).toBe("{}");
+    expect(cached?.prompt === prompt).toBe(true);
   });
 
   test("a version returns what the last refresh resolved it to, while a pin keeps an earlier resolution", async () => {
@@ -852,6 +952,61 @@ describe("refresh", () => {
     }
   });
 
+  test("refreshes that die after storing leave no orphan past the grace period and the lease, while the running refresh keeps what it staged", async () => {
+    const reserve = async () =>
+      (await t.mutation(internal.prompts.reserve, { names: ["greeting"] }))[0]!;
+    const store = async (token: string, prompt: string) =>
+      (await t.mutation(internal.prompts.store, {
+        name: "greeting",
+        token,
+        candidates: [{ version: 1, type: "text", prompt, config: "{}" }],
+      }))![0]!;
+    const sweep = () => t.mutation(internal.retention.sweep, {});
+    const snapshots = async () => (await promptTables()).promptSnapshots;
+
+    // Every 15 minutes the name is reserved, as a tick does, and its refresh
+    // stores a new snapshot and dies before it publishes.
+    const start = Date.now();
+    let newest = await store(await reserve(), "v0");
+    for (let round = 1; round < 12; round++) {
+      vi.setSystemTime(start + round * 15 * MINUTE);
+      newest = await store(await reserve(), `v${round}`);
+      await sweep();
+      const oldest = Math.min(...(await snapshots()).map((s) => s.fetchedAt));
+      expect(Date.now() - oldest).toBeLessThanOrEqual(
+        SNAPSHOT_GRACE_MS + PROMPT_REFRESH_MAX_MS,
+      );
+    }
+    expect((await snapshots()).length).toBeLessThan(12);
+
+    // Every orphan passes the grace period; the running refresh reuses the
+    // newest one, and the sweep keeps only that.
+    vi.setSystemTime(Date.now() + 2 * SNAPSHOT_GRACE_MS);
+    expect(await store(await reserve(), "v11")).toBe(newest);
+    await sweep();
+    expect((await snapshots()).map((s) => s._id)).toEqual([newest]);
+
+    // That refresh dies too: once its lease is over, the sweep collects it.
+    vi.setSystemTime(Date.now() + PROMPT_REFRESH_MAX_MS + 1_000);
+    await sweep();
+    expect(await snapshots()).toEqual([]);
+  });
+
+  test("an orphan that no running refresh staged is collected although its name was reserved a moment ago", async () => {
+    await t.run(async (ctx) => {
+      await ctx.db.insert(
+        "promptSnapshots",
+        snapshotDoc("greeting", {
+          fetchedAt: Date.now() - 2 * SNAPSHOT_GRACE_MS,
+        }),
+      );
+    });
+    await t.mutation(internal.prompts.reserve, { names: ["greeting"] });
+    expect(await nameRow("greeting")).toBeDefined();
+    await t.mutation(internal.retention.sweep, {});
+    expect((await promptTables()).promptSnapshots).toEqual([]);
+  });
+
   test("without a webhook, the rolling refresh picks up a moved label, a deleted prompt, a deleted dependency and a failed refresh", async () => {
     prompts.add("moved", "m1");
     prompts.add("deleted", "d1");
@@ -1011,9 +1166,28 @@ describe("with Convex's transaction limits", () => {
     const names = Array.from({ length: MAX_PROMPT_NAMES }, (_, i) =>
       pad(`name${String(i).padStart(3, "0")}`),
     );
-    await t.run(async (ctx) => {
+    const snapshotIds = await t.run(async (ctx) => {
       await ctx.db.insert("promptSync", { lastListAt: Date.now() });
+      const ids: Id<"promptSnapshots">[] = [];
+      for (let i = 0; i < MAX_PROMPT_LABELS; i++) {
+        ids.push(
+          await ctx.db.insert(
+            "promptSnapshots",
+            snapshotDoc(`s${i}`, { fetchedAt: Date.now() }),
+          ),
+        );
+      }
+      return ids;
     });
+    // Every row stages `MAX_PROMPT_LABELS` ids, the largest `staged`. A
+    // reservation clears it, so the rows are staged again before the webhook.
+    const stageAll = () =>
+      t.run(async (ctx) => {
+        const staged = { at: Date.now(), snapshotIds };
+        for (const row of await ctx.db.query("promptNames").collect()) {
+          await ctx.db.patch("promptNames", row._id, { staged });
+        }
+      });
     for (let i = 0; i < names.length; i += 100) {
       await t.run(async (ctx) => {
         for (const name of names.slice(i, i + 100)) {
@@ -1027,6 +1201,7 @@ describe("with Convex's transaction limits", () => {
       });
     }
 
+    await stageAll();
     await t.mutation(internal.prompts.tick, {});
     expect((await scheduledRefreshes()).map((job) => job.name).sort()).toEqual(
       names,
@@ -1034,6 +1209,7 @@ describe("with Convex's transaction limits", () => {
     const rows = (await promptTables()).promptNames;
     expect(rows.filter((row) => row.token === "token")).toEqual([]);
 
+    await stageAll();
     await t.mutation(internal.prompts.webhook, { name: dependsOn[0]! });
     expect(await scheduledRefreshes()).toHaveLength(2 * MAX_PROMPT_NAMES);
   });
@@ -1060,6 +1236,38 @@ describe("with Convex's transaction limits", () => {
     });
     await sweepUntilDone();
     expect(await snapshotNames()).toEqual(["young"]);
+  });
+
+  test("a sweep over 200 expired pins and 200 old snapshots that live pins reference, all pins of the largest size, finishes", async () => {
+    const name = "n".repeat(MAX_PROMPT_NAME_BYTES);
+    const scope = (i: number) => String(i).padEnd(MAX_PROMPT_SCOPE_BYTES, "x");
+    const old = Date.now() - 2 * SNAPSHOT_GRACE_MS;
+    for (let i = 0; i < RETENTION_BATCH; i++) {
+      await t.run(async (ctx) => {
+        const snapshotId = await ctx.db.insert(
+          "promptSnapshots",
+          snapshotDoc(name, { fetchedAt: old }),
+        );
+        for (const [n, expiresAt] of [
+          [i, Date.now() + PIN_TTL_MS],
+          [RETENTION_BATCH + i, Date.now() - 1],
+        ] as const) {
+          await ctx.db.insert("promptPins", {
+            scope: scope(n),
+            name,
+            snapshotId,
+            expiresAt,
+          });
+        }
+      });
+    }
+
+    await t.mutation(internal.retention.sweep, {});
+    const state = await promptTables();
+    expect(state.promptSnapshots).toHaveLength(RETENTION_BATCH);
+    expect(state.promptPins.map((row) => row.scope).sort()).toEqual(
+      Array.from({ length: RETENTION_BATCH }, (_, i) => scope(i)).sort(),
+    );
   });
 
   test("snapshots with one fetchedAt, more than two pages of them, are all collected", async () => {

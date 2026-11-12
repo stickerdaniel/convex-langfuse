@@ -241,8 +241,17 @@ export default defineSchema({
     dependsOn: v.array(v.string()),
     /** Last time a refresh was reserved. */
     attemptedAt: v.number(),
-    /** Last time a refresh was published. */
-    refreshedAt: v.optional(v.number()),
+    /**
+     * The snapshots the refresh holding `token` stored or reused, at most
+     * `MAX_PROMPT_LABELS`, and the time of its first `store`. A reservation
+     * and `publish` clear it.
+     */
+    staged: v.optional(
+      v.object({
+        at: v.number(),
+        snapshotIds: v.array(v.id("promptSnapshots")),
+      }),
+    ),
     /** Fixed code of the last refresh's first failure. */
     error: v.optional(v.string()),
   })
@@ -251,6 +260,7 @@ export default defineSchema({
 
   /** The snapshot a scope uses for a prompt name until `expiresAt`. */
   promptPins: defineTable({
+    /** At most `MAX_PROMPT_SCOPE_BYTES`. */
     scope: v.string(),
     name: v.string(),
     snapshotId: v.id("promptSnapshots"),

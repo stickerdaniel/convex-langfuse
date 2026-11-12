@@ -11,7 +11,7 @@ import type { Observation, TraceContext } from "../shared/validators.js";
 
 export type TestConvex = ReturnType<typeof initConvexTest>;
 
-/** How the fake answers one request. `body` is sent as JSON. */
+/** How the fake answers one request. `body` is sent as JSON, a stream as is. */
 export type Behaviour =
   | { status: number; headers?: Record<string, string>; body?: unknown }
   | { network: true }
@@ -96,8 +96,13 @@ export function installFakeLangfuse() {
           });
         });
       }
+      const { body: answered } = behaviour;
       return new Response(
-        behaviour.body === undefined ? null : JSON.stringify(behaviour.body),
+        answered === undefined
+          ? null
+          : answered instanceof ReadableStream
+            ? answered
+            : JSON.stringify(answered),
         { status: behaviour.status, headers: behaviour.headers },
       );
     },

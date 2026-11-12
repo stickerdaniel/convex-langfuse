@@ -33,6 +33,8 @@ import {
   MAX_PROMPT_LABELS,
   MAX_PROMPT_NAME_BYTES,
   MAX_PROMPT_NAMES,
+  MAX_PROMPT_RESPONSE_BYTES,
+  MAX_PROMPT_SCOPE_BYTES,
   MAX_SNAPSHOT_BYTES,
   MAX_SNAPSHOT_DOCUMENT_BYTES,
   PIN_TTL_MS,
@@ -55,6 +57,7 @@ import { byteLength } from "../shared/otlp.js";
 export type PromptErrorCode =
   | "invalid_prompt_selector"
   | "invalid_prompt_name"
+  | "invalid_prompt_scope"
   | "invalid_fallback"
   | "invalid_ttl"
   | "prompt_too_large"
@@ -299,7 +302,9 @@ async function nameRow(
 
 /**
  * The cached snapshot for a selector: the one a label maps to, or the one a
- * version resolved to in the last refresh that fetched it. `null` on a miss.
+ * version resolved to in the last refresh that fetched it, while a label or
+ * a pin still holds that snapshot. A pin on an older resolution of the
+ * version does not keep the version readable. `null` on a miss.
  */
 async function resolve(
   ctx: QueryCtx,
@@ -315,8 +320,11 @@ async function resolve(
 /**
  * The cached prompt for a label (default `production`) or a version, or
  * `null` when the cache holds none, also for a name the cache cannot track.
- * Reads only the cache; a miss starts no fetch. Throws
- * `invalid_prompt_selector` for a label and a version together.
+ * A version is served as the last refresh resolved it, while a label or a
+ * pin still holds that snapshot; a pin on an older resolution of the
+ * version does not keep the version readable. Reads only the cache; a miss
+ * starts no fetch. Throws `invalid_prompt_selector` for a label and a
+ * version together.
  */
 export const get = query({
   args: selectorArgs,
@@ -374,7 +382,8 @@ async function storeFallback(
  * stores `fallback` as a snapshot, and without a fallback it returns `null`
  * and stores nothing. The result is pinned for `ttlMs` (default
  * `PIN_TTL_MS`) from now. Runs in the caller's transaction. Throws
- * `invalid_prompt_name` for a name the cache cannot track.
+ * `invalid_prompt_name` for a name the cache cannot track and
+ * `invalid_prompt_scope` for a scope over `MAX_PROMPT_SCOPE_BYTES`.
  */
 export const pin = mutation({
   args: {
@@ -396,6 +405,9 @@ export const pin = mutation({
     checkSelector(args);
     const { scope, name, fallback, ttlMs = PIN_TTL_MS } = args;
     if (!isPromptName(name)) refuse("invalid_prompt_name");
+    if (byteLength(scope) > MAX_PROMPT_SCOPE_BYTES) {
+      refuse("invalid_prompt_scope");
+    }
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) refuse("invalid_ttl");
     const now = Date.now();
     const existing = await ctx.db
@@ -426,8 +438,10 @@ type Reserved = { name: string; token: string };
 
 /**
  * Reserves a refresh of a tracked name: a new token, which fences every
- * refresh reserved before, and `attemptedAt`. A random token never repeats,
- * also not after the row was deleted and created again.
+ * refresh reserved before, and `attemptedAt`. It clears `staged`: the
+ * refresh that staged those snapshots is fenced and publishes nothing. A
+ * random token never repeats, also not after the row was deleted and
+ * created again.
  */
 async function reserveRow(
   ctx: MutationCtx,
@@ -435,7 +449,11 @@ async function reserveRow(
   now: number,
 ): Promise<Reserved> {
   const token = crypto.randomUUID();
-  await ctx.db.patch("promptNames", row._id, { token, attemptedAt: now });
+  await ctx.db.patch("promptNames", row._id, {
+    token,
+    attemptedAt: now,
+    staged: undefined,
+  });
   return { name: row.name, token };
 }
 
@@ -550,7 +568,38 @@ type Fetched =
   | { ok: true; body: unknown }
   | { ok: false; status?: number; error: string };
 
-/** One GET request to the public API, with Basic auth and a timeout. */
+/**
+ * The body as text, or `null` once it exceeds `MAX_PROMPT_RESPONSE_BYTES`.
+ * A larger `Content-Length` is refused before the body is read; otherwise
+ * the body is read as a stream that is cancelled at the cap.
+ */
+async function boundedText(response: Response): Promise<string | null> {
+  const declared = Number(response.headers.get("Content-Length") ?? 0);
+  if (declared > MAX_PROMPT_RESPONSE_BYTES) {
+    await response.body?.cancel();
+    return null;
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return text + decoder.decode();
+    bytes += value.byteLength;
+    if (bytes > MAX_PROMPT_RESPONSE_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+}
+
+/**
+ * One GET request to the public API, with Basic auth and a timeout. A body
+ * over `MAX_PROMPT_RESPONSE_BYTES` gives `oversize`.
+ */
 async function getJson(config: ExportConfig, path: string): Promise<Fetched> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PROMPT_TIMEOUT_MS);
@@ -568,8 +617,10 @@ async function getJson(config: ExportConfig, path: string): Promise<Fetched> {
         error: `http_${response.status}`,
       };
     }
+    const text = await boundedText(response);
+    if (text === null) return { ok: false, error: "oversize" };
     try {
-      return { ok: true, body: (await response.json()) as unknown };
+      return { ok: true, body: JSON.parse(text) as unknown };
     } catch {
       return { ok: false, error: "invalid_response" };
     }
@@ -679,8 +730,12 @@ async function fetchLabel(
     `${promptPath(name)}?label=${encodeURIComponent(label)}`,
   );
   if (!fetched.ok) {
-    // 404: the prompt or the label is gone; 409: a dependency is.
-    const gone = fetched.status === 404 || fetched.status === 409;
+    // 404: the prompt or the label is gone; 409: a dependency is. A response
+    // over the cap is removed as an oversize snapshot is.
+    const gone =
+      fetched.status === 404 ||
+      fetched.status === 409 ||
+      fetched.error === "oversize";
     return { outcome: gone ? "gone" : "failed", error: fetched.error };
   }
   const parsed = parsePrompt(name, fetched.body);
@@ -699,9 +754,10 @@ async function fetchLabel(
  * snapshot id, version and the bounded dependency names, so it holds at most
  * one step of candidates at once: `PROMPT_STEP_LABELS` × `MAX_SNAPSHOT_BYTES`,
  * 3.5 MiB of prompt text, plus the responses of that step while they are
- * parsed. Last, `publish` applies the whole result at once. It stops once
- * `store` reports a newer reservation. Does nothing when the component is
- * disabled. Errors are fixed codes: `http_<status>`, `network`, `timeout`,
+ * parsed, each read up to `MAX_PROMPT_RESPONSE_BYTES`. Last, `publish`
+ * applies the whole result at once. It stops once `store` reports a newer
+ * reservation. Does nothing when the component is disabled. Errors are
+ * fixed codes: `http_<status>`, `network`, `timeout`,
  * `invalid_response`, `oversize`, `too_many_labels`,
  * `too_many_dependencies`; the first one is recorded.
  */
@@ -792,9 +848,12 @@ export const refresh = internalAction({
 
 /**
  * Stores the snapshots of one refresh step, inserting or reusing each, and
- * returns their ids in order. Publishes nothing: a snapshot no refresh
- * publishes stays unreferenced and the retention sweep collects it. Returns
- * `null` and stores nothing when `token` is not the name's current one.
+ * returns their ids in order. Publishes nothing. It adds the ids to the
+ * name's `staged`, timed by the token's first `store`; the retention sweep
+ * keeps a staged snapshot for `PROMPT_REFRESH_MAX_MS` from then. A snapshot
+ * no refresh publishes stays unreferenced, and the sweep collects it once
+ * that time is over. Returns `null` and stores nothing when `token` is not
+ * the name's current one.
  */
 export const store = internalMutation({
   args: {
@@ -812,6 +871,13 @@ export const store = internalMutation({
         await storeSnapshot(ctx, { name, source: "langfuse", ...candidate }),
       );
     }
+    const staged = row.staged ?? { at: Date.now(), snapshotIds: [] };
+    await ctx.db.patch("promptNames", row._id, {
+      staged: {
+        at: staged.at,
+        snapshotIds: [...new Set([...staged.snapshotIds, ...ids])],
+      },
+    });
     return ids;
   },
 });
@@ -837,8 +903,8 @@ async function pointVersion(
  * name's current one. `ok` points the label and its version to their stored
  * snapshot; `gone` removes the label; `failed` keeps its mapping. It removes
  * the labels the listing no longer shows (all of them when the prompt is
- * gone, none when the listing failed), records `error`, and sets
- * `refreshedAt`. `dependsOn` replaces the stored names only when the refresh
+ * gone, none when the listing failed), records `error`, and clears
+ * `staged`. `dependsOn` replaces the stored names only when the refresh
  * is `complete`, every listed label resolved; otherwise it adds to them, so
  * a dependency that is gone for now still reaches this name through the
  * webhook. A name without labels and without an error is no longer tracked.
@@ -899,7 +965,7 @@ export const publish = internalMutation({
       return null;
     }
     await ctx.db.patch("promptNames", row._id, {
-      refreshedAt: Date.now(),
+      staged: undefined,
       dependsOn: complete
         ? dependsOn
         : boundDependencies([...row.dependsOn, ...dependsOn]).names,
@@ -1037,11 +1103,10 @@ export type SyncResult = Infer<typeof vSyncResult>;
 /**
  * Turns the prompt cache on and schedules refreshes. With `names`, for those
  * names; without, for every name the list endpoint returns. Refreshes run in
- * the background and apply within seconds. Returns `disabled` without
- * writing when the component has no export configuration. Throws
- * `prompt_list_failed` when a page of the listing fails and
- * `invalid_prompt_name` for a name that is empty or has more than
- * `MAX_PROMPT_NAME_BYTES`.
+ * the background. Returns `disabled` without writing when the component has
+ * no export configuration. Throws `prompt_list_failed` when a page of the
+ * listing fails and `invalid_prompt_name` for a name that is empty or has
+ * more than `MAX_PROMPT_NAME_BYTES`.
  */
 export const sync = action({
   args: { names: v.optional(v.array(v.string())) },
@@ -1151,14 +1216,19 @@ async function referenced(
 }
 
 /**
- * Whether a refresh of the row may still publish: it was reserved within
- * `PROMPT_REFRESH_MAX_MS` and nothing was published since. Such a refresh can
- * hold the id of an old snapshot that `store` reused.
+ * Whether the current refresh of the row staged the snapshot less than
+ * `PROMPT_REFRESH_MAX_MS` ago, so it may still publish it. `store` can stage
+ * an old snapshot it reused.
  */
-function refreshing(row: Doc<"promptNames">, now: number): boolean {
+function staged(
+  row: Doc<"promptNames"> | null,
+  snapshotId: Id<"promptSnapshots">,
+  now: number,
+): boolean {
   return (
-    row.attemptedAt > now - PROMPT_REFRESH_MAX_MS &&
-    (row.refreshedAt ?? 0) <= row.attemptedAt
+    row?.staged !== undefined &&
+    row.staged.at > now - PROMPT_REFRESH_MAX_MS &&
+    row.staged.snapshotIds.includes(snapshotId)
   );
 }
 
@@ -1174,10 +1244,11 @@ export type SnapshotPass = Infer<typeof vSnapshotPass>;
 /**
  * One step of a snapshot collection pass, within `bytes` of reads and
  * deletions. It reads one page of snapshots fetched before the pass's cutoff
- * and deletes those that no label and no pin references, unless a refresh
- * of their name may still publish them, with their version pointers. A pass
- * without `pass` starts at `now - SNAPSHOT_GRACE_MS`. Returns the pass to
- * continue in the next sweep, or `undefined` once it read the last page.
+ * and deletes those that no label and no pin references, unless the running
+ * refresh of their name staged them (`staged`), with their version
+ * pointers. A pass without `pass` starts at `now - SNAPSHOT_GRACE_MS`.
+ * Returns the pass to continue in the next sweep, or `undefined` once it
+ * read the last page.
  */
 export async function collectSnapshots(
   ctx: MutationCtx,
@@ -1204,8 +1275,7 @@ export async function collectSnapshots(
     if (!names.has(snapshot.name)) {
       names.set(snapshot.name, await nameRow(ctx, snapshot.name));
     }
-    const row = names.get(snapshot.name);
-    if (row && refreshing(row, now)) continue;
+    if (staged(names.get(snapshot.name) ?? null, snapshot._id, now)) continue;
     // A snapshot has one name and version, so one pointer at most.
     const pointer = await ctx.db
       .query("promptVersions")
