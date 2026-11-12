@@ -41,6 +41,10 @@ import { byteLength } from "../shared/otlp.js";
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realTick = () => new Promise((resolve) => realSetTimeout(resolve, 5));
 
+// The tests over `MAX_PROMPT_NAMES` names do 500 times the work of the others
+// and pass the default 5 s on a busy machine.
+vi.setConfig({ testTimeout: 30_000 });
+
 let t: TestConvex;
 let fake: FakeLangfuse;
 let prompts: FakePrompts;
@@ -115,6 +119,7 @@ type PromptTables = {
   promptNames: Doc<"promptNames">[];
   promptPins: Doc<"promptPins">[];
   promptSync: Doc<"promptSync">[];
+  promptSlots: Doc<"promptSlots">[];
 };
 
 async function promptTables(): Promise<PromptTables> {
@@ -125,6 +130,7 @@ async function promptTables(): Promise<PromptTables> {
     promptNames: await ctx.db.query("promptNames").collect(),
     promptPins: await ctx.db.query("promptPins").collect(),
     promptSync: await ctx.db.query("promptSync").collect(),
+    promptSlots: await ctx.db.query("promptSlots").collect(),
   }));
 }
 
@@ -307,6 +313,30 @@ describe("sync and get", () => {
     const tracked = (await promptTables()).promptNames.map((row) => row.name);
     expect(tracked).toHaveLength(500);
     expect(tracked).not.toContain("p500");
+  });
+
+  test("a name that left the cache frees its place for another name", async () => {
+    for (let i = 0; i < MAX_PROMPT_NAMES; i++) {
+      const name = `p${String(i).padStart(3, "0")}`;
+      prompts.add(name, name);
+    }
+    await sync();
+    prompts.add("late", "late");
+    expect(await sync(["late"])).toEqual({
+      status: "ok",
+      tracked: 0,
+      overflow: 1,
+    });
+
+    // The refresh finds the prompt gone and stops tracking the name.
+    prompts.delete("p000");
+    await sync(["p000"]);
+    expect(await sync(["late"])).toEqual({
+      status: "ok",
+      tracked: 1,
+      overflow: 0,
+    });
+    expect(await get("late")).toMatchObject({ prompt: "late" });
   });
 
   test("a name of 257 UTF-8 bytes: sync refuses it, the listing counts it as overflow, get returns null and pin refuses it", async () => {
@@ -549,6 +579,7 @@ describe("webhook", () => {
       promptNames: 1,
       promptPins: 0,
       promptSync: 1,
+      promptSlots: 1,
     });
 
     for (let i = 0; i < 4; i++) {
@@ -1256,6 +1287,7 @@ describe("refresh", () => {
           dependsOn: [],
           attemptedAt: start + 1_000,
         });
+        await ctx.db.insert("promptSlots", { name });
       }
     });
 
@@ -1334,6 +1366,7 @@ describe("with Convex's transaction limits", () => {
             dependsOn,
             attemptedAt: Date.now() - PROMPT_REFRESH_INTERVAL_MS,
           });
+          await ctx.db.insert("promptSlots", { name });
         }
       });
     }

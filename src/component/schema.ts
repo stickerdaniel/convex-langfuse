@@ -278,4 +278,12 @@ export default defineSchema({
     lastListAt: v.optional(v.number()),
     lastWebhookAt: v.optional(v.number()),
   }),
+
+  /**
+   * One row per tracked prompt name, created and deleted with its
+   * `promptNames` row and never changed in between. The `MAX_PROMPT_NAMES`
+   * bound counts these rows: a count over `promptNames` would read rows that
+   * running refreshes write, and conflict with them.
+   */
+  promptSlots: defineTable({ name: v.string() }).index("by_name", ["name"]),
 });

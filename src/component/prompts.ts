@@ -45,11 +45,13 @@ import {
   PROMPT_REFRESH_INTERVAL_MS,
   PROMPT_REFRESH_MAX_MS,
   PROMPT_REFRESH_SPACING_MS,
+  PROMPT_REQUEST_RETRY_MS,
   PROMPT_STEP_LABELS,
   PROMPT_TIMEOUT_MS,
   RETENTION_BATCH,
   SNAPSHOT_GRACE_MS,
 } from "./constants.js";
+import { withPauses } from "./retry.js";
 import { vPromptSource, vPromptType } from "./schema.js";
 import { basicAuth, exportConfig, type ExportConfig } from "./settings.js";
 import { byteLength } from "../shared/otlp.js";
@@ -464,6 +466,12 @@ async function reserveRow(
  * name once `MAX_PROMPT_NAMES` are tracked reserve nothing and count as
  * overflow. With `onlyNew`, tracked names are skipped. `sync`, the listing
  * and the webhook all reserve through here.
+ *
+ * The tracked names are counted in `promptSlots`, which holds one row per
+ * name that only changes when a name starts or stops being tracked. Every
+ * `store` and `publish` of a running refresh writes a `promptNames` row, so
+ * a count over that table would conflict with them: a listing of several
+ * pages reserves a page while the refreshes of its earlier pages run.
  */
 async function reserveNames(
   ctx: MutationCtx,
@@ -486,7 +494,7 @@ async function reserveNames(
     }
     free ??=
       MAX_PROMPT_NAMES -
-      (await ctx.db.query("promptNames").take(MAX_PROMPT_NAMES)).length;
+      (await ctx.db.query("promptSlots").take(MAX_PROMPT_NAMES)).length;
     if (free <= 0) {
       overflow += 1;
       continue;
@@ -499,6 +507,7 @@ async function reserveNames(
       dependsOn: [],
       attemptedAt: now,
     });
+    await ctx.db.insert("promptSlots", { name });
     reserved.push({ name, token });
   }
   return { reserved, overflow };
@@ -911,7 +920,8 @@ async function pointVersion(
  * `staged`. `dependsOn` replaces the stored names only when the refresh
  * is `complete`, every listed label resolved; otherwise it adds to them, so
  * a dependency that is gone for now still reaches this name through the
- * webhook. A name without labels and without an error is no longer tracked.
+ * webhook. A name without labels and without an error is no longer tracked:
+ * its `promptNames` and `promptSlots` rows are deleted.
  */
 export const publish = internalMutation({
   args: {
@@ -966,6 +976,11 @@ export const publish = internalMutation({
     }
     if (left === 0 && error === undefined) {
       await ctx.db.delete("promptNames", row._id);
+      const slot = await ctx.db
+        .query("promptSlots")
+        .withIndex("by_name", (q) => q.eq("name", name))
+        .unique();
+      if (slot) await ctx.db.delete("promptSlots", slot._id);
       return null;
     }
     await ctx.db.patch("promptNames", row._id, {
@@ -1029,6 +1044,27 @@ export const listed = internalMutation({
 });
 
 /**
+ * Runs `request`, and again after each pause of `PROMPT_REQUEST_RETRY_MS`
+ * when it throws. A reservation reads `promptSlots` and the rows of its
+ * names. Refreshes that start or stop tracking names, or that run for those
+ * names, write the same rows, and Convex gives up on a mutation whose reads
+ * keep changing under it. That error has no type of its own, so every error
+ * is tried again. A mutation that throws wrote nothing, so the next attempt
+ * starts from the same state. Should an answer be lost after its commit, the
+ * next attempt reserves the same names once more, which fences the refreshes
+ * of the first.
+ */
+async function requestRefreshes(
+  ctx: ActionCtx,
+  args: { names: string[]; onlyNew?: boolean; start?: boolean },
+): Promise<{ tracked: number; overflow: number }> {
+  return await withPauses(
+    () => ctx.runMutation(internal.prompts.request, args),
+    PROMPT_REQUEST_RETRY_MS,
+  );
+}
+
+/**
  * Pages through every prompt name of the project and requests a refresh for
  * the names of each page; with `onlyNew`, only for names that are not
  * tracked. A listing entry carries the config of the name's latest version,
@@ -1088,10 +1124,7 @@ async function listAndRequest(
         .filter(
           (name): name is string => typeof name === "string" && name !== "",
         );
-      const counts = await ctx.runMutation(internal.prompts.request, {
-        names,
-        onlyNew,
-      });
+      const counts = await requestRefreshes(ctx, { names, onlyNew });
       total.tracked += counts.tracked;
       total.overflow += counts.overflow;
     }
@@ -1158,7 +1191,7 @@ export const sync = action({
     if (names?.some((name) => !isPromptName(name))) {
       refuse("invalid_prompt_name");
     }
-    const counts = await ctx.runMutation(internal.prompts.request, {
+    const counts = await requestRefreshes(ctx, {
       names: names ?? [],
       start: true,
     });
