@@ -4,8 +4,15 @@
 // recorded and from every read-back, and each fixture's kept values must
 // arrive.
 
+import { setTimeout as sleep } from "node:timers/promises";
+
 /** How long Langfuse may take to show a recorded observation. */
 const VISIBLE_MS = 60_000;
+/**
+ * How long the dropped-record case keeps watching the proxy after a later
+ * record arrived in Langfuse.
+ */
+const QUIET_MS = 5_000;
 
 /** Throws when `marker` is in a request body the proxy recorded. */
 function expectNotSent(proxy, marker) {
@@ -153,7 +160,6 @@ export default [
     async run({
       runId,
       mutation,
-      query,
       observations,
       proxy,
       poll,
@@ -186,9 +192,9 @@ export default [
           observationIds: [observationIdFromKey(traceId, "span")],
         }),
       );
-      // The outbox sends in order: once a later sentinel arrived and the
-      // outbox is empty, anything the dropped record had enqueued was sent
-      // and shows on the proxy.
+      // The outbox sends in order: once a later sentinel arrived, anything
+      // the dropped record had enqueued was sent before it. The quiet window
+      // after it covers a request that was still on its way.
       const sentinelSeed = `contract:${runId}:after-dropped`;
       const sentinel = traceIdFromSeed(sentinelSeed);
       await mutation("record", {
@@ -204,13 +210,7 @@ export default [
         (rows) => (rows.length === 1 ? [] : [`${rows.length} observations`]),
         VISIBLE_MS,
       );
-      await poll(
-        "the outbox empty",
-        () => query("health", {}),
-        ({ pendingAtLeast }) =>
-          pendingAtLeast === 0 ? [] : [`${pendingAtLeast} rows pending`],
-        VISIBLE_MS,
-      );
+      await sleep(QUIET_MS);
       const sent = proxy.records.filter((record) =>
         record.body.includes(traceId),
       );
