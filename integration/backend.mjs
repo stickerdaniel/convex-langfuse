@@ -98,13 +98,17 @@ export async function ensureBinary() {
 const children = new Set();
 const processGroups = new WeakSet();
 
-/** Stops an owned process, including its children when it owns a group. */
+/**
+ * Stops an owned process, including its children when it owns a group. A
+ * group that is already gone answers `ESRCH`. On macOS a group whose
+ * processes have all exited and wait to be reaped answers `EPERM`.
+ */
 function stop(child) {
   if (!processGroups.has(child)) return child.kill("SIGKILL");
   try {
     process.kill(-child.pid, "SIGKILL");
   } catch (error) {
-    if (error.code !== "ESRCH") throw error;
+    if (error.code !== "ESRCH" && error.code !== "EPERM") throw error;
   }
 }
 
