@@ -60,6 +60,14 @@ export const MAX_PENDING_AGE_MS = 72 * HOUR;
 export const DEAD_LETTER_RETENTION_MS = 7 * 24 * HOUR;
 /** Rows per table one retention sweep deletes. */
 export const RETENTION_BATCH = 200;
+/**
+ * Payload bytes one retention sweep deletes, outbox and dead letters
+ * together. Convex reads a document to delete it and charges its size to the
+ * transaction's reads, at most 16 MiB. Half of that leaves room for the rows
+ * the sweep reads besides the payloads and for the document overhead that
+ * `bytes` does not count.
+ */
+export const RETENTION_BATCH_BYTES = 8 * MIB;
 
 /** Counts in `health` are lower bounds capped at this value. */
 export const HEALTH_COUNT_CAP = 1_000;

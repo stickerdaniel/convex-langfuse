@@ -8,7 +8,7 @@ import {
   SERVICE_NAME,
   type AttributeName,
 } from "./attributes.js";
-import type { Observation, TraceContext } from "./validators.js";
+import type { Observation, Prompt, TraceContext } from "./validators.js";
 
 type AnyValue =
   | { stringValue: string }
@@ -41,16 +41,23 @@ function usageDetails(usage: Record<string, number>): string | undefined {
     : JSON.stringify(Object.fromEntries(kept));
 }
 
+/** A cost entry Langfuse keeps: a finite number, not negative. */
+export function isCostValue(value: number): boolean {
+  return Number.isFinite(value) && value >= 0;
+}
+
 /**
- * Keeps finite numbers and appends `total` when it is missing. Langfuse derives
- * a total cost only when every key is `input` or `output`; with any other key
- * and no `total`, the observation would show no cost. Writes no cost at all
- * when the sum is not finite, because JSON would turn that total into `null`.
- * The client calls it to learn whether a cost record is exported.
+ * Keeps non-negative finite numbers and appends `total` when it is missing.
+ * Langfuse drops a negative entry, so summing it would make the total
+ * disagree with the entries. Langfuse derives a total cost only when every
+ * key is `input` or `output`; with any other key and no `total`, the
+ * observation would show no cost. Writes no cost at all when the sum is not
+ * finite, because JSON would turn that total into `null`. The client calls
+ * it to learn whether a cost record is exported.
  */
 export function costDetails(cost: Record<string, number>): string | undefined {
   const kept = Object.fromEntries(
-    Object.entries(cost).filter(([, value]) => Number.isFinite(value)),
+    Object.entries(cost).filter(([, value]) => isCostValue(value)),
   );
   const values = Object.values(kept);
   if (values.length === 0) return undefined;
@@ -63,17 +70,40 @@ export function costDetails(cost: Record<string, number>): string | undefined {
 }
 
 /**
+ * The prompt link to export, or `undefined`: a copy of an object with a
+ * non-empty string name and a positive integer version. It checks at
+ * runtime, because a caller without types can pass anything, and reads each
+ * field once, so what it checked is what it returns. Langfuse rejects a
+ * generation that carries only one of the two attributes, so the encoder
+ * writes both or neither.
+ */
+export function promptLink(prompt: unknown): Prompt | undefined {
+  if (typeof prompt !== "object" || prompt === null) return undefined;
+  const { name, version } = prompt as { name?: unknown; version?: unknown };
+  return typeof name === "string" &&
+    name !== "" &&
+    typeof version === "number" &&
+    Number.isSafeInteger(version) &&
+    version > 0
+    ? { name, version }
+    : undefined;
+}
+
+/**
  * Encodes one observation as one OTLP/JSON span object and returns it as a
  * JSON string. Deterministic: equal input gives equal output. Every span
- * carries the full trace context. Absent fields produce no attribute.
+ * carries the full trace context. Absent fields produce no attribute. Only a
+ * generation exports its prompt link.
  */
 export function encodeSpan(
   trace: TraceContext,
   observation: Observation,
 ): string {
   const { experiment } = trace;
-  const isGeneration = observation.type === "generation";
-  const promptVersion = observation.prompt?.version;
+  const link =
+    observation.type === "generation"
+      ? promptLink(observation.prompt)
+      : undefined;
 
   const candidates: [AttributeName, AnyValue | undefined][] = [
     [ATTR.observationType, { stringValue: observation.type }],
@@ -106,19 +136,8 @@ export function encodeSpan(
       stringValue(observation.usage && usageDetails(observation.usage)),
     ],
     [ATTR.cost, stringValue(observation.cost && costDetails(observation.cost))],
-    [
-      ATTR.promptName,
-      isGeneration ? stringValue(observation.prompt?.name) : undefined,
-    ],
-    [
-      ATTR.promptVersion,
-      isGeneration &&
-      promptVersion !== undefined &&
-      Number.isSafeInteger(promptVersion) &&
-      promptVersion > 0
-        ? { intValue: String(promptVersion) }
-        : undefined,
-    ],
+    [ATTR.promptName, link && { stringValue: link.name }],
+    [ATTR.promptVersion, link && { intValue: String(link.version) }],
     [
       ATTR.completionStartTime,
       observation.completionStartTime === undefined

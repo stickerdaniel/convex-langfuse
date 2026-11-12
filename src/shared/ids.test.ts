@@ -37,6 +37,11 @@ describe("observationIdFromKey", () => {
     expect(await observationIdFromKey(traceA, "llm")).toBe(id);
   });
 
+  test("is the first 16 hex characters of SHA-256 over `<traceId>:<key>`", async () => {
+    // Computed once with node:crypto.
+    expect(await observationIdFromKey(traceA, "llm")).toBe("99970f641a3edfd5");
+  });
+
   test("differs for different keys and different traces", async () => {
     const id = await observationIdFromKey(traceA, "llm");
     expect(await observationIdFromKey(traceA, "tool")).not.toBe(id);

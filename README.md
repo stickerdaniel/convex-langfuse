@@ -44,8 +44,9 @@ trace deletion and prompt management are in progress.
 2. One exporter per deployment drains the outbox to
    `POST /api/public/otel/v1/traces` of your Langfuse project, at most 50 spans
    or 512 KiB per request.
-3. A request that fails stays in the outbox. The exporter backs off, honours
-   `Retry-After`, and sends the same bytes again.
+3. The spans of a request that fails stay in the outbox. The exporter backs off,
+   honours `Retry-After`, and sends each stored span again byte for byte, in a
+   request that can hold other spans than the failed one.
 4. A span that Langfuse rejects moves to a dead-letter table after the exporter
    isolated it from its batch. The rest of the batch is delivered.
 
@@ -209,9 +210,13 @@ Notes on the fields:
 - `usage` and `cost` hold at most 1,024 entries each. A key has 1 to 1,024
   printable ASCII characters and starts with neither `$` nor `_`.
 - `tags` are at most 8,192 strings.
-- With `cost` set, Langfuse uses your numbers and infers nothing from the model
-  name. Without it, Langfuse prices the usage from its model table.
-- `prompt` links a generation to a prompt version in Langfuse. Other observation
+- A string cut inside an emoji holds a lone surrogate, which Convex refuses. The
+  client sends U+FFFD in its place.
+- A `cost` with at least one usable entry replaces Langfuse's own pricing.
+  Without one, Langfuse may infer a cost when its model table has a price for
+  the model. Cost values are non-negative numbers.
+- `prompt` links a generation to a prompt version in Langfuse; a link without a
+  name or without a positive integer version is left out. Other observation
   types ignore it.
 - `environment` and `release` on the trace override the component's defaults.
 - `experiment` on the trace attaches its observations to a Langfuse experiment
@@ -276,25 +281,28 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Code                  | Meaning                                                      | Record sent        |
 | --------------------- | ------------------------------------------------------------ | ------------------ |
 | `invalid_id`          | A trace id, observation id, seed or key is invalid           | no                 |
-| `invalid_environment` | The environment name breaks Langfuse's rule                  | no                 |
+| `invalid_environment` | The trace's or the default environment name is invalid       | no                 |
 | `row_too_large`       | The encoded observation exceeds 900 KiB                      | no                 |
 | `redact_failed`       | `redact` threw                                               | no                 |
 | `backlog`             | The outbox is full, see [Delivery](#delivery)                | no                 |
 | `enqueue_failed`      | The component call failed                                    | no                 |
 | `unserializable`      | `input`, `output` or a JSON field cannot be serialized       | without that field |
-| `invalid_metadata`    | A metadata or model-parameter value is not a plain object    | without that field |
+| `invalid_metadata`    | Metadata or model parameters do not convert to a JSON object | without that field |
 | `invalid_tags`        | The tags are not an array of at most 8,192 strings           | without the tags   |
 | `invalid_usage`       | A usage entry has a bad key or value                         | without that entry |
 | `invalid_usage`       | `usage` has more than 1,024 entries                          | without `usage`    |
 | `invalid_cost`        | A cost entry has a bad key or value                          | without that entry |
 | `invalid_cost`        | `cost` has more than 1,024 entries, or its sum is not finite | without `cost`     |
+| `invalid_prompt`      | A prompt link lacks a name or a positive integer version     | without `prompt`   |
 
 ## Delivery
 
 - **At least once.** The exporter sends an enqueued row until Langfuse answers
   2xx, the row becomes a dead letter, or it expires. Langfuse answers 2xx when
-  it queued a batch. An accepted row leaves the outbox. A batch whose answer got
-  lost is sent again with identical bytes and identical ids.
+  it queued a batch. An accepted row leaves the outbox. The spans of a batch
+  whose answer got lost are sent again, each byte for byte with its ids, in a
+  request that can hold other spans. Langfuse can show a span it received twice
+  as two observations until its background merge.
 - **Order.** The exporter sends the oldest rows first. Langfuse places an
   observation by its ids and timestamps, not by its arrival.
 - **Backoff.** Network errors, timeouts after 20 s, 408, 425, 429 and 5xx back

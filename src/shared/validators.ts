@@ -47,6 +47,9 @@ export const vTraceContext = v.object({
   ),
 });
 
+/** A generation's link to a prompt version in Langfuse. */
+export const vPrompt = v.object({ name: v.string(), version: v.number() });
+
 /** One observation, encoded as one OTLP span. */
 export const vObservation = v.object({
   id: v.string(),
@@ -71,12 +74,11 @@ export const vObservation = v.object({
   modelParameters: v.optional(v.string()),
   usage: v.optional(v.record(v.string(), v.number())),
   cost: v.optional(v.record(v.string(), v.number())),
-  prompt: v.optional(
-    v.object({ name: v.string(), version: v.optional(v.number()) }),
-  ),
+  prompt: v.optional(vPrompt),
 });
 
 export type TraceContext = Infer<typeof vTraceContext>;
 export type Observation = Infer<typeof vObservation>;
+export type Prompt = Infer<typeof vPrompt>;
 export type ObservationType = Infer<typeof vObservationType>;
 export type Level = Infer<typeof vLevel>;

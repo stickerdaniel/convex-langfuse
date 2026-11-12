@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { internal } from "./_generated/api.js";
-import { DEAD_LETTER_RETENTION_MS, MAX_PENDING_AGE_MS } from "./constants.js";
+import {
+  DEAD_LETTER_RETENTION_MS,
+  MAX_PENDING_AGE_MS,
+  MAX_ROW_BYTES,
+  RETENTION_BATCH_BYTES,
+} from "./constants.js";
 import {
   countStep,
   enableExport,
@@ -95,6 +100,95 @@ describe("retention sweep", () => {
     state = await tables(t);
     expect(state.deadLetters).toEqual([]);
     expect(state.payloads).toEqual([]);
+  });
+
+  describe("with Convex's transaction limits", () => {
+    const ROWS = 20;
+    const data = "x".repeat(MAX_ROW_BYTES);
+
+    beforeEach(() => {
+      t = initConvexTest({ transactionLimits: true });
+    });
+
+    /** `count` outbox rows of `MAX_ROW_BYTES`, five per commit. */
+    async function insertLargeRows(count: number): Promise<void> {
+      for (let i = 0; i < count; i += 5) {
+        await insertRows(
+          t,
+          Array.from({ length: Math.min(5, count - i) }, () => ({ data })),
+        );
+      }
+    }
+
+    /** `count` dead letters of `MAX_ROW_BYTES`, five per commit. */
+    async function insertLargeDeadLetters(count: number): Promise<void> {
+      for (let i = 0; i < count; i += 5) {
+        await t.run(async (ctx) => {
+          for (let j = i; j < Math.min(i + 5, count); j++) {
+            const payloadId = await ctx.db.insert("payloads", { data });
+            await ctx.db.insert("deadLetters", {
+              kind: "span",
+              ref: `r${j}`,
+              bytes: MAX_ROW_BYTES,
+              payloadId,
+              reason: "rejected",
+              status: 400,
+              failedAt: Date.now() - DEAD_LETTER_RETENTION_MS - 1,
+            });
+          }
+        });
+      }
+    }
+
+    async function sweepUntilDone(): Promise<void> {
+      await t.mutation(internal.retention.sweep, {});
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+    }
+
+    test("20 expired rows of 900 KiB are all deleted and counted", async () => {
+      await insertLargeRows(ROWS);
+      vi.setSystemTime(Date.now() + MAX_PENDING_AGE_MS + 1_000);
+      await sweepUntilDone();
+
+      const state = await tables(t);
+      expect(state.outbox).toEqual([]);
+      expect(state.payloads).toEqual([]);
+      expect(state.exporter[0]).toMatchObject({
+        expired: ROWS,
+        removedRows: ROWS,
+        removedBytes: ROWS * MAX_ROW_BYTES,
+      });
+      expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
+    });
+
+    test("20 old dead letters of 900 KiB are all deleted", async () => {
+      await insertLargeDeadLetters(ROWS);
+      await sweepUntilDone();
+
+      const state = await tables(t);
+      expect(state.deadLetters).toEqual([]);
+      expect(state.payloads).toEqual([]);
+    });
+
+    test("dead letters follow in the next run once outbox rows spent the budget", async () => {
+      const rows = Math.floor(RETENTION_BATCH_BYTES / MAX_ROW_BYTES) + 1;
+      await insertLargeRows(rows);
+      vi.setSystemTime(Date.now() + MAX_PENDING_AGE_MS + 1_000);
+      await insertLargeDeadLetters(3);
+
+      await t.mutation(internal.retention.sweep, {});
+      let state = await tables(t);
+      expect(state.outbox).toHaveLength(1);
+      expect(state.deadLetters).toHaveLength(3);
+      expect(await pendingScheduled(t)).toContain("retention:sweep");
+
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+      state = await tables(t);
+      expect(state.outbox).toEqual([]);
+      expect(state.deadLetters).toEqual([]);
+      expect(state.payloads).toEqual([]);
+      expect(state.exporter[0]!.expired).toBe(rows);
+    });
   });
 
   test("a sweep over empty tables writes and schedules nothing", async () => {

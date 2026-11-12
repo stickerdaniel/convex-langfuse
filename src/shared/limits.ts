@@ -6,13 +6,16 @@ const MIB = 1024 * KIB;
 
 /** Encoded span bytes per outbox row. A document holds at most 1 MiB. */
 export const MAX_ROW_BYTES = 900 * KIB;
-/** Encoded span bytes per `tracing.record` call, a quarter of a transaction. */
+/**
+ * Encoded span bytes per `tracing.record` call, measured without the
+ * environment and release the component stamps. With the largest defaults a
+ * call stores about 6.7 MB, below the 16 MiB a transaction writes.
+ */
 export const MAX_CALL_BYTES = 4 * MIB;
 /** Observations per `tracing.record` call. */
 export const MAX_CALL_RECORDS = 50;
 /**
- * Encoded span bytes the client puts into one call. Below `MAX_CALL_BYTES`,
- * which leaves room for the environment and release the component stamps.
+ * Encoded span bytes the client puts into one call, below `MAX_CALL_BYTES`.
  * The client sends only what the encoder exports, so the arguments of a call
  * stay close to this size and far below Convex's 16 MiB argument limit.
  */

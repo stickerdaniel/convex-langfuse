@@ -67,7 +67,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             name: string;
             output?: string;
             parentId?: string;
-            prompt?: { name: string; version?: number };
+            prompt?: { name: string; version: number };
             startTime: number;
             statusMessage?: string;
             type:

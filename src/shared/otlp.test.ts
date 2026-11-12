@@ -88,12 +88,43 @@ function jsonAttribute(span: Span, key: string): unknown {
   return value === undefined ? undefined : JSON.parse(value);
 }
 
+/** The attribute set of the design, written out independently of `ATTR`. */
+const ATTRIBUTE_NAMES = [
+  "langfuse.observation.type",
+  "langfuse.trace.name",
+  "user.id",
+  "session.id",
+  "langfuse.trace.tags",
+  "langfuse.trace.metadata",
+  "langfuse.environment",
+  "langfuse.release",
+  "langfuse.version",
+  "langfuse.observation.input",
+  "langfuse.observation.output",
+  "langfuse.observation.metadata",
+  "langfuse.observation.level",
+  "langfuse.observation.status_message",
+  "langfuse.observation.model.name",
+  "langfuse.observation.model.parameters",
+  "langfuse.observation.usage_details",
+  "langfuse.observation.cost_details",
+  "langfuse.observation.prompt.name",
+  "langfuse.observation.prompt.version",
+  "langfuse.observation.completion_start_time",
+  "langfuse.experiment.id",
+  "langfuse.experiment.name",
+  "langfuse.experiment.dataset.id",
+  "langfuse.experiment.item.id",
+  "langfuse.experiment.item.root_observation_id",
+  "langfuse.experiment.metadata",
+];
+
 describe("attribute set", () => {
-  test("a maximal generation emits exactly the ATTR names", () => {
+  test("a maximal generation emits exactly the 27 attributes", () => {
     const span = encode(maximalGeneration, maximalTrace);
     const emitted = span.attributes.map((entry) => entry.key);
-    expect(new Set(emitted)).toEqual(new Set(Object.values(ATTR)));
-    expect(emitted).toHaveLength(Object.values(ATTR).length);
+    expect(ATTRIBUTE_NAMES).toHaveLength(27);
+    expect([...emitted].sort()).toEqual([...ATTRIBUTE_NAMES].sort());
   });
 
   test("every ATTR name is a Langfuse SDK attribute", () => {
@@ -250,6 +281,14 @@ describe("cost", () => {
     });
   });
 
+  test("drops a negative entry before the total is built", () => {
+    const span = encode({ cost: { input: -0.002, output: 0.005 } });
+    expect(jsonAttribute(span, ATTR.cost)).toEqual({
+      output: 0.005,
+      total: 0.005,
+    });
+  });
+
   test("writes no cost when the total overflows", () => {
     const span = encode({
       cost: { input: 1e308, input_audio_tokens: 1e308 },
@@ -296,21 +335,44 @@ describe("prompt", () => {
     expect(attribute(span, ATTR.promptVersion)).toEqual({ intValue: "4" });
   });
 
+  test("exports the values it checked when a field reads differently later", () => {
+    let reads = 0;
+    const changing = {
+      get name() {
+        return reads++ === 0 ? "chat-system" : (undefined as unknown as string);
+      },
+      version: 4,
+    };
+    const span = encode({ type: "generation", prompt: changing });
+    expect(attribute(span, ATTR.promptName)).toEqual({
+      stringValue: "chat-system",
+    });
+    expect(attribute(span, ATTR.promptVersion)).toEqual({ intValue: "4" });
+  });
+
   test("writes no prompt on a span", () => {
     const span = encode({ type: "span", prompt });
     expect(attribute(span, ATTR.promptName)).toBeUndefined();
     expect(attribute(span, ATTR.promptVersion)).toBeUndefined();
   });
 
-  test("writes no version that is not a positive integer", () => {
-    for (const version of [0, -1, 1.5, undefined]) {
-      const span = encode({
-        type: "generation",
-        prompt: { name: "p", version },
-      });
-      expect(attribute(span, ATTR.promptName)).toEqual({ stringValue: "p" });
-      expect(attribute(span, ATTR.promptVersion)).toBeUndefined();
-    }
+  test.each([
+    { name: "a missing version", prompt: { name: "p" } },
+    { name: "version 0", prompt: { name: "p", version: 0 } },
+    { name: "a fractional version", prompt: { name: "p", version: 1.5 } },
+    { name: "a negative version", prompt: { name: "p", version: -1 } },
+    { name: "an empty name", prompt: { name: "", version: 4 } },
+    { name: "a missing name", prompt: { version: 4 } },
+    { name: "a name that is no string", prompt: { name: 7, version: 4 } },
+    { name: "null", prompt: null },
+  ])("writes neither attribute for $name", ({ prompt }) => {
+    // A caller without types can pass anything.
+    const span = encode({
+      type: "generation",
+      prompt: prompt as typeof base.prompt,
+    });
+    expect(attribute(span, ATTR.promptName)).toBeUndefined();
+    expect(attribute(span, ATTR.promptVersion)).toBeUndefined();
   });
 });
 
