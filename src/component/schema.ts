@@ -200,7 +200,6 @@ export default defineSchema({
     fetchedAt: v.number(),
   })
     .index("by_key", ["key"])
-    .index("by_name_version", ["name", "version"])
     .index("by_fetchedAt", ["fetchedAt"]),
 
   /** The snapshot a label of a prompt name resolves to, from the last refresh. */
@@ -212,16 +211,37 @@ export default defineSchema({
     .index("by_name_label", ["name", "label"])
     .index("by_snapshot", ["snapshotId"]),
 
+  /**
+   * The snapshot a version of a prompt name resolved to in the last refresh
+   * that fetched it. A version that references another prompt's label can
+   * resolve to other text over time. A pointer keeps no snapshot alive: the
+   * retention sweep deletes it with its snapshot.
+   */
+  promptVersions: defineTable({
+    name: v.string(),
+    version: v.number(),
+    snapshotId: v.id("promptSnapshots"),
+  })
+    .index("by_name_version", ["name", "version"])
+    .index("by_snapshot", ["snapshotId"]),
+
   /** A tracked prompt name and its refresh fence. */
   promptNames: defineTable({
+    /** At most `MAX_PROMPT_NAME_BYTES`. */
     name: v.string(),
-    /** Fences refreshes: only the refresh with the current generation applies. */
-    generation: v.number(),
-    /** Every other prompt name in the resolution graphs of its labels. */
+    /**
+     * Fences refreshes: only the refresh holding this token publishes. Every
+     * reservation draws a new random one.
+     */
+    token: v.string(),
+    /**
+     * Other prompt names in the resolution graphs of its labels, sorted, at
+     * most `MAX_PROMPT_DEPENDENCIES` of at most `MAX_PROMPT_NAME_BYTES` each.
+     */
     dependsOn: v.array(v.string()),
     /** Last time a refresh was reserved. */
     attemptedAt: v.number(),
-    /** Last time a refresh was applied. */
+    /** Last time a refresh was published. */
     refreshedAt: v.optional(v.number()),
     /** Fixed code of the last refresh's first failure. */
     error: v.optional(v.string()),

@@ -548,6 +548,11 @@ describe("a component call carries only what the span exports", () => {
       name: "no name",
       prompt: { version: 2 } as { name: string; version: number },
     },
+    // A replaced character would link another prompt.
+    {
+      name: "a lone surrogate in the name",
+      prompt: { name: "cut 😀".slice(0, -1), version: 2 },
+    },
     {
       name: "a name that is no string",
       prompt: { name: 7, version: 2 } as unknown as {
@@ -742,7 +747,6 @@ describe("a string cut inside an emoji", () => {
           statusMessage: CUT,
           version: CUT,
           model: CUT,
-          prompt: { name: CUT, version: 1 },
         }),
     );
 
@@ -762,7 +766,6 @@ describe("a string cut inside an emoji", () => {
       statusMessage: FIXED,
       version: FIXED,
       model: FIXED,
-      prompt: { name: FIXED, version: 1 },
     });
     for (const text of strings(calls)) expect(text).not.toMatch(/\p{Cs}/u);
     expect((await tables(t)).outbox).toHaveLength(1);

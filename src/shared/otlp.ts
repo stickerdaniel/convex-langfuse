@@ -71,7 +71,8 @@ export function costDetails(cost: Record<string, number>): string | undefined {
 
 /**
  * The prompt link to export, or `undefined`: a copy of an object with a
- * non-empty string name and a positive integer version. It checks at
+ * non-empty string name without a lone surrogate and a positive integer
+ * version. A replaced character would link another prompt. It checks at
  * runtime, because a caller without types can pass anything, and reads each
  * field once, so what it checked is what it returns. Langfuse rejects a
  * generation that carries only one of the two attributes, so the encoder
@@ -82,6 +83,7 @@ export function promptLink(prompt: unknown): Prompt | undefined {
   const { name, version } = prompt as { name?: unknown; version?: unknown };
   return typeof name === "string" &&
     name !== "" &&
+    !hasLoneSurrogate(name) &&
     typeof version === "number" &&
     Number.isSafeInteger(version) &&
     version > 0
@@ -207,4 +209,14 @@ export function buildExportBody(
 /** UTF-8 byte length. */
 export function byteLength(text: string): number {
   return encoder.encode(text).byteLength;
+}
+
+/**
+ * Whether `text` holds a lone surrogate, as a string cut inside an emoji
+ * does. Convex refuses such a function argument. In Unicode mode a
+ * surrogate pair is one code point, so the category "surrogate" matches
+ * only the lone ones.
+ */
+export function hasLoneSurrogate(text: string): boolean {
+  return /\p{Cs}/u.test(text);
 }

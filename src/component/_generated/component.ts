@@ -98,7 +98,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "action",
         "internal",
         { names?: Array<string> },
-        { overflow: number; status: "ok" | "disabled"; tracked: number },
+        {
+          overflow: number;
+          status: "ok" | "incomplete" | "disabled";
+          tracked: number;
+        },
         Name
       >;
     };

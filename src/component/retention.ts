@@ -16,7 +16,11 @@ import {
   scheduleCount,
   withRemoved,
 } from "./outbox.js";
-import { collectSnapshots, deleteExpiredPins } from "./prompts.js";
+import {
+  collectSnapshots,
+  deleteExpiredPins,
+  vSnapshotPass,
+} from "./prompts.js";
 import { forgetOp } from "./scoreKeys.js";
 
 /**
@@ -32,18 +36,19 @@ const EXPIRING = ["span", "scoreCreate", "scoreDelete"] as const;
  * without pointers idle for `SCORE_KEY_RETENTION_MS`, deletes expired prompt
  * pins, then prompt snapshots that no label and no pin references (see
  * `prompts.collectSnapshots`). At most `RETENTION_BATCH` of each and
- * `RETENTION_BATCH_BYTES` of payloads in total per run; a run that reaches a
- * limit schedules the next one at once, which continues the snapshot scan at
- * `snapshotsFrom`. Expired span and score rows add to the removed totals, and
+ * `RETENTION_BATCH_BYTES` in total per run, for the payloads it deletes and
+ * the snapshots it reads and deletes; a run that reaches a limit schedules
+ * the next one at once, which continues the snapshot collection pass in
+ * `snapshots`. Expired span and score rows add to the removed totals, and
  * an expired score op leaves no pointer to it. Starts a count chain while
  * rows are pending or receipts are left, then sets the gate from both totals
  * and resets drifted totals once no counted row and no receipt is left
  * (`reconcile`). A run that finds nothing to do writes and schedules nothing.
  */
 export const sweep = internalMutation({
-  args: { snapshotsFrom: v.optional(v.number()) },
+  args: { snapshots: v.optional(vSnapshotPass) },
   returns: v.null(),
-  handler: async (ctx, { snapshotsFrom }) => {
+  handler: async (ctx, args) => {
     const now = Date.now();
 
     // Payload bytes and rows this run deletes. The sizes come from `bytes`,
@@ -136,7 +141,16 @@ export const sweep = internalMutation({
     }
 
     const expiredPins = await deleteExpiredPins(ctx, now);
-    const nextSnapshots = await collectSnapshots(ctx, now, snapshotsFrom);
+    // Snapshot collection spends what the payloads left of the budget. Once
+    // they spent it, collection waits for the next run.
+    const snapshots = overBudget
+      ? args.snapshots
+      : await collectSnapshots(
+          ctx,
+          now,
+          RETENTION_BATCH_BYTES - spentBytes,
+          args.snapshots,
+        );
 
     // Receipts stay behind when traffic stops before the next chain is due.
     if (
@@ -153,11 +167,9 @@ export const sweep = internalMutation({
       deadLetters.length === RETENTION_BATCH ||
       oldKeys.length === RETENTION_BATCH ||
       expiredPins === RETENTION_BATCH ||
-      nextSnapshots !== undefined
+      snapshots !== undefined
     ) {
-      await ctx.scheduler.runAfter(0, internal.retention.sweep, {
-        snapshotsFrom: nextSnapshots,
-      });
+      await ctx.scheduler.runAfter(0, internal.retention.sweep, { snapshots });
     }
     return null;
   },

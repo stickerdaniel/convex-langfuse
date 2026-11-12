@@ -2,8 +2,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api.js";
 import type { Doc } from "./_generated/dataModel.js";
 import {
+  MAX_PROMPT_DEPENDENCIES,
+  MAX_PROMPT_LABELS,
+  MAX_PROMPT_NAME_BYTES,
+  MAX_PROMPT_NAMES,
+  MAX_SNAPSHOT_BYTES,
   PIN_TTL_MS,
+  PROMPT_LIST_MAX_PAGES,
   PROMPT_REFRESH_INTERVAL_MS,
+  PROMPT_REFRESH_SPACING_MS,
+  PROMPT_STEP_LABELS,
+  RETENTION_BATCH,
   SNAPSHOT_GRACE_MS,
   WEBHOOK_TOLERANCE_MS,
 } from "./constants.js";
@@ -11,7 +20,7 @@ import {
   enableExport,
   installFakeLangfuse,
   pendingScheduled,
-  runScheduledNow,
+  refusalCode,
   type FakeLangfuse,
   type TestConvex,
 } from "./fakeLangfuse.test-util.js";
@@ -47,13 +56,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-/** Runs scheduled functions, and the ones they schedule, until none is left. */
+/**
+ * Runs scheduled functions, and the ones they schedule, until none is left.
+ * The fake clock moves to each one's time, such as a tick's spaced refreshes.
+ */
 async function settle(): Promise<void> {
-  for (let i = 0; i < 20; i++) {
-    await runScheduledNow(t);
-    if ((await pendingScheduled(t)).length === 0) return;
-  }
-  throw new Error("settle: functions are still scheduled");
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 }
 
 async function sync(names?: string[]) {
@@ -72,6 +80,7 @@ const pin = (
   name: string,
   extra: {
     label?: string;
+    version?: number;
     fallback?: { type: "text" | "chat"; prompt: string; config?: string };
     ttlMs?: number;
   } = {},
@@ -97,6 +106,7 @@ async function notify(name: string): Promise<void> {
 type PromptTables = {
   promptSnapshots: Doc<"promptSnapshots">[];
   promptLabels: Doc<"promptLabels">[];
+  promptVersions: Doc<"promptVersions">[];
   promptNames: Doc<"promptNames">[];
   promptPins: Doc<"promptPins">[];
   promptSync: Doc<"promptSync">[];
@@ -106,6 +116,7 @@ async function promptTables(): Promise<PromptTables> {
   return await t.run(async (ctx) => ({
     promptSnapshots: await ctx.db.query("promptSnapshots").collect(),
     promptLabels: await ctx.db.query("promptLabels").collect(),
+    promptVersions: await ctx.db.query("promptVersions").collect(),
     promptNames: await ctx.db.query("promptNames").collect(),
     promptPins: await ctx.db.query("promptPins").collect(),
     promptSync: await ctx.db.query("promptSync").collect(),
@@ -123,6 +134,66 @@ async function nameRow(name: string) {
 }
 
 const promptHealth = async () => (await t.query(api.outbox.health, {})).prompts;
+
+const MINUTE = 60_000;
+
+/** The refreshes that are scheduled and have not run, with their start time. */
+async function scheduledRefreshes(): Promise<{ name: string; at: number }[]> {
+  return await t.run(async (ctx) =>
+    (await ctx.db.system.query("_scheduled_functions").collect())
+      .filter(
+        (job) => job.state.kind === "pending" && job.name === "prompts:refresh",
+      )
+      .map((job) => ({
+        name: (job.args[0] as { name: string }).name,
+        at: job.scheduledTime,
+      })),
+  );
+}
+
+/** A text snapshot of `name` as a refresh would store it, for direct inserts. */
+function snapshotDoc(
+  name: string,
+  fields: { fetchedAt: number; prompt?: string },
+): Omit<Doc<"promptSnapshots">, "_id" | "_creationTime"> {
+  return {
+    key: `${name}-${fields.fetchedAt}-${Math.random()}`,
+    name,
+    version: 1,
+    source: "langfuse",
+    type: "text",
+    prompt: fields.prompt ?? name,
+    config: "{}",
+    fetchedAt: fields.fetchedAt,
+  };
+}
+
+/**
+ * A fake answer that holds the first request `matches` accepts until
+ * `release` is called, and tells once that request arrived.
+ */
+function holdFirst(matches: (path: string) => boolean) {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let holding = true;
+  const from = fake.requests.length;
+  fake.fallback = async (request) => {
+    const answer = prompts.answer(request);
+    if (holding && matches(request.path)) {
+      holding = false;
+      await held;
+    }
+    return answer;
+  };
+  return {
+    release,
+    arrived: async () => {
+      while (!fake.requests.slice(from).some((r) => matches(r.path))) {
+        await realTick();
+      }
+    },
+  };
+}
 
 describe("sync and get", () => {
   test("sync fills snapshots and labels; get resolves production by default, a label and a version", async () => {
@@ -232,6 +303,57 @@ describe("sync and get", () => {
     expect(tracked).toHaveLength(500);
     expect(tracked).not.toContain("p500");
   });
+
+  test("a name of 257 UTF-8 bytes: sync refuses it, the listing counts it as overflow, get returns null and pin refuses it", async () => {
+    const longest = "é".repeat(MAX_PROMPT_NAME_BYTES / 2);
+    const long = `${longest}n`;
+    prompts.add(longest, "Longest");
+    prompts.add(long, "Too long");
+
+    expect(
+      await refusalCode(t.action(api.prompts.sync, { names: [long] })),
+    ).toBe("invalid_prompt_name");
+    expect(await sync()).toEqual({ status: "ok", tracked: 1, overflow: 1 });
+    expect(await get(longest)).toMatchObject({ prompt: "Longest" });
+    expect(await get(long)).toBeNull();
+    expect(
+      await refusalCode(
+        pin("s", long, { fallback: { type: "text", prompt: "Fallback" } }),
+      ),
+    ).toBe("invalid_prompt_name");
+    const state = await promptTables();
+    expect(state.promptNames.map((row) => row.name)).toEqual([longest]);
+    expect(state.promptPins).toEqual([]);
+  });
+
+  test("a listing cut at its page cap returns incomplete, and the next tick starts no listing", async () => {
+    prompts.override = (request) => {
+      const url = new URL(request.url);
+      if (
+        url.pathname !== "/api/public/v2/prompts" ||
+        url.searchParams.has("name")
+      ) {
+        return undefined;
+      }
+      const page = Number(url.searchParams.get("page"));
+      return {
+        status: 200,
+        body: {
+          data: [{ name: `p${page}`, labels: ["production"] }],
+          meta: { page, totalPages: PROMPT_LIST_MAX_PAGES + 1 },
+        },
+      };
+    };
+    expect(await sync()).toEqual({
+      status: "incomplete",
+      tracked: PROMPT_LIST_MAX_PAGES,
+      overflow: 0,
+    });
+
+    vi.setSystemTime(Date.now() + 5 * MINUTE);
+    await t.mutation(internal.prompts.tick, {});
+    expect(await pendingScheduled(t)).toEqual([]);
+  });
 });
 
 describe("webhook", () => {
@@ -277,18 +399,24 @@ describe("webhook", () => {
     expect(fake.requests).toEqual([]);
   });
 
-  test("five identical valid deliveries add no row beyond the first", async () => {
+  test("five identical valid deliveries each refresh the prompt and add no row beyond the first", async () => {
     prompts.add("greeting", "Hello");
+    const fetches = () =>
+      fake.requests.filter((request) =>
+        request.path.startsWith("/api/public/v2/prompts/greeting?"),
+      ).length;
     const body = webhookBody("greeting");
     const header = signature(body);
     const response = await deliver(body, header);
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("");
     await settle();
+    expect(fetches()).toBe(1);
     const counts = rowCounts(await promptTables());
     expect(counts).toEqual({
       promptSnapshots: 1,
       promptLabels: 1,
+      promptVersions: 1,
       promptNames: 1,
       promptPins: 0,
       promptSync: 1,
@@ -297,6 +425,7 @@ describe("webhook", () => {
     for (let i = 0; i < 4; i++) {
       expect((await deliver(body, header)).status).toBe(200);
       await settle();
+      expect(fetches()).toBe(i + 2);
     }
     expect(rowCounts(await promptTables())).toEqual(counts);
     expect(await get("greeting")).toMatchObject({ prompt: "Hello" });
@@ -307,6 +436,32 @@ describe("webhook", () => {
     expect((await deliver(body)).status).toBe(200);
     expect((await deliver("not json")).status).toBe(400);
     expect((await pendingScheduled(t)).length).toBe(0);
+  });
+
+  test("a webhook for a name of 257 UTF-8 bytes answers 200 and tracks nothing", async () => {
+    const long = `${"é".repeat(MAX_PROMPT_NAME_BYTES / 2)}n`;
+    prompts.add(long, "Too long");
+    await notify(long);
+    expect((await promptTables()).promptNames).toEqual([]);
+    expect(fake.requests).toEqual([]);
+  });
+
+  test("a parent that lost its label on a 409 is refreshed by the webhook of its restored dependency", async () => {
+    prompts.add("child", "world");
+    prompts.add(
+      "parent",
+      "Hello @@@langfusePrompt:name=child|label=production@@@",
+    );
+    await sync();
+
+    prompts.delete("child");
+    await notify("child");
+    expect(await get("parent")).toBeNull();
+    expect((await nameRow("parent"))?.error).toBe("http_409");
+
+    prompts.add("child", "again");
+    await notify("child");
+    expect(await get("parent")).toMatchObject({ prompt: "Hello again" });
   });
 });
 
@@ -505,6 +660,51 @@ describe("snapshots", () => {
     expect((await nameRow("big"))?.error).toBe("oversize");
     expect((await promptHealth()).errors).toBe(1);
   });
+
+  test("a version returns what the last refresh resolved it to, while a pin keeps an earlier resolution", async () => {
+    prompts.add("child", "A");
+    prompts.add("parent", "@@@langfusePrompt:name=child|label=production@@@");
+    await sync();
+    expect(await get("parent", { version: 1 })).toMatchObject({ prompt: "A" });
+
+    // The child's label moves to a new version: parent version 1 reads B.
+    prompts.add("child", "B");
+    await notify("child");
+    expect(await get("parent", { version: 1 })).toMatchObject({ prompt: "B" });
+    const pinned = await pin("s1", "parent", { version: 1 });
+    expect(pinned).toMatchObject({ prompt: "B" });
+
+    // It moves back: the refresh finds the first snapshot by its key.
+    prompts.move("child", 1, "production");
+    await notify("child");
+    expect(await get("parent")).toMatchObject({ prompt: "A" });
+    expect(await get("parent", { version: 1 })).toMatchObject({ prompt: "A" });
+    expect(await pin("s2", "parent", { version: 1 })).toMatchObject({
+      prompt: "A",
+    });
+    expect(await pin("s1", "parent")).toEqual(pinned);
+  });
+
+  test("a dependency name of 257 bytes is left out of dependsOn, also where it would sort into the first 32, and the error is recorded", async () => {
+    const long = "a".repeat(MAX_PROMPT_NAME_BYTES + 1);
+    const children = Array.from(
+      { length: MAX_PROMPT_DEPENDENCIES },
+      (_, i) => `c${String(i).padStart(2, "0")}`,
+    );
+    for (const child of [long, ...children]) prompts.add(child, "x");
+    prompts.add(
+      "parent",
+      [long, ...children]
+        .map((child) => `@@@langfusePrompt:name=${child}|label=production@@@`)
+        .join(""),
+    );
+    await sync(["parent"]);
+    expect(await get("parent")).toMatchObject({ prompt: "x".repeat(33) });
+    expect(await nameRow("parent")).toMatchObject({
+      dependsOn: children,
+      error: "too_many_dependencies",
+    });
+  });
 });
 
 describe("refresh", () => {
@@ -516,41 +716,140 @@ describe("refresh", () => {
     });
 
     // The older refresh reads v1 and is held before it can apply.
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => (release = resolve));
-    let holding = true;
-    fake.fallback = async (request) => {
-      const answer = prompts.answer(request);
-      if (holding && request.path.includes("?label=")) {
-        holding = false;
-        await held;
-      }
-      return answer;
-    };
-    const sent = fake.requests.length;
+    const hold = holdFirst((path) => path.includes("?label="));
     const olderRun = t.action(internal.prompts.refresh, {
       name: "greeting",
-      generation: older!,
+      token: older!,
     });
-    while (!fake.requests.slice(sent).some((r) => r.path.includes("?label="))) {
-      await realTick();
-    }
+    await hold.arrived();
 
     prompts.add("greeting", "Hello v2");
-    vi.setSystemTime(Date.now() + 1);
     const [newer] = await t.mutation(internal.prompts.reserve, {
       names: ["greeting"],
     });
-    expect(newer).toBeGreaterThan(older!);
+    expect(newer).not.toBe(older);
     await t.action(internal.prompts.refresh, {
       name: "greeting",
-      generation: newer!,
+      token: newer!,
     });
     expect(await get("greeting")).toMatchObject({ prompt: "Hello v2" });
 
-    release();
+    hold.release();
     await olderRun;
     expect(await get("greeting")).toMatchObject({ prompt: "Hello v2" });
+  });
+
+  test("with a frozen clock, a refresh reserved before the name was deleted and tracked again leaves the newer result", async () => {
+    const refresh = async (token: string | null) =>
+      await t.action(internal.prompts.refresh, {
+        name: "greeting",
+        token: token!,
+      });
+    const reserve = async () =>
+      (await t.mutation(internal.prompts.reserve, { names: ["greeting"] }))[0]!;
+
+    // With the fake clock frozen at T, convex-test runs the first
+    // transaction at T and every later one at T + 1. A fence derived from
+    // the clock would give the row created again below the value of the
+    // older reservation.
+    prompts.add("greeting", "Old");
+    await reserve();
+    const older = await reserve();
+    const hold = holdFirst((path) => path.includes("?label="));
+    const olderRun = refresh(older);
+    await hold.arrived();
+
+    // The prompt is deleted, its refresh deletes the row, and it is tracked
+    // again, all in the same millisecond.
+    prompts.delete("greeting");
+    await refresh(await reserve());
+    expect(await nameRow("greeting")).toBeUndefined();
+    prompts.add("greeting", "New");
+    await refresh(await reserve());
+    expect(await get("greeting")).toMatchObject({ prompt: "New" });
+
+    hold.release();
+    await olderRun;
+    expect(await get("greeting")).toMatchObject({ prompt: "New" });
+  });
+
+  test("a refresh that stops after its first storing step publishes no label, and the next one publishes every label together", async () => {
+    const labels = ["a", "b", "c", "d", "e", "f"];
+    expect(labels.length).toBeGreaterThan(PROMPT_STEP_LABELS);
+    prompts.add("greeting", "Old", labels);
+    await sync();
+    prompts.add("greeting", "New", labels);
+
+    // The first label of the second step never answers.
+    const hold = holdFirst((path) => path.endsWith("?label=e"));
+    const [token] = await t.mutation(internal.prompts.reserve, {
+      names: ["greeting"],
+    });
+    const stopped = t.action(internal.prompts.refresh, {
+      name: "greeting",
+      token: token!,
+    });
+    await hold.arrived();
+    for (const label of labels) {
+      expect(await get("greeting", { label })).toMatchObject({ prompt: "Old" });
+    }
+
+    await notify("greeting");
+    for (const label of labels) {
+      expect(await get("greeting", { label })).toMatchObject({ prompt: "New" });
+    }
+    hold.release();
+    await stopped;
+  });
+
+  test("a refresh of 50 labels has at most PROMPT_STEP_LABELS label requests in flight at once", async () => {
+    const labels = Array.from(
+      { length: MAX_PROMPT_LABELS },
+      (_, i) => `l${String(i).padStart(2, "0")}`,
+    );
+    prompts.add("wide", "Hello", labels);
+    let inFlight = 0;
+    let most = 0;
+    fake.fallback = async (request) => {
+      if (!request.path.includes("?label=")) return prompts.answer(request);
+      most = Math.max(most, ++inFlight);
+      await realTick();
+      inFlight -= 1;
+      return prompts.answer(request);
+    };
+    await sync(["wide"]);
+    expect(most).toBe(PROMPT_STEP_LABELS);
+    expect((await promptTables()).promptLabels).toHaveLength(MAX_PROMPT_LABELS);
+  });
+
+  test("a sweep while a refresh holds an old unreferenced snapshot it reused keeps it, so the refresh publishes it", async () => {
+    const labels = ["a", "b", "c", "d", "e"];
+    prompts.add("greeting", "First", labels);
+    await sync();
+    prompts.add("greeting", "Second", labels);
+    await notify("greeting");
+    vi.setSystemTime(Date.now() + 2 * SNAPSHOT_GRACE_MS);
+
+    // The labels move back. The first step reuses the old snapshot; the
+    // refresh is held in its second step while the sweep runs.
+    prompts.move("greeting", 1, ...labels);
+    const hold = holdFirst((path) => path.endsWith("?label=e"));
+    const [token] = await t.mutation(internal.prompts.reserve, {
+      names: ["greeting"],
+    });
+    const run = t.action(internal.prompts.refresh, {
+      name: "greeting",
+      token: token!,
+    });
+    await hold.arrived();
+    await t.mutation(internal.retention.sweep, {});
+    hold.release();
+    await run;
+    for (const label of labels) {
+      expect(await get("greeting", { label })).toMatchObject({
+        prompt: "First",
+      });
+    }
   });
 
   test("without a webhook, the rolling refresh picks up a moved label, a deleted prompt, a deleted dependency and a failed refresh", async () => {
@@ -582,8 +881,8 @@ describe("refresh", () => {
     for (const minutes of [5, 10]) await tickAt(minutes);
     expect(await get("moved")).toMatchObject({ prompt: "m1" });
 
-    // 15 minutes plus one tick after the changes.
-    for (const minutes of [15, 20]) await tickAt(minutes);
+    // Due 13 minutes after the sync, reserved by the tick at minute 15.
+    await tickAt(15);
     expect(await get("moved")).toMatchObject({ prompt: "m2" });
     expect(await get("deleted")).toBeNull();
     expect(await get("parent")).toBeNull();
@@ -592,8 +891,11 @@ describe("refresh", () => {
     expect(await get("flaky")).toMatchObject({ prompt: "f1" });
     expect((await nameRow("flaky"))?.error).toBe("network");
 
-    // 15 minutes plus one tick after the failed refresh at minute 15.
-    for (const minutes of [25, 30, 35]) await tickAt(minutes);
+    // Due 13 minutes after the failed refresh, reserved by the tick at
+    // minute 30.
+    for (const minutes of [20, 25]) await tickAt(minutes);
+    expect(await get("flaky")).toMatchObject({ prompt: "f1" });
+    await tickAt(30);
     expect(await get("flaky")).toMatchObject({ prompt: "f2" });
     expect((await nameRow("flaky"))?.error).toBeUndefined();
   });
@@ -616,7 +918,7 @@ describe("refresh", () => {
     await t.run(async (ctx) => {
       await ctx.db.insert("promptNames", {
         name: "greeting",
-        generation: 1,
+        token: "token",
         dependsOn: [],
         attemptedAt: Date.now() - 2 * PROMPT_REFRESH_INTERVAL_MS,
       });
@@ -633,6 +935,221 @@ describe("refresh", () => {
     const withSync = await promptTables();
     await t.mutation(internal.prompts.tick, {});
     expect(await promptTables()).toEqual(withSync);
+    expect(await pendingScheduled(t)).toEqual([]);
+  });
+
+  test("a tick with an initialized cache and nothing due writes and schedules nothing", async () => {
+    prompts.add("greeting", "Hello");
+    await sync();
+    vi.setSystemTime(Date.now() + 5 * MINUTE);
+    const before = await promptTables();
+    await t.mutation(internal.prompts.tick, {});
+    expect(await promptTables()).toEqual(before);
+    expect(await pendingScheduled(t)).toEqual([]);
+  });
+
+  test("500 names attempted one second after a tick are scheduled by the first eligible tick within 99.8 s and applied within 20 minutes", async () => {
+    const names = Array.from(
+      { length: MAX_PROMPT_NAMES },
+      (_, i) => `p${String(i).padStart(3, "0")}`,
+    );
+    for (const name of names) prompts.add(name, name);
+    const start = Date.now();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("promptSync", { lastListAt: start });
+      for (const name of names) {
+        await ctx.db.insert("promptNames", {
+          name,
+          token: "token",
+          dependsOn: [],
+          attemptedAt: start + 1_000,
+        });
+      }
+    });
+
+    for (const minutes of [5, 10, 15]) {
+      vi.setSystemTime(start + minutes * MINUTE);
+      await t.mutation(internal.prompts.tick, {});
+      if (minutes < 15) expect(await scheduledRefreshes()).toEqual([]);
+    }
+    const scheduled = await scheduledRefreshes();
+    expect(scheduled.map((job) => job.name).sort()).toEqual(names);
+    const times = scheduled.map((job) => job.at);
+    // The transaction clock of convex-test can run up to 1 ms ahead.
+    expect(Math.min(...times) - (start + 15 * MINUTE)).toBeLessThanOrEqual(1);
+    expect(Math.max(...times) - Math.min(...times)).toBe(
+      (MAX_PROMPT_NAMES - 1) * PROMPT_REFRESH_SPACING_MS,
+    );
+
+    await vi.advanceTimersByTimeAsync(start + 1_000 + 20 * MINUTE - Date.now());
+    await t.finishInProgressScheduledFunctions();
+    expect(Date.now()).toBe(start + 1_000 + 20 * MINUTE);
+    const labeled = (await promptTables()).promptLabels.map((row) => row.name);
+    expect(labeled.sort()).toEqual(names);
+  });
+});
+
+describe("with Convex's transaction limits", () => {
+  beforeEach(() => {
+    t = initConvexTest({ transactionLimits: true });
+  });
+
+  /** The names of the snapshots left. */
+  const snapshotNames = async () =>
+    (await promptTables()).promptSnapshots.map((row) => row.name).sort();
+
+  async function sweepUntilDone(): Promise<void> {
+    await t.mutation(internal.retention.sweep, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+  }
+
+  test("500 names with rows of the largest size are reserved and scheduled by one tick and by one webhook", async () => {
+    const pad = (prefix: string) => prefix.padEnd(MAX_PROMPT_NAME_BYTES, "x");
+    const dependsOn = Array.from({ length: MAX_PROMPT_DEPENDENCIES }, (_, i) =>
+      pad(`dep${String(i).padStart(2, "0")}`),
+    );
+    const names = Array.from({ length: MAX_PROMPT_NAMES }, (_, i) =>
+      pad(`name${String(i).padStart(3, "0")}`),
+    );
+    await t.run(async (ctx) => {
+      await ctx.db.insert("promptSync", { lastListAt: Date.now() });
+    });
+    for (let i = 0; i < names.length; i += 100) {
+      await t.run(async (ctx) => {
+        for (const name of names.slice(i, i + 100)) {
+          await ctx.db.insert("promptNames", {
+            name,
+            token: "token",
+            dependsOn,
+            attemptedAt: Date.now() - PROMPT_REFRESH_INTERVAL_MS,
+          });
+        }
+      });
+    }
+
+    await t.mutation(internal.prompts.tick, {});
+    expect((await scheduledRefreshes()).map((job) => job.name).sort()).toEqual(
+      names,
+    );
+    const rows = (await promptTables()).promptNames;
+    expect(rows.filter((row) => row.token === "token")).toEqual([]);
+
+    await t.mutation(internal.prompts.webhook, { name: dependsOn[0]! });
+    expect(await scheduledRefreshes()).toHaveLength(2 * MAX_PROMPT_NAMES);
+  });
+
+  test("eleven unreferenced snapshots of 900 KiB are all collected once past the grace period; a younger one stays", async () => {
+    const fetchedAt = Date.now();
+    for (let i = 0; i < 11; i++) {
+      await t.run(async (ctx) => {
+        await ctx.db.insert(
+          "promptSnapshots",
+          snapshotDoc(`big${String(i).padStart(2, "0")}`, {
+            fetchedAt,
+            prompt: "x".repeat(MAX_SNAPSHOT_BYTES - 2),
+          }),
+        );
+      });
+    }
+    vi.setSystemTime(fetchedAt + SNAPSHOT_GRACE_MS + 1);
+    await t.run(async (ctx) => {
+      await ctx.db.insert(
+        "promptSnapshots",
+        snapshotDoc("young", { fetchedAt: fetchedAt + MINUTE }),
+      );
+    });
+    await sweepUntilDone();
+    expect(await snapshotNames()).toEqual(["young"]);
+  });
+
+  test("snapshots with one fetchedAt, more than two pages of them, are all collected", async () => {
+    const fetchedAt = Date.now() - 2 * SNAPSHOT_GRACE_MS;
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 2 * RETENTION_BATCH + 50; i++) {
+        await ctx.db.insert("promptSnapshots", snapshotDoc("s", { fetchedAt }));
+      }
+    });
+    await sweepUntilDone();
+    expect(await snapshotNames()).toEqual([]);
+  });
+
+  test("referenced snapshots in front of an orphan stay, more than one run reads, and the orphan goes", async () => {
+    const old = Date.now() - 2 * SNAPSHOT_GRACE_MS;
+    for (let i = 0; i < 12; i++) {
+      await t.run(async (ctx) => {
+        const snapshotId = await ctx.db.insert(
+          "promptSnapshots",
+          snapshotDoc("big", {
+            fetchedAt: old + i,
+            prompt: "x".repeat(850 * 1024),
+          }),
+        );
+        await ctx.db.insert("promptLabels", {
+          name: "big",
+          label: `l${i}`,
+          snapshotId,
+        });
+      });
+    }
+    await t.run(async (ctx) => {
+      await ctx.db.insert(
+        "promptSnapshots",
+        snapshotDoc("orphan", { fetchedAt: old + 100 }),
+      );
+    });
+
+    await t.mutation(internal.retention.sweep, {});
+    expect(await snapshotNames()).toContain("orphan");
+    expect(await pendingScheduled(t)).toEqual(["retention:sweep"]);
+
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(await snapshotNames()).toEqual(Array(12).fill("big"));
+  });
+
+  test("a pass whose cursor document was deleted meanwhile finishes", async () => {
+    const old = Date.now() - 2 * SNAPSHOT_GRACE_MS;
+    // A page of orphans that ends with a referenced snapshot, then more
+    // orphans.
+    const last = await t.run(async (ctx) => {
+      for (let i = 0; i < RETENTION_BATCH - 1; i++) {
+        await ctx.db.insert(
+          "promptSnapshots",
+          snapshotDoc("first", { fetchedAt: old }),
+        );
+      }
+      const snapshotId = await ctx.db.insert(
+        "promptSnapshots",
+        snapshotDoc("kept", { fetchedAt: old + 1 }),
+      );
+      const labelId = await ctx.db.insert("promptLabels", {
+        name: "kept",
+        label: "production",
+        snapshotId,
+      });
+      for (let i = 0; i < 5; i++) {
+        await ctx.db.insert(
+          "promptSnapshots",
+          snapshotDoc("after", { fetchedAt: old + 2 }),
+        );
+      }
+      return { snapshotId, labelId };
+    });
+
+    await t.mutation(internal.retention.sweep, {});
+    expect(await snapshotNames()).toEqual([
+      "after",
+      "after",
+      "after",
+      "after",
+      "after",
+      "kept",
+    ]);
+    await t.run(async (ctx) => {
+      await ctx.db.delete("promptLabels", last.labelId);
+      await ctx.db.delete("promptSnapshots", last.snapshotId);
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    expect(await snapshotNames()).toEqual([]);
     expect(await pendingScheduled(t)).toEqual([]);
   });
 });
@@ -659,50 +1176,5 @@ describe("retention", () => {
     ]);
     expect(state.promptPins.map((row) => row.scope)).toEqual(["live"]);
     expect(await pin("live", "greeting")).toMatchObject({ prompt: "v0" });
-  });
-
-  test("a sweep that reaches its read budget continues the snapshot scan in the next run", async () => {
-    const old = Date.now() - 2 * SNAPSHOT_GRACE_MS;
-    await t.run(async (ctx) => {
-      // 12 referenced snapshots of 850 KiB, more than one run reads, then
-      // one unreferenced snapshot.
-      for (let i = 0; i < 12; i++) {
-        const snapshotId = await ctx.db.insert("promptSnapshots", {
-          key: `big-${i}`,
-          name: "big",
-          version: i + 1,
-          source: "langfuse",
-          type: "text",
-          prompt: "x".repeat(850 * 1024),
-          config: "{}",
-          fetchedAt: old + i,
-        });
-        await ctx.db.insert("promptLabels", {
-          name: "big",
-          label: `l${i}`,
-          snapshotId,
-        });
-      }
-      await ctx.db.insert("promptSnapshots", {
-        key: "orphan",
-        name: "orphan",
-        version: 1,
-        source: "langfuse",
-        type: "text",
-        prompt: "orphan",
-        config: "{}",
-        fetchedAt: old + 100,
-      });
-    });
-
-    await t.mutation(internal.retention.sweep, {});
-    let names = (await promptTables()).promptSnapshots.map((row) => row.name);
-    expect(names).toContain("orphan");
-    expect(await pendingScheduled(t)).toEqual(["retention:sweep"]);
-
-    await settle();
-    names = (await promptTables()).promptSnapshots.map((row) => row.name);
-    expect(names).not.toContain("orphan");
-    expect(names).toHaveLength(12);
   });
 });

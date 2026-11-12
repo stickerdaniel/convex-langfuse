@@ -25,6 +25,7 @@ import {
   byteLength,
   costDetails,
   encodeSpan,
+  hasLoneSurrogate,
   isCostValue,
   promptLink,
 } from "../shared/otlp.js";
@@ -162,10 +163,16 @@ export type PromptSyncResult = FunctionReturnType<
 >;
 
 /**
- * The component's prompt cache. It holds what Langfuse served, refreshed by
- * the signed webhook and at least every 15 minutes, and never fetches on a
- * read. Template compilation is not part of the component: compile `prompt`
- * with the variables of the call site.
+ * The component's prompt cache. It holds what Langfuse served and never
+ * fetches on a read. The signed webhook refreshes a prompt and the prompts
+ * that reference it; a rolling refresh schedules every tracked name again
+ * no later than the first 5-minute tick after its last attempt is 13 minutes
+ * old, plus 99.8 s. Template compilation is not part of the component:
+ * compile `prompt` with the variables of the call site.
+ *
+ * A name, label or scope with a lone surrogate is refused with a
+ * `ConvexError` before the component call: `invalid_prompt_name`,
+ * `invalid_prompt_selector` or `invalid_prompt_scope`.
  */
 export interface Prompts {
   /**
@@ -180,7 +187,8 @@ export interface Prompts {
    * result for `ttlMs` (default 7 days); every later call for the scope and
    * name returns the same bytes until the pin expires, whatever its label,
    * version or fallback. Returns `null` on a miss without a fallback. Runs
-   * in the caller's transaction.
+   * in the caller's transaction. A lone surrogate in the fallback's text or
+   * config is stored as U+FFFD.
    */
   pin(
     ctx: RunMutationCtx,
@@ -194,7 +202,9 @@ export interface Prompts {
    * Turns the cache on and schedules refreshes: for `names`, or for every
    * prompt of the project. Run it from an action after deploying; the
    * refreshes apply in the background within seconds. Without it or a
-   * webhook delivery, the cache stays empty.
+   * webhook delivery, the cache stays empty. A listing that stops at its
+   * page cap of 50 pages returns `incomplete`. A name has 1 to 256 UTF-8
+   * bytes; `invalid_prompt_name` refuses another.
    */
   sync(
     ctx: RunActionCtx,
@@ -225,9 +235,33 @@ function decodePrompt(stored: StoredPrompt): Prompt {
     : { ...base, type: "text", prompt: stored.prompt };
 }
 
+/**
+ * Refuses a name, label or scope with a lone surrogate before the component
+ * call, which Convex would refuse: a replaced character would name another
+ * prompt or scope.
+ */
+function checkPromptArgs({
+  name,
+  label,
+  scope,
+}: {
+  name: string;
+  label?: string;
+  scope?: string;
+}): void {
+  if (hasLoneSurrogate(name)) throw new ConvexError("invalid_prompt_name");
+  if (label !== undefined && hasLoneSurrogate(label)) {
+    throw new ConvexError("invalid_prompt_selector");
+  }
+  if (scope !== undefined && hasLoneSurrogate(scope)) {
+    throw new ConvexError("invalid_prompt_scope");
+  }
+}
+
 function promptsOf(component: ComponentApi): Prompts {
   return {
     async get(ctx, { name, label, version }) {
+      checkPromptArgs({ name, label });
       const stored = await ctx.runQuery(component.prompts.get, {
         name,
         label,
@@ -236,6 +270,7 @@ function promptsOf(component: ComponentApi): Prompts {
       return stored && decodePrompt(stored);
     },
     async pin(ctx, { scope, name, label, version, fallback, ttlMs }) {
+      checkPromptArgs({ name, label, scope });
       const stored = await ctx.runMutation(component.prompts.pin, {
         scope,
         name,
@@ -246,17 +281,18 @@ function promptsOf(component: ComponentApi): Prompts {
           type: fallback.type,
           prompt:
             fallback.type === "chat"
-              ? JSON.stringify(fallback.prompt)
-              : fallback.prompt,
+              ? wellFormedJson(fallback.prompt)
+              : wellFormed(fallback.prompt),
           config:
             fallback.config === undefined
               ? undefined
-              : JSON.stringify(fallback.config),
+              : wellFormedJson(fallback.config),
         },
       });
       return stored && decodePrompt(stored);
     },
     async sync(ctx, args = {}) {
+      for (const name of args.names ?? []) checkPromptArgs({ name });
       return await ctx.runAction(component.prompts.sync, args);
     },
   };
@@ -448,9 +484,10 @@ function sortedJson(value: unknown): unknown {
 }
 
 /**
- * A copy with every lone surrogate replaced by U+FFFD, in strings at any
- * depth. A string cut inside an emoji holds one. Convex refuses an argument
- * with such a string, which would fail the whole component call.
+ * A copy with every lone surrogate replaced by U+FFFD, in strings and
+ * object keys at any depth. A string cut inside an emoji holds one. Convex
+ * refuses an argument with such a string, which would fail the whole
+ * component call.
  */
 function wellFormed<T>(value: T): T;
 function wellFormed(value: unknown): unknown {
@@ -460,10 +497,24 @@ function wellFormed(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((item) => wellFormed(item));
   if (typeof value === "object" && value !== null) {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, wellFormed(item)]),
+      Object.entries(value).map(([key, item]) => [
+        wellFormed(key),
+        wellFormed(item),
+      ]),
     );
   }
   return value;
+}
+
+/**
+ * `value` as JSON with every lone surrogate replaced by U+FFFD. Parsing the
+ * JSON first applies `toJSON`, and `JSON.stringify` would only escape a
+ * lone surrogate, which parses back into one.
+ */
+function wellFormedJson(value: unknown): string {
+  return JSON.stringify(
+    wellFormed(JSON.parse(JSON.stringify(value)) as unknown),
+  );
 }
 
 /**
@@ -611,15 +662,6 @@ function scoreValue(
       }
       return { dataType, value };
   }
-}
-
-/**
- * Whether `text` holds a lone surrogate. Convex refuses such an argument,
- * and `wellFormed` would replace it, so a name, id or category with one is
- * refused instead: the replaced text would name another thing.
- */
-function hasLoneSurrogate(text: string): boolean {
-  return /\p{Cs}/u.test(text);
 }
 
 /** A score id has 1 to `MAX_SCORE_ID_BYTES` UTF-8 bytes and no lone surrogate. */

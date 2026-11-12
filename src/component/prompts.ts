@@ -2,13 +2,15 @@
 //
 // Langfuse resolves a prompt and the prompts it references at request time.
 // The cache stores every resolved result as an immutable snapshot and maps
-// each label of a tracked prompt name to one. A refresh of a name lists its
-// labels, fetches the prompt behind each and applies the results in
-// mutations fenced by the name's generation. Refreshes come from the signed
-// webhook (`http.ts`), from `sync`, and from a tick that refreshes every
-// tracked name at least every `PROMPT_REFRESH_INTERVAL_MS`, which also
-// repairs refreshes that failed or never arrived. A pin keeps one snapshot
-// per scope and name, so a scope keeps its prompt bytes while labels move.
+// each label of a tracked prompt name to one, and each fetched version to
+// the snapshot it last resolved to. A refresh of a name lists its labels,
+// fetches the prompt behind each and stores the snapshots in steps that
+// publish nothing, then publishes every pointer of the name at once in one
+// mutation fenced by the name's token. Refreshes come from the signed
+// webhook (`http.ts`), from `sync`, and from a tick that reserves every name
+// whose last attempt is `PROMPT_REFRESH_INTERVAL_MS` old, which also repairs
+// refreshes that failed or never arrived. A pin keeps one snapshot per scope
+// and name, so a scope keeps its prompt bytes while labels move.
 //
 // No prompt function reads or writes the export tables.
 
@@ -27,21 +29,23 @@ import {
 } from "./_generated/server.js";
 import {
   HEALTH_COUNT_CAP,
+  MAX_PROMPT_DEPENDENCIES,
   MAX_PROMPT_LABELS,
+  MAX_PROMPT_NAME_BYTES,
   MAX_PROMPT_NAMES,
   MAX_SNAPSHOT_BYTES,
+  MAX_SNAPSHOT_DOCUMENT_BYTES,
   PIN_TTL_MS,
-  PROMPT_APPLY_BYTES,
   PROMPT_LIST_INTERVAL_MS,
   PROMPT_LIST_MAX_PAGES,
   PROMPT_PAGE_LIMIT,
   PROMPT_REFRESH_INTERVAL_MS,
-  PROMPT_TICK_BATCH,
+  PROMPT_REFRESH_MAX_MS,
+  PROMPT_REFRESH_SPACING_MS,
+  PROMPT_STEP_LABELS,
   PROMPT_TIMEOUT_MS,
   RETENTION_BATCH,
   SNAPSHOT_GRACE_MS,
-  SNAPSHOT_SCAN_BYTES,
-  SNAPSHOT_SCAN_ROWS,
 } from "./constants.js";
 import { vPromptSource, vPromptType } from "./schema.js";
 import { basicAuth, exportConfig, type ExportConfig } from "./settings.js";
@@ -58,6 +62,11 @@ export type PromptErrorCode =
 
 function refuse(code: PromptErrorCode): never {
   throw new ConvexError(code);
+}
+
+/** A name the cache can track: 1 to `MAX_PROMPT_NAME_BYTES` UTF-8 bytes. */
+function isPromptName(name: string): boolean {
+  return name !== "" && byteLength(name) <= MAX_PROMPT_NAME_BYTES;
 }
 
 // ── Snapshots ──────────────────────────────────────────────────────────────
@@ -105,23 +114,22 @@ function contentBytes(
   );
 }
 
-/** The snapshot with this content, inserted when no equal one exists. */
+/** The id of the snapshot with this content, inserted when no equal one exists. */
 async function storeSnapshot(
   ctx: MutationCtx,
   content: Content,
-): Promise<Doc<"promptSnapshots">> {
+): Promise<Id<"promptSnapshots">> {
   const key = await snapshotKey(content);
   const existing = await ctx.db
     .query("promptSnapshots")
     .withIndex("by_key", (q) => q.eq("key", key))
     .first();
-  if (existing) return existing;
-  const id = await ctx.db.insert("promptSnapshots", {
+  if (existing) return existing._id;
+  return await ctx.db.insert("promptSnapshots", {
     key,
     ...content,
     fetchedAt: Date.now(),
   });
-  return (await ctx.db.get("promptSnapshots", id))!;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -194,6 +202,25 @@ function graphNames(graph: Record<string, unknown>, name: string): string[] {
   return [...names];
 }
 
+/**
+ * The names a `dependsOn` keeps: a name longer than `MAX_PROMPT_NAME_BYTES`
+ * is dropped, never truncated, then the rest are sorted and cut to
+ * `MAX_PROMPT_DEPENDENCIES`. `cut` tells that a name was dropped or cut.
+ * Applied to its own result plus more names, it gives the same as applied
+ * to all names at once.
+ */
+function boundDependencies(names: Iterable<string>): {
+  names: string[];
+  cut: boolean;
+} {
+  const distinct = [...new Set(names)];
+  const kept = distinct.filter(isPromptName).sort(compareStrings);
+  return {
+    names: kept.slice(0, MAX_PROMPT_DEPENDENCIES),
+    cut: kept.length < distinct.length || kept.length > MAX_PROMPT_DEPENDENCIES,
+  };
+}
+
 // ── Reads ──────────────────────────────────────────────────────────────────
 
 const vPrompt = v.object({
@@ -247,6 +274,19 @@ async function labelRow(
     .unique();
 }
 
+async function versionRow(
+  ctx: QueryCtx,
+  name: string,
+  version: number,
+): Promise<Doc<"promptVersions"> | null> {
+  return await ctx.db
+    .query("promptVersions")
+    .withIndex("by_name_version", (q) =>
+      q.eq("name", name).eq("version", version),
+    )
+    .unique();
+}
+
 async function nameRow(
   ctx: QueryCtx,
   name: string,
@@ -258,39 +298,32 @@ async function nameRow(
 }
 
 /**
- * The cached snapshot for a selector: the one a label maps to, or the
- * newest Langfuse snapshot of a version. `null` on a miss.
+ * The cached snapshot for a selector: the one a label maps to, or the one a
+ * version resolved to in the last refresh that fetched it. `null` on a miss.
  */
 async function resolve(
   ctx: QueryCtx,
-  selector: Selector,
+  { name, label, version }: Selector,
 ): Promise<Doc<"promptSnapshots"> | null> {
-  checkSelector(selector);
-  const { name, version } = selector;
-  if (version !== undefined) {
-    // Fallback snapshots have no version, so this finds Langfuse ones only.
-    return await ctx.db
-      .query("promptSnapshots")
-      .withIndex("by_name_version", (q) =>
-        q.eq("name", name).eq("version", version),
-      )
-      .order("desc")
-      .first();
-  }
-  const row = await labelRow(ctx, name, selector.label ?? "production");
+  const row =
+    version === undefined
+      ? await labelRow(ctx, name, label ?? "production")
+      : await versionRow(ctx, name, version);
   return row && (await ctx.db.get("promptSnapshots", row.snapshotId));
 }
 
 /**
  * The cached prompt for a label (default `production`) or a version, or
- * `null` when the cache holds none. Reads only the cache; a miss starts no
- * fetch. Throws `invalid_prompt_selector` for a label and a version
- * together.
+ * `null` when the cache holds none, also for a name the cache cannot track.
+ * Reads only the cache; a miss starts no fetch. Throws
+ * `invalid_prompt_selector` for a label and a version together.
  */
 export const get = query({
   args: selectorArgs,
   returns: v.union(vPrompt, v.null()),
   handler: async (ctx, selector): Promise<Prompt | null> => {
+    checkSelector(selector);
+    if (!isPromptName(selector.name)) return null;
     const snapshot = await resolve(ctx, selector);
     return snapshot && toPrompt(snapshot);
   },
@@ -324,13 +357,14 @@ async function storeFallback(
   if (contentBytes({ prompt, config }) > MAX_SNAPSHOT_BYTES) {
     refuse("prompt_too_large");
   }
-  return await storeSnapshot(ctx, {
+  const id = await storeSnapshot(ctx, {
     name,
     source: "fallback",
     type: fallback.type,
     prompt,
     config,
   });
+  return (await ctx.db.get("promptSnapshots", id))!;
 }
 
 /**
@@ -339,7 +373,8 @@ async function storeFallback(
  * and fallback of this call. Otherwise it resolves like `get`; on a miss it
  * stores `fallback` as a snapshot, and without a fallback it returns `null`
  * and stores nothing. The result is pinned for `ttlMs` (default
- * `PIN_TTL_MS`) from now. Runs in the caller's transaction.
+ * `PIN_TTL_MS`) from now. Runs in the caller's transaction. Throws
+ * `invalid_prompt_name` for a name the cache cannot track.
  */
 export const pin = mutation({
   args: {
@@ -360,6 +395,7 @@ export const pin = mutation({
   handler: async (ctx, args): Promise<Prompt | null> => {
     checkSelector(args);
     const { scope, name, fallback, ttlMs = PIN_TTL_MS } = args;
+    if (!isPromptName(name)) refuse("invalid_prompt_name");
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) refuse("invalid_ttl");
     const now = Date.now();
     const existing = await ctx.db
@@ -384,45 +420,49 @@ export const pin = mutation({
   },
 });
 
-// ── Refresh ────────────────────────────────────────────────────────────────
+// ── Reservation ────────────────────────────────────────────────────────────
+
+type Reserved = { name: string; token: string };
 
 /**
- * The next generation of a name. Generations grow with the clock, so a
- * refresh reserved for a deleted row cannot match a later row of the same
- * name.
+ * Reserves a refresh of a tracked name: a new token, which fences every
+ * refresh reserved before, and `attemptedAt`. A random token never repeats,
+ * also not after the row was deleted and created again.
  */
-function nextGeneration(previous: number, now: number): number {
-  return Math.max(previous + 1, now);
+async function reserveRow(
+  ctx: MutationCtx,
+  row: Doc<"promptNames">,
+  now: number,
+): Promise<Reserved> {
+  const token = crypto.randomUUID();
+  await ctx.db.patch("promptNames", row._id, { token, attemptedAt: now });
+  return { name: row.name, token };
 }
 
 /**
- * Reserves a refresh for each distinct name: creates its `promptNames` row
- * when missing, raises its generation and sets `attemptedAt`. A missing name
- * finds no row once `MAX_PROMPT_NAMES` are tracked and counts as overflow.
- * With `onlyNew`, tracked names are skipped.
+ * Reserves a refresh for each distinct name, creating its `promptNames` row
+ * when missing. A name the cache cannot track (`isPromptName`) and a missing
+ * name once `MAX_PROMPT_NAMES` are tracked reserve nothing and count as
+ * overflow. With `onlyNew`, tracked names are skipped. `sync`, the listing
+ * and the webhook all reserve through here.
  */
 async function reserveNames(
   ctx: MutationCtx,
   names: string[],
   { onlyNew = false }: { onlyNew?: boolean } = {},
-): Promise<{
-  reserved: { name: string; generation: number }[];
-  overflow: number;
-}> {
+): Promise<{ reserved: Reserved[]; overflow: number }> {
   const now = Date.now();
-  const reserved: { name: string; generation: number }[] = [];
+  const reserved: Reserved[] = [];
   let overflow = 0;
   let free: number | undefined;
   for (const name of new Set(names)) {
+    if (!isPromptName(name)) {
+      overflow += 1;
+      continue;
+    }
     const row = await nameRow(ctx, name);
     if (row) {
-      if (onlyNew) continue;
-      const generation = nextGeneration(row.generation, now);
-      await ctx.db.patch("promptNames", row._id, {
-        generation,
-        attemptedAt: now,
-      });
-      reserved.push({ name, generation });
+      if (!onlyNew) reserved.push(await reserveRow(ctx, row, now));
       continue;
     }
     free ??=
@@ -433,51 +473,44 @@ async function reserveNames(
       continue;
     }
     free -= 1;
-    const generation = nextGeneration(0, now);
+    const token = crypto.randomUUID();
     await ctx.db.insert("promptNames", {
       name,
-      generation,
+      token,
       dependsOn: [],
       attemptedAt: now,
     });
-    reserved.push({ name, generation });
+    reserved.push({ name, token });
   }
   return { reserved, overflow };
 }
 
-/**
- * Reserves a refresh for each name and schedules it. Returns how many names
- * it scheduled and how many found no free slot.
- */
-async function requestRefresh(
+/** Schedules the reserved refreshes, `spacingMs` apart. */
+async function scheduleRefreshes(
   ctx: MutationCtx,
-  names: string[],
-  options: { onlyNew?: boolean } = {},
-): Promise<{ tracked: number; overflow: number }> {
-  const { reserved, overflow } = await reserveNames(ctx, names, options);
-  for (const { name, generation } of reserved) {
-    await ctx.scheduler.runAfter(0, internal.prompts.refresh, {
+  reserved: Reserved[],
+  spacingMs = 0,
+): Promise<void> {
+  for (const [i, { name, token }] of reserved.entries()) {
+    await ctx.scheduler.runAfter(i * spacingMs, internal.prompts.refresh, {
       name,
-      generation,
+      token,
     });
   }
-  return { tracked: reserved.length, overflow };
 }
 
 /**
- * Reserves a refresh for each name, as `requestRefresh` does, without
- * scheduling it. Returns the generation per name, `null` for a name that is
- * not tracked and finds no free slot.
+ * Reserves a refresh for each name, as `reserveNames` does, without
+ * scheduling it. Returns the token per name, `null` for a name that reserved
+ * nothing.
  */
 export const reserve = internalMutation({
   args: { names: v.array(v.string()) },
-  returns: v.array(v.union(v.number(), v.null())),
+  returns: v.array(v.union(v.string(), v.null())),
   handler: async (ctx, { names }) => {
     const { reserved } = await reserveNames(ctx, names);
-    const generations = new Map(
-      reserved.map(({ name, generation }) => [name, generation]),
-    );
-    return names.map((name) => generations.get(name) ?? null);
+    const tokens = new Map(reserved.map(({ name, token }) => [name, token]));
+    return names.map((name) => tokens.get(name) ?? null);
   },
 });
 
@@ -491,7 +524,8 @@ async function getOrCreateSync(ctx: MutationCtx): Promise<Doc<"promptSync">> {
 }
 
 /**
- * `requestRefresh` in a mutation of its own, for `sync` and `list`. With
+ * Reserves and schedules a refresh for each name, for `sync` and `list`.
+ * Returns how many names it scheduled and how many reserved nothing. With
  * `start`, it creates the `promptSync` row, which turns the tick on.
  */
 export const request = internalMutation({
@@ -503,9 +537,13 @@ export const request = internalMutation({
   returns: vCount,
   handler: async (ctx, { names, onlyNew, start }) => {
     if (start) await getOrCreateSync(ctx);
-    return await requestRefresh(ctx, names, { onlyNew });
+    const { reserved, overflow } = await reserveNames(ctx, names, { onlyNew });
+    await scheduleRefreshes(ctx, reserved);
+    return { tracked: reserved.length, overflow };
   },
 });
+
+// ── Refresh ────────────────────────────────────────────────────────────────
 
 /** A JSON response, or a fixed code for what went wrong. */
 type Fetched =
@@ -555,31 +593,20 @@ const vCandidate = v.object({
 type Candidate = Infer<typeof vCandidate>;
 
 /**
- * What a refresh learned about one label: `ok` points it to a snapshot of
- * the candidate, `gone` removes it, `failed` keeps its mapping.
+ * What a refresh publishes for one label: `ok` points it to a stored
+ * snapshot of `version`, `gone` removes it, `failed` keeps its mapping.
  */
 const vLabelResult = v.union(
   v.object({
     label: v.string(),
     outcome: v.literal("ok"),
-    candidate: vCandidate,
+    snapshotId: v.id("promptSnapshots"),
+    version: v.number(),
   }),
   v.object({ label: v.string(), outcome: v.literal("gone") }),
   v.object({ label: v.string(), outcome: v.literal("failed") }),
 );
 type LabelResult = Infer<typeof vLabelResult>;
-
-/** The end of a refresh, applied with the last batch of label results. */
-const vDone = v.object({
-  /** Every label of the name, or `null` when the listing failed. */
-  listed: v.union(v.array(v.string()), v.null()),
-  /** Other prompt names in the resolution graphs of the fetched labels. */
-  dependsOn: v.array(v.string()),
-  /** A label kept its old mapping, so `dependsOn` adds to the old one. */
-  partial: v.boolean(),
-  error: v.optional(v.string()),
-});
-type Done = Infer<typeof vDone>;
 
 /** The candidate in a `GET /api/public/v2/prompts/{name}` body, or `null`. */
 function parsePrompt(
@@ -636,54 +663,17 @@ function promptPath(name: string): string {
   return `/api/public/v2/prompts/${encodeURIComponent(name)}`;
 }
 
-/**
- * Lists `name`, fetches the resolved prompt behind each of its labels, at
- * most `MAX_PROMPT_LABELS`, and returns the per-label results and the end of
- * the refresh. Errors are fixed codes: `http_<status>`, `network`,
- * `timeout`, `invalid_response`, `oversize`, `too_many_labels`.
- */
-async function fetchName(
-  config: ExportConfig,
-  name: string,
-): Promise<{ labels: LabelResult[]; done: Done }> {
-  const listing = await getJson(
-    config,
-    `/api/public/v2/prompts?name=${encodeURIComponent(name)}&page=1&limit=1`,
-  );
-  const listed = listing.ok ? parseListing(name, listing.body) : null;
-  if (listed === null) {
-    const error = listing.ok ? "invalid_response" : listing.error;
-    return {
-      labels: [],
-      done: { listed: null, dependsOn: [], partial: true, error },
-    };
-  }
-  const distinct = [...new Set(listed)].sort();
-  const kept = distinct.slice(0, MAX_PROMPT_LABELS);
-  const fetched = await Promise.all(
-    kept.map(async (label) => await fetchLabel(config, name, label)),
-  );
-  const errors = fetched.flatMap(({ error }) => error ?? []);
-  if (kept.length < distinct.length) errors.unshift("too_many_labels");
-  return {
-    labels: fetched.map(({ result }) => result),
-    done: {
-      listed: kept,
-      dependsOn: [
-        ...new Set(fetched.flatMap(({ dependsOn }) => dependsOn)),
-      ].sort(),
-      partial: fetched.some(({ result }) => result.outcome === "failed"),
-      error: errors[0],
-    },
-  };
-}
+/** What fetching one label gave: a candidate, or a fixed error code. */
+type LabelFetch =
+  | { outcome: "ok"; candidate: Candidate; dependsOn: string[] }
+  | { outcome: "gone" | "failed"; error: string };
 
 /** Fetches the resolved prompt behind one label of `name`. */
 async function fetchLabel(
   config: ExportConfig,
   name: string,
   label: string,
-): Promise<{ result: LabelResult; error?: string; dependsOn: string[] }> {
+): Promise<LabelFetch> {
   const fetched = await getJson(
     config,
     `${promptPath(name)}?label=${encodeURIComponent(label)}`,
@@ -691,105 +681,191 @@ async function fetchLabel(
   if (!fetched.ok) {
     // 404: the prompt or the label is gone; 409: a dependency is.
     const gone = fetched.status === 404 || fetched.status === 409;
-    return {
-      result: { label, outcome: gone ? "gone" : "failed" },
-      error: fetched.error,
-      dependsOn: [],
-    };
+    return { outcome: gone ? "gone" : "failed", error: fetched.error };
   }
   const parsed = parsePrompt(name, fetched.body);
-  if (!parsed) {
-    return {
-      result: { label, outcome: "failed" },
-      error: "invalid_response",
-      dependsOn: [],
-    };
-  }
+  if (!parsed) return { outcome: "failed", error: "invalid_response" };
   if (contentBytes(parsed.candidate) > MAX_SNAPSHOT_BYTES) {
-    return {
-      result: { label, outcome: "gone" },
-      error: "oversize",
-      dependsOn: [],
-    };
+    return { outcome: "gone", error: "oversize" };
   }
-  return {
-    result: { label, outcome: "ok", candidate: parsed.candidate },
-    dependsOn: parsed.dependsOn,
-  };
-}
-
-/** Label results in order, in batches of at most `PROMPT_APPLY_BYTES` of candidates. */
-function batches(labels: LabelResult[]): LabelResult[][] {
-  const result: LabelResult[][] = [[]];
-  let bytes = 0;
-  for (const label of labels) {
-    const size = label.outcome === "ok" ? contentBytes(label.candidate) : 0;
-    if (bytes + size > PROMPT_APPLY_BYTES && result.at(-1)!.length > 0) {
-      result.push([]);
-      bytes = 0;
-    }
-    result.at(-1)!.push(label);
-    bytes += size;
-  }
-  return result;
+  return { outcome: "ok", ...parsed };
 }
 
 /**
- * Refreshes one name for generation `generation`: lists its labels, fetches
- * the resolved prompt behind each, and passes the results to `apply` in
- * batches, the last one with the end of the refresh. Stops once `apply`
- * reports a newer generation. Does nothing when the component is disabled.
+ * Refreshes one name for the reservation `token`. It lists the name's
+ * labels, at most `MAX_PROMPT_LABELS`, then fetches them
+ * `PROMPT_STEP_LABELS` at a time and stores each step's snapshots with
+ * `store`, which publishes nothing. Of a stored step it keeps only label,
+ * snapshot id, version and the bounded dependency names, so it holds at most
+ * one step of candidates at once: `PROMPT_STEP_LABELS` × `MAX_SNAPSHOT_BYTES`,
+ * 3.5 MiB of prompt text, plus the responses of that step while they are
+ * parsed. Last, `publish` applies the whole result at once. It stops once
+ * `store` reports a newer reservation. Does nothing when the component is
+ * disabled. Errors are fixed codes: `http_<status>`, `network`, `timeout`,
+ * `invalid_response`, `oversize`, `too_many_labels`,
+ * `too_many_dependencies`; the first one is recorded.
  */
 export const refresh = internalAction({
-  args: { name: v.string(), generation: v.number() },
+  args: { name: v.string(), token: v.string() },
   returns: v.null(),
-  handler: async (ctx, { name, generation }) => {
+  handler: async (ctx, { name, token }) => {
     const config = exportConfig();
     if (!config) return null;
-    const { labels, done } = await fetchName(config, name);
-    const parts = batches(labels);
-    for (const [i, part] of parts.entries()) {
-      const current = await ctx.runMutation(internal.prompts.apply, {
+    const listing = await getJson(
+      config,
+      `/api/public/v2/prompts?name=${encodeURIComponent(name)}&page=1&limit=1`,
+    );
+    const listed = listing.ok ? parseListing(name, listing.body) : null;
+    if (listed === null) {
+      await ctx.runMutation(internal.prompts.publish, {
         name,
-        generation,
-        labels: part,
-        ...(i === parts.length - 1 ? { done } : {}),
+        token,
+        labels: [],
+        listed: null,
+        dependsOn: [],
+        complete: false,
+        error: listing.ok ? "invalid_response" : listing.error,
       });
-      if (!current) break;
+      return null;
     }
+    const distinct = [...new Set(listed)].sort();
+    const kept = distinct.slice(0, MAX_PROMPT_LABELS);
+    const errors = kept.length < distinct.length ? ["too_many_labels"] : [];
+    const labels: LabelResult[] = [];
+    let dependencies = boundDependencies([]);
+    for (let i = 0; i < kept.length; i += PROMPT_STEP_LABELS) {
+      const step = kept.slice(i, i + PROMPT_STEP_LABELS);
+      const fetched = await Promise.all(
+        step.map(async (label) => await fetchLabel(config, name, label)),
+      );
+      const candidates = fetched.flatMap((result) =>
+        result.outcome === "ok" ? [result.candidate] : [],
+      );
+      const ids =
+        candidates.length === 0
+          ? []
+          : await ctx.runMutation(internal.prompts.store, {
+              name,
+              token,
+              candidates,
+            });
+      if (ids === null) return null;
+      let stored = 0;
+      for (const [j, result] of fetched.entries()) {
+        const label = step[j]!;
+        if (result.outcome !== "ok") {
+          labels.push({ label, outcome: result.outcome });
+          errors.push(result.error);
+          continue;
+        }
+        labels.push({
+          label,
+          outcome: "ok",
+          snapshotId: ids[stored++]!,
+          version: result.candidate.version,
+        });
+        const merged = boundDependencies([
+          ...dependencies.names,
+          ...result.dependsOn,
+        ]);
+        dependencies = {
+          names: merged.names,
+          cut: dependencies.cut || merged.cut,
+        };
+      }
+    }
+    if (dependencies.cut) errors.push("too_many_dependencies");
+    await ctx.runMutation(internal.prompts.publish, {
+      name,
+      token,
+      labels,
+      listed: kept,
+      dependsOn: dependencies.names,
+      complete:
+        kept.length === distinct.length &&
+        labels.every(({ outcome }) => outcome === "ok"),
+      error: errors[0],
+    });
     return null;
   },
 });
 
 /**
- * Applies label results of refresh `generation` of `name`; returns `false`
- * and changes nothing when the generation is not current. `ok` points the
- * label to the snapshot of its candidate, inserted or reused; `gone` removes
- * the label; `failed` keeps its mapping. With `done`, it also removes the
- * labels the listing no longer shows (all of them when the prompt is gone,
- * none when the listing failed), records the first error, and sets
- * `refreshedAt` and `dependsOn`. A name without labels and without an error
- * is no longer tracked.
+ * Stores the snapshots of one refresh step, inserting or reusing each, and
+ * returns their ids in order. Publishes nothing: a snapshot no refresh
+ * publishes stays unreferenced and the retention sweep collects it. Returns
+ * `null` and stores nothing when `token` is not the name's current one.
  */
-export const apply = internalMutation({
+export const store = internalMutation({
   args: {
     name: v.string(),
-    generation: v.number(),
-    labels: v.array(vLabelResult),
-    done: v.optional(vDone),
+    token: v.string(),
+    candidates: v.array(vCandidate),
   },
-  returns: v.boolean(),
-  handler: async (ctx, { name, generation, labels, done }) => {
+  returns: v.union(v.array(v.id("promptSnapshots")), v.null()),
+  handler: async (ctx, { name, token, candidates }) => {
     const row = await nameRow(ctx, name);
-    if (!row || row.generation !== generation) return false;
+    if (!row || row.token !== token) return null;
+    const ids: Id<"promptSnapshots">[] = [];
+    for (const candidate of candidates) {
+      ids.push(
+        await storeSnapshot(ctx, { name, source: "langfuse", ...candidate }),
+      );
+    }
+    return ids;
+  },
+});
+
+/** Points version `version` of `name` to `snapshotId`. */
+async function pointVersion(
+  ctx: MutationCtx,
+  name: string,
+  version: number,
+  snapshotId: Id<"promptSnapshots">,
+): Promise<void> {
+  const existing = await versionRow(ctx, name, version);
+  if (!existing) {
+    await ctx.db.insert("promptVersions", { name, version, snapshotId });
+  } else if (existing.snapshotId !== snapshotId) {
+    await ctx.db.patch("promptVersions", existing._id, { snapshotId });
+  }
+}
+
+/**
+ * Publishes the result of refresh `token` of `name` in one transaction, so a
+ * reader sees all of it or none; changes nothing when `token` is not the
+ * name's current one. `ok` points the label and its version to their stored
+ * snapshot; `gone` removes the label; `failed` keeps its mapping. It removes
+ * the labels the listing no longer shows (all of them when the prompt is
+ * gone, none when the listing failed), records `error`, and sets
+ * `refreshedAt`. `dependsOn` replaces the stored names only when the refresh
+ * is `complete`, every listed label resolved; otherwise it adds to them, so
+ * a dependency that is gone for now still reaches this name through the
+ * webhook. A name without labels and without an error is no longer tracked.
+ */
+export const publish = internalMutation({
+  args: {
+    name: v.string(),
+    token: v.string(),
+    labels: v.array(vLabelResult),
+    /** Every label of the name, or `null` when the listing failed. */
+    listed: v.union(v.array(v.string()), v.null()),
+    /** Other prompt names in the resolution graphs of the `ok` labels. */
+    dependsOn: v.array(v.string()),
+    complete: v.boolean(),
+    error: v.optional(v.string()),
+  },
+  returns: v.null(),
+  handler: async (
+    ctx,
+    { name, token, labels, listed, dependsOn, complete, error },
+  ) => {
+    const row = await nameRow(ctx, name);
+    if (!row || row.token !== token) return null;
     for (const result of labels) {
       const existing = await labelRow(ctx, name, result.label);
       if (result.outcome === "ok") {
-        const { _id: snapshotId } = await storeSnapshot(ctx, {
-          name,
-          source: "langfuse",
-          ...result.candidate,
-        });
+        const { snapshotId } = result;
         if (!existing) {
           await ctx.db.insert("promptLabels", {
             name,
@@ -799,50 +875,51 @@ export const apply = internalMutation({
         } else if (existing.snapshotId !== snapshotId) {
           await ctx.db.patch("promptLabels", existing._id, { snapshotId });
         }
+        await pointVersion(ctx, name, result.version, snapshotId);
       } else if (result.outcome === "gone" && existing) {
         await ctx.db.delete("promptLabels", existing._id);
       }
     }
-    if (!done) return true;
 
     const current = await ctx.db
       .query("promptLabels")
       .withIndex("by_name_label", (q) => q.eq("name", name))
       .take(2 * MAX_PROMPT_LABELS);
     let left = current.length;
-    if (done.listed !== null) {
-      const listed = new Set(done.listed);
+    if (listed !== null) {
+      const shown = new Set(listed);
       for (const label of current) {
-        if (listed.has(label.label)) continue;
+        if (shown.has(label.label)) continue;
         await ctx.db.delete("promptLabels", label._id);
         left -= 1;
       }
     }
-    if (left === 0 && done.error === undefined) {
+    if (left === 0 && error === undefined) {
       await ctx.db.delete("promptNames", row._id);
-      return true;
+      return null;
     }
-    const dependsOn = done.partial
-      ? [...new Set([...row.dependsOn, ...done.dependsOn])].sort()
-      : done.dependsOn;
     await ctx.db.patch("promptNames", row._id, {
       refreshedAt: Date.now(),
-      dependsOn,
-      error: done.error,
+      dependsOn: complete
+        ? dependsOn
+        : boundDependencies([...row.dependsOn, ...dependsOn]).names,
+      error,
     });
-    return true;
+    return null;
   },
 });
 
 // ── Triggers ───────────────────────────────────────────────────────────────
 
 /**
- * Every 5 minutes: requests a refresh for up to `PROMPT_TICK_BATCH` tracked
- * names whose last attempt is at least `PROMPT_REFRESH_INTERVAL_MS` old,
- * oldest first, and schedules `list` once the last listing is
- * `PROMPT_LIST_INTERVAL_MS` old. Writes and schedules nothing before the
- * first `sync` or webhook created `promptSync`, or while the component is
- * disabled.
+ * Every 5 minutes: reserves every tracked name whose last attempt is at
+ * least `PROMPT_REFRESH_INTERVAL_MS` old, at most `MAX_PROMPT_NAMES`, and
+ * schedules their refreshes `PROMPT_REFRESH_SPACING_MS` apart, the last of
+ * 500 at 99.8 s. So every due name is reserved and scheduled no later than
+ * the first tick after it became due plus 99.8 s. Schedules `list` once the
+ * last listing is `PROMPT_LIST_INTERVAL_MS` old. Writes and schedules
+ * nothing before the first `sync` or webhook created `promptSync`, or while
+ * the component is disabled.
  */
 export const tick = internalMutation({
   args: {},
@@ -856,11 +933,10 @@ export const tick = internalMutation({
       .withIndex("by_attemptedAt", (q) =>
         q.lte("attemptedAt", now - PROMPT_REFRESH_INTERVAL_MS),
       )
-      .take(PROMPT_TICK_BATCH);
-    await requestRefresh(
-      ctx,
-      due.map((row) => row.name),
-    );
+      .take(MAX_PROMPT_NAMES);
+    const reserved: Reserved[] = [];
+    for (const row of due) reserved.push(await reserveRow(ctx, row, now));
+    await scheduleRefreshes(ctx, reserved, PROMPT_REFRESH_SPACING_MS);
     if (
       sync.lastListAt === undefined ||
       now - sync.lastListAt >= PROMPT_LIST_INTERVAL_MS
@@ -871,7 +947,7 @@ export const tick = internalMutation({
   },
 });
 
-/** Sets `lastListAt` after a listing read every page. */
+/** Sets `lastListAt` after a listing ended, on its last page or at the page cap. */
 export const listed = internalMutation({
   args: {},
   returns: v.null(),
@@ -886,16 +962,18 @@ export const listed = internalMutation({
  * Pages through every prompt name of the project, at most
  * `PROMPT_LIST_MAX_PAGES` pages, and requests a refresh for the names of
  * each page; with `onlyNew`, only for names that are not tracked. Sets
- * `lastListAt` when it read every page. Returns the summed counts, or `null`
- * when a page failed.
+ * `lastListAt` once it read the last page or stopped at the page cap, so
+ * the next listing is due `PROMPT_LIST_INTERVAL_MS` later either way.
+ * Returns the summed counts and whether it read every page, or `null` when
+ * a page failed.
  */
 async function listAndRequest(
   ctx: ActionCtx,
   config: ExportConfig,
   onlyNew: boolean,
-): Promise<{ tracked: number; overflow: number } | null> {
+): Promise<{ tracked: number; overflow: number; complete: boolean } | null> {
   const total = { tracked: 0, overflow: 0 };
-  for (let page = 1; page <= PROMPT_LIST_MAX_PAGES; page++) {
+  for (let page = 1; ; page++) {
     const fetched = await getJson(
       config,
       `/api/public/v2/prompts?page=${page}&limit=${PROMPT_PAGE_LIMIT}`,
@@ -915,12 +993,11 @@ async function listAndRequest(
     });
     total.tracked += counts.tracked;
     total.overflow += counts.overflow;
-    if (page >= totalPages) {
+    if (page >= totalPages || page === PROMPT_LIST_MAX_PAGES) {
       await ctx.runMutation(internal.prompts.listed, {});
-      return total;
+      return { ...total, complete: page >= totalPages };
     }
   }
-  return total;
 }
 
 /**
@@ -938,10 +1015,21 @@ export const list = internalAction({
 });
 
 const vSyncResult = v.object({
-  status: v.union(v.literal("ok"), v.literal("disabled")),
+  /**
+   * `incomplete`: the listing stopped at `PROMPT_LIST_MAX_PAGES` pages, so
+   * names on later pages are not tracked.
+   */
+  status: v.union(
+    v.literal("ok"),
+    v.literal("incomplete"),
+    v.literal("disabled"),
+  ),
   /** Names a refresh was scheduled for. */
   tracked: v.number(),
-  /** Names not tracked because `MAX_PROMPT_NAMES` are. */
+  /**
+   * Listed names not tracked: `MAX_PROMPT_NAMES` are, or the name has more
+   * than `MAX_PROMPT_NAME_BYTES`.
+   */
   overflow: v.number(),
 });
 export type SyncResult = Infer<typeof vSyncResult>;
@@ -952,7 +1040,8 @@ export type SyncResult = Infer<typeof vSyncResult>;
  * the background and apply within seconds. Returns `disabled` without
  * writing when the component has no export configuration. Throws
  * `prompt_list_failed` when a page of the listing fails and
- * `invalid_prompt_name` for an empty name.
+ * `invalid_prompt_name` for a name that is empty or has more than
+ * `MAX_PROMPT_NAME_BYTES`.
  */
 export const sync = action({
   args: { names: v.optional(v.array(v.string())) },
@@ -960,23 +1049,27 @@ export const sync = action({
   handler: async (ctx, { names }): Promise<SyncResult> => {
     const config = exportConfig();
     if (!config) return { status: "disabled", tracked: 0, overflow: 0 };
-    if (names?.some((name) => name === "")) refuse("invalid_prompt_name");
+    if (names?.some((name) => !isPromptName(name))) {
+      refuse("invalid_prompt_name");
+    }
     const counts = await ctx.runMutation(internal.prompts.request, {
       names: names ?? [],
       start: true,
     });
     if (names) return { status: "ok", ...counts };
-    const listedCounts = await listAndRequest(ctx, config, false);
-    if (!listedCounts) refuse("prompt_list_failed");
-    return { status: "ok", ...listedCounts };
+    const listing = await listAndRequest(ctx, config, false);
+    if (!listing) refuse("prompt_list_failed");
+    const { complete, ...listed } = listing;
+    return { status: complete ? "ok" : "incomplete", ...listed };
   },
 });
 
 /**
  * A verified webhook delivery for prompt `name`: records `lastWebhookAt`,
  * creating `promptSync`, and requests a refresh for the name and for every
- * tracked name whose resolution graphs reference it. A replayed delivery
- * causes one more refresh, which reuses the existing snapshots.
+ * tracked name whose `dependsOn` holds it. A name the cache cannot track
+ * reserves nothing. A replayed delivery causes one more refresh, which
+ * reuses the existing snapshots.
  */
 export const webhook = internalMutation({
   args: { name: v.string() },
@@ -987,10 +1080,12 @@ export const webhook = internalMutation({
     if (exportConfig() === null) return null;
     const dependents = (
       await ctx.db.query("promptNames").take(MAX_PROMPT_NAMES)
-    )
-      .filter((row) => row.dependsOn.includes(name))
-      .map((row) => row.name);
-    await requestRefresh(ctx, [name, ...dependents]);
+    ).filter((row) => row.dependsOn.includes(name));
+    const { reserved } = await reserveNames(ctx, [name]);
+    const now = Date.now();
+    for (const row of dependents)
+      reserved.push(await reserveRow(ctx, row, now));
+    await scheduleRefreshes(ctx, reserved);
     return null;
   },
 });
@@ -1056,44 +1151,68 @@ async function referenced(
 }
 
 /**
- * Deletes snapshots fetched more than `SNAPSHOT_GRACE_MS` ago that no label
- * and no pin references, oldest first, starting at `fetchedAt >= from`. It
- * reads at most `SNAPSHOT_SCAN_ROWS` snapshots and about
- * `SNAPSHOT_SCAN_BYTES`, and deletes at most `RETENTION_BATCH`. Returns the
- * `fetchedAt` to continue from, or `undefined` once the scan reached the
- * end.
+ * Whether a refresh of the row may still publish: it was reserved within
+ * `PROMPT_REFRESH_MAX_MS` and nothing was published since. Such a refresh can
+ * hold the id of an old snapshot that `store` reused.
+ */
+function refreshing(row: Doc<"promptNames">, now: number): boolean {
+  return (
+    row.attemptedAt > now - PROMPT_REFRESH_MAX_MS &&
+    (row.refreshedAt ?? 0) <= row.attemptedAt
+  );
+}
+
+/** Where a snapshot collection pass continues. */
+export const vSnapshotPass = v.object({
+  /** The `paginate` cursor of `by_fetchedAt`, `null` at the start. */
+  cursor: v.union(v.string(), v.null()),
+  /** Snapshots fetched before this are collected in this pass. */
+  cutoff: v.number(),
+});
+export type SnapshotPass = Infer<typeof vSnapshotPass>;
+
+/**
+ * One step of a snapshot collection pass, within `bytes` of reads and
+ * deletions. It reads one page of snapshots fetched before the pass's cutoff
+ * and deletes those that no label and no pin references, unless a refresh
+ * of their name may still publish them, with their version pointers. A pass
+ * without `pass` starts at `now - SNAPSHOT_GRACE_MS`. Returns the pass to
+ * continue in the next sweep, or `undefined` once it read the last page.
  */
 export async function collectSnapshots(
   ctx: MutationCtx,
   now: number,
-  from: number | undefined,
-): Promise<number | undefined> {
-  const cutoff = now - SNAPSHOT_GRACE_MS;
-  const scan = ctx.db
+  bytes: number,
+  pass: SnapshotPass = { cursor: null, cutoff: now - SNAPSHOT_GRACE_MS },
+): Promise<SnapshotPass | undefined> {
+  // A page ends with the snapshot that reaches `maximumBytesRead`, so it
+  // reads at most that plus one snapshot, and deleting all of it costs as
+  // much again. A budget too small for that waits for the next sweep.
+  const maximumBytesRead = Math.floor(bytes / 2) - MAX_SNAPSHOT_DOCUMENT_BYTES;
+  if (maximumBytesRead <= 0) return pass;
+  const { page, isDone, continueCursor } = await ctx.db
     .query("promptSnapshots")
-    .withIndex("by_fetchedAt", (q) =>
-      from === undefined
-        ? q.lt("fetchedAt", cutoff)
-        : q.gte("fetchedAt", from).lt("fetchedAt", cutoff),
-    );
-  const unreferenced: Id<"promptSnapshots">[] = [];
-  let rows = 0;
-  let bytes = 0;
-  let next: number | undefined;
-  for await (const snapshot of scan) {
-    if (
-      unreferenced.length === RETENTION_BATCH ||
-      rows === SNAPSHOT_SCAN_ROWS ||
-      bytes > SNAPSHOT_SCAN_BYTES
-    ) {
-      next = snapshot.fetchedAt;
-      break;
+    .withIndex("by_fetchedAt", (q) => q.lt("fetchedAt", pass.cutoff))
+    .paginate({
+      cursor: pass.cursor,
+      numItems: RETENTION_BATCH,
+      maximumBytesRead,
+    });
+  const names = new Map<string, Doc<"promptNames"> | null>();
+  for (const snapshot of page) {
+    if (await referenced(ctx, snapshot._id)) continue;
+    if (!names.has(snapshot.name)) {
+      names.set(snapshot.name, await nameRow(ctx, snapshot.name));
     }
-    rows += 1;
-    bytes += contentBytes(snapshot);
-    if (!(await referenced(ctx, snapshot._id))) unreferenced.push(snapshot._id);
+    const row = names.get(snapshot.name);
+    if (row && refreshing(row, now)) continue;
+    // A snapshot has one name and version, so one pointer at most.
+    const pointer = await ctx.db
+      .query("promptVersions")
+      .withIndex("by_snapshot", (q) => q.eq("snapshotId", snapshot._id))
+      .first();
+    if (pointer) await ctx.db.delete("promptVersions", pointer._id);
+    await ctx.db.delete("promptSnapshots", snapshot._id);
   }
-  for (const id of unreferenced) await ctx.db.delete("promptSnapshots", id);
-  // A scan that could not move past one `fetchedAt` stops until the next sweep.
-  return next === from ? undefined : next;
+  return isDone ? undefined : { cursor: continueCursor, cutoff: pass.cutoff };
 }

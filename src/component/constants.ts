@@ -63,10 +63,11 @@ export const DEAD_LETTER_RETENTION_MS = 7 * 24 * HOUR;
 /** Rows per table one retention sweep deletes. */
 export const RETENTION_BATCH = 200;
 /**
- * Payload bytes one retention sweep deletes, outbox and dead letters
- * together. Convex reads a document to delete it and charges its size to the
- * transaction's reads, at most 16 MiB. Half of that leaves room for the rows
- * the sweep reads besides the payloads and for the document overhead that
+ * Bytes one retention sweep spends: the payloads of outbox rows and dead
+ * letters it deletes, and the prompt snapshots it reads and deletes. Convex
+ * reads a document to delete it and charges its size to the transaction's
+ * reads, at most 16 MiB. Half of that leaves room for the rows the sweep
+ * reads besides payloads and snapshots and for the document overhead that
  * `bytes` does not count.
  */
 export const RETENTION_BATCH_BYTES = 8 * MIB;
@@ -119,10 +120,21 @@ export const MAX_SCORE_DEFINITIONS = 500;
 /** Name of the batch-worker loop that drives the exporter. */
 export const WORKER_NAME = "export";
 
-/** A tracked prompt name is refreshed again once its last attempt is this old. */
-export const PROMPT_REFRESH_INTERVAL_MS = 15 * MINUTE;
-/** Names one refresh tick requests at most. */
-export const PROMPT_TICK_BATCH = 100;
+/**
+ * A tracked prompt name is due for a refresh once its last attempt is this
+ * old. The tick runs every 5 minutes and reserves every due name, so a name
+ * is reserved and scheduled no later than the first tick after it became
+ * due plus `MAX_PROMPT_NAMES` × `PROMPT_REFRESH_SPACING_MS` (99.8 s).
+ */
+export const PROMPT_REFRESH_INTERVAL_MS = 13 * MINUTE;
+/** Time between the starts of two refreshes one tick schedules. */
+export const PROMPT_REFRESH_SPACING_MS = 200;
+/**
+ * Longest a refresh action can run: the action timeout of the Convex
+ * backend (`V8_ACTION_USER_TIMEOUT`). Until then, a reserved refresh that
+ * has not published counts as running.
+ */
+export const PROMPT_REFRESH_MAX_MS = 30 * MINUTE;
 /** The tick lists the project's prompts again once the last listing is this old. */
 export const PROMPT_LIST_INTERVAL_MS = HOUR;
 /** Pages of `PROMPT_PAGE_LIMIT` names one listing reads at most. */
@@ -131,20 +143,29 @@ export const PROMPT_LIST_MAX_PAGES = 50;
 export const PROMPT_PAGE_LIMIT = 100;
 /** Prompt names the cache tracks at most. */
 export const MAX_PROMPT_NAMES = 500;
+/**
+ * UTF-8 bytes of a tracked prompt name and of a name in `dependsOn`. With
+ * `MAX_PROMPT_DEPENDENCIES`, a `promptNames` row has at most about 9 KiB, so
+ * the tick and the webhook can read all `MAX_PROMPT_NAMES` rows.
+ */
+export const MAX_PROMPT_NAME_BYTES = 256;
+/** Names in the `dependsOn` of one tracked name. */
+export const MAX_PROMPT_DEPENDENCIES = 32;
 /** Labels of one prompt name a refresh fetches at most, in sorted order. */
 export const MAX_PROMPT_LABELS = 50;
+/** Labels a refresh fetches at once and stores in one mutation. */
+export const PROMPT_STEP_LABELS = 4;
 /** Summed UTF-8 bytes of prompt, config and resolution graph of a snapshot. */
 export const MAX_SNAPSHOT_BYTES = 900 * KIB;
-/** Snapshot bytes one `prompts.apply` call carries at most. */
-export const PROMPT_APPLY_BYTES = 4 * MIB;
+/**
+ * Bytes of a snapshot document: `MAX_SNAPSHOT_BYTES` of content plus its
+ * key, its name of at most `MAX_PROMPT_NAME_BYTES` and the small fields.
+ */
+export const MAX_SNAPSHOT_DOCUMENT_BYTES = MAX_SNAPSHOT_BYTES + KIB;
 /** Default lifetime of a pin. */
 export const PIN_TTL_MS = 7 * 24 * HOUR;
 /** Unreferenced snapshots younger than this survive the retention sweep. */
 export const SNAPSHOT_GRACE_MS = HOUR;
-/** Snapshots one retention sweep reads at most. */
-export const SNAPSHOT_SCAN_ROWS = 1_000;
-/** Snapshot bytes one retention sweep reads at most, past the first row. */
-export const SNAPSHOT_SCAN_BYTES = 8 * MIB;
 /** Largest distance between a webhook's signed timestamp and now. */
 export const WEBHOOK_TOLERANCE_MS = 5 * MINUTE;
 /** Timeout of one prompt API request. */
