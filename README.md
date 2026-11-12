@@ -293,15 +293,19 @@ export const rate = mutation({
   `LANGFUSE_CLICKHOUSE_TRACE_DELETION_CONCURRENCY_DURATION_MS`). Deleting a
   trace deletes its scores in one step.
 - A write or a deletion replaces an operation of the same id that still waits.
-  Operations of one id are sent one at a time, at least 30 seconds apart,
-  because Langfuse can apply a write up to 15 seconds after it accepted it.
+  Operations of one id are sent one at a time, at least 30 seconds apart.
+  Langfuse applies a write asynchronously, around midnight UTC after a queue
+  delay of 15 seconds.
 - Langfuse does not order two operations on one id, so the value it finally
   stores is not guaranteed. Keep your own record of a rating as the source of
   truth, as the example does.
 - `langfuse.syncScoreConfigs(ctx)`, called from an action, creates a Langfuse
   score config for every defined name that has none and lets the component
-  attach the config ids. Run it after you deploy changed definitions. The
-  component repeats it every hour.
+  attach the config ids. Run it after you deploy changed definitions; until
+  then, a score of a changed definition is sent without a config id. The
+  component repeats the sync every hour.
+- A defined name follows Langfuse's rule for a score config: 1 to 80 letters,
+  digits, spaces or `_`, `.`, `(`, `)`, `-`. A category label is not empty.
 - Without the `scores` option, `score` takes any name with a boolean, a number
   or a string.
 
@@ -314,13 +318,14 @@ await langfuse.deleteTraces(ctx, {
 ```
 
 - The request is recorded in the caller's transaction and sent at least once,
-  after the observations that were enqueued before it. The component does not
-  verify that Langfuse completed the erasure.
+  after the observations and score writes that were enqueued before it. The
+  component does not verify that Langfuse completed the erasure.
 - `deleteTraces` ignores `onError`. On an enabled component every failure
   throws, so a purge mutation rolls back with it. On a disabled component it
   returns `{ enqueued: false, reason: "disabled" }`.
 - A deletion request passes a closed backlog gate and never expires. At most
-  1,000 requests can wait. The next one throws.
+  1,000 requests can be pending, counting the ones Langfuse rejected, which stay
+  in the dead letters. The next one throws.
 
 ## Content and privacy
 
@@ -349,7 +354,9 @@ new Langfuse(components.convexLangfuse, {
   character boundary, followed by `…[truncated <n> bytes]`. The marker comes on
   top of `maxFieldBytes`.
 - Log lines of the client carry a code and ids, never field content or error
-  text. An id you passed that is not a valid id is logged as an empty string.
+  text. An id you passed that is not a valid id is logged as an empty string. A
+  score's log line carries the trace id only, because a score id can hold any
+  text.
 
 The order is fixed: `redact`, content mode, serialization, truncation. Content
 that `redact` or `content: "none"` removes never reaches the outbox, the dead
@@ -364,7 +371,7 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Code                  | Meaning                                                      | Record sent        |
 | --------------------- | ------------------------------------------------------------ | ------------------ |
 | `invalid_id`          | A trace id, observation id, seed or key is invalid           | no                 |
-| `invalid_environment` | The trace's or the default environment name is invalid       | no                 |
+| `invalid_environment` | An environment name, your own or the default, is invalid     | no                 |
 | `row_too_large`       | The encoded observation exceeds 900 KiB                      | no                 |
 | `invalid_score`       | A score id, name or value is invalid                         | no                 |
 | `score_too_large`     | The score exceeds 900 KiB                                    | no                 |
@@ -390,10 +397,11 @@ throws an `Error` whose message is the code, which rolls back a mutation.
   as two observations until its background merge.
 - **Order.** The exporter sends the oldest rows first. Langfuse places an
   observation by its ids and timestamps, not by its arrival.
-- **Backoff.** Network errors, timeouts after 20 s, 408, 425, 429 and 5xx back
-  off exponentially up to 5 minutes, or for the `Retry-After` time. 401, 403,
-  404, 405 and redirects count as a configuration problem and back off up to 30
-  minutes.
+- **Backoff.** Network errors, timeouts, 408, 425, 429 and 5xx back off
+  exponentially up to 5 minutes, or for the `Retry-After` time. A request with
+  observations times out after 20 s, a score or deletion request after 10 s. 401
+  and 403 count as a configuration problem and back off up to 30 minutes, and so
+  do 404, 405 and redirects for observations.
 - **Rejections.** A 4xx for a batch makes the exporter send its rows one by one.
   A row rejected alone becomes a dead letter. After 20 consecutive dead letters
   the exporter treats the rejection as a configuration problem and stops
@@ -401,10 +409,10 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 - **Scores and deletion requests.** Each one is a request of its own. A 404, a
   405 or a redirect from its endpoint delays only that request by 30 minutes;
   observations behind it are still sent.
-- **Backlog.** Above 25,000 pending observations or 256 MiB of pending payload
-  the component stops accepting. Recording and score calls then log `backlog`
-  and drop the record. It accepts again below half of both. Deletion requests
-  are always accepted.
+- **Backlog.** Above 25,000 pending observations and score operations or 256 MiB
+  of pending payload the component stops accepting. Recording and score calls
+  then log `backlog` and drop the record. It accepts again below half of both.
+  Deletion requests pass a closed gate, up to their own limit.
 - **Retention.** A pending observation or score older than 72 hours expires. A
   dead letter is deleted after 7 days. Deletion requests never expire.
 
@@ -422,7 +430,7 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Bytes per export request                          | 512 KiB, a larger span goes alone      |
 | Score id                                          | 1 to 128 bytes                         |
 | Trace ids per deletion request                    | 100, split by the client               |
-| Pending deletion requests                         | 1,000                                  |
+| Pending deletion requests, rejected ones included | 1,000                                  |
 
 ## Operations
 
