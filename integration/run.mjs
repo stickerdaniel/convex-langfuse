@@ -803,6 +803,60 @@ async function main() {
       return "the span arrived with U+FFFD in place of the lone surrogate";
     });
 
+    await runCase(
+      "11 a listing of several pages while refreshes run",
+      async () => {
+        // Each listing page reserves its 100 names and starts their refreshes.
+        // The backend runs 8 scheduled functions at a time and the fake holds
+        // every prompt for 150 ms, so the refreshes of the first page write
+        // their rows for about 2 s, longer than a mutation retries a write
+        // conflict, while the next pages are reserved.
+        const names = Array.from(
+          { length: 450 },
+          (_, i) => `integration/listed-${String(i).padStart(3, "0")}`,
+        );
+        for (let i = 0; i < names.length; i += 25) {
+          await Promise.all(
+            names.slice(i, i + 25).map((name) =>
+              fake.addPrompt({
+                name,
+                prompt: `Hello ${name}`,
+                labels: ["production"],
+              }),
+            ),
+          );
+        }
+        const cachedVersions = async () => {
+          const versions = [];
+          for (let i = 0; i < names.length; i += 50) {
+            versions.push(
+              ...(await client.query(api.promptVersions, {
+                names: names.slice(i, i + 50),
+              })),
+            );
+          }
+          return versions;
+        };
+        await fake.holdPrompts(150);
+        let sync;
+        try {
+          sync = await client.action(api.syncPrompts, {});
+          if (sync.status !== "ok" || sync.tracked < names.length) {
+            throw new Error(`prompts.sync returned ${JSON.stringify(sync)}`);
+          }
+          await waitFor(
+            "every listed name in the cache",
+            async () => (await cachedVersions()).every((v) => v === 1),
+            120_000,
+            1_000,
+          );
+        } finally {
+          await fake.holdPrompts(0);
+        }
+        return `prompts.sync tracked ${sync.tracked} names, each cached at version 1`;
+      },
+    );
+
     const final = await fake.stats();
     const diverging = divergent(final);
     results.push({

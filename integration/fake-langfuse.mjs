@@ -96,6 +96,8 @@ const observations = new Map();
 const prompts = new Map();
 /** Where created prompt versions are posted, or `null`. */
 let webhook = null;
+/** A prompt by name is answered after this many milliseconds. */
+let promptHoldMs = 0;
 
 /** A pseudo-random generator: the same seed gives the same sequence. */
 function mulberry32(seed) {
@@ -526,6 +528,9 @@ async function publicApi(req, res, url) {
           : item.version === Number(version),
       );
     if (!entry) return json(res, 404, { message: "Prompt not found" });
+    if (promptHoldMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, promptHoldMs));
+    }
     return json(res, 200, {
       ...promptBody(name, entry),
       isActive: entry.labels.includes("production"),
@@ -652,6 +657,10 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/control/webhook") {
       webhook = JSON.parse(await readBody(req));
+      return json(res, 200, {});
+    }
+    if (req.method === "POST" && url.pathname === "/control/prompt-hold") {
+      promptHoldMs = JSON.parse(await readBody(req)).ms;
       return json(res, 200, {});
     }
     if (req.method === "POST" && url.pathname === "/control") {
