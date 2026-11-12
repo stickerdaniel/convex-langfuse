@@ -45,11 +45,13 @@ import {
   PROMPT_REFRESH_INTERVAL_MS,
   PROMPT_REFRESH_MAX_MS,
   PROMPT_REFRESH_SPACING_MS,
+  PROMPT_REQUEST_RETRY_MS,
   PROMPT_STEP_LABELS,
   PROMPT_TIMEOUT_MS,
   RETENTION_BATCH,
   SNAPSHOT_GRACE_MS,
 } from "./constants.js";
+import { withPauses } from "./retry.js";
 import { vPromptSource, vPromptType } from "./schema.js";
 import { basicAuth, exportConfig, type ExportConfig } from "./settings.js";
 import { byteLength } from "../shared/otlp.js";
@@ -1042,6 +1044,24 @@ export const listed = internalMutation({
 });
 
 /**
+ * Runs `request`, and again after each pause of `PROMPT_REQUEST_RETRY_MS`
+ * when it throws. A mutation that throws wrote nothing, so the next attempt
+ * starts from the same state. A reservation reads `promptSlots` and the rows
+ * of its names. Refreshes that start or stop tracking names, or that run for
+ * those names, write the same rows, and Convex gives up on a mutation whose
+ * reads keep changing under it.
+ */
+async function requestRefreshes(
+  ctx: ActionCtx,
+  args: { names: string[]; onlyNew?: boolean; start?: boolean },
+): Promise<{ tracked: number; overflow: number }> {
+  return await withPauses(
+    () => ctx.runMutation(internal.prompts.request, args),
+    PROMPT_REQUEST_RETRY_MS,
+  );
+}
+
+/**
  * Pages through every prompt name of the project and requests a refresh for
  * the names of each page; with `onlyNew`, only for names that are not
  * tracked. A listing entry carries the config of the name's latest version,
@@ -1101,10 +1121,7 @@ async function listAndRequest(
         .filter(
           (name): name is string => typeof name === "string" && name !== "",
         );
-      const counts = await ctx.runMutation(internal.prompts.request, {
-        names,
-        onlyNew,
-      });
+      const counts = await requestRefreshes(ctx, { names, onlyNew });
       total.tracked += counts.tracked;
       total.overflow += counts.overflow;
     }
@@ -1171,7 +1188,7 @@ export const sync = action({
     if (names?.some((name) => !isPromptName(name))) {
       refuse("invalid_prompt_name");
     }
-    const counts = await ctx.runMutation(internal.prompts.request, {
+    const counts = await requestRefreshes(ctx, {
       names: names ?? [],
       start: true,
     });

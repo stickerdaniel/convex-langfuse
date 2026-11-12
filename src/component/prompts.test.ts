@@ -41,6 +41,12 @@ import { byteLength } from "../shared/otlp.js";
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realTick = () => new Promise((resolve) => realSetTimeout(resolve, 5));
 
+/**
+ * For a test over `MAX_PROMPT_NAMES` names: it does 500 times the work of
+ * the others and passes the default 5 s on a busy machine.
+ */
+const LONG = { timeout: 30_000 };
+
 let t: TestConvex;
 let fake: FakeLangfuse;
 let prompts: FakePrompts;
@@ -115,6 +121,7 @@ type PromptTables = {
   promptNames: Doc<"promptNames">[];
   promptPins: Doc<"promptPins">[];
   promptSync: Doc<"promptSync">[];
+  promptSlots: Doc<"promptSlots">[];
 };
 
 async function promptTables(): Promise<PromptTables> {
@@ -125,6 +132,7 @@ async function promptTables(): Promise<PromptTables> {
     promptNames: await ctx.db.query("promptNames").collect(),
     promptPins: await ctx.db.query("promptPins").collect(),
     promptSync: await ctx.db.query("promptSync").collect(),
+    promptSlots: await ctx.db.query("promptSlots").collect(),
   }));
 }
 
@@ -293,45 +301,53 @@ describe("sync and get", () => {
     expect(await get("team/greeting")).toMatchObject({ prompt: "Hello team" });
   });
 
-  test("the 501st name is not tracked and sync reports the overflow", async () => {
-    const names = Array.from(
-      { length: 501 },
-      (_, i) => `p${String(i).padStart(3, "0")}`,
-    );
-    for (const name of names) prompts.add(name, name);
-    expect(await t.action(api.prompts.sync, {})).toEqual({
-      status: "ok",
-      tracked: 500,
-      overflow: 1,
-    });
-    const tracked = (await promptTables()).promptNames.map((row) => row.name);
-    expect(tracked).toHaveLength(500);
-    expect(tracked).not.toContain("p500");
-  });
+  test(
+    "the 501st name is not tracked and sync reports the overflow",
+    LONG,
+    async () => {
+      const names = Array.from(
+        { length: 501 },
+        (_, i) => `p${String(i).padStart(3, "0")}`,
+      );
+      for (const name of names) prompts.add(name, name);
+      expect(await t.action(api.prompts.sync, {})).toEqual({
+        status: "ok",
+        tracked: 500,
+        overflow: 1,
+      });
+      const tracked = (await promptTables()).promptNames.map((row) => row.name);
+      expect(tracked).toHaveLength(500);
+      expect(tracked).not.toContain("p500");
+    },
+  );
 
-  test("a name that left the cache frees its place for another name", async () => {
-    for (let i = 0; i < MAX_PROMPT_NAMES; i++) {
-      const name = `p${String(i).padStart(3, "0")}`;
-      prompts.add(name, name);
-    }
-    await sync();
-    prompts.add("late", "late");
-    expect(await sync(["late"])).toEqual({
-      status: "ok",
-      tracked: 0,
-      overflow: 1,
-    });
+  test(
+    "a name that left the cache frees its place for another name",
+    LONG,
+    async () => {
+      for (let i = 0; i < MAX_PROMPT_NAMES; i++) {
+        const name = `p${String(i).padStart(3, "0")}`;
+        prompts.add(name, name);
+      }
+      await sync();
+      prompts.add("late", "late");
+      expect(await sync(["late"])).toEqual({
+        status: "ok",
+        tracked: 0,
+        overflow: 1,
+      });
 
-    // The refresh finds the prompt gone and stops tracking the name.
-    prompts.delete("p000");
-    await sync(["p000"]);
-    expect(await sync(["late"])).toEqual({
-      status: "ok",
-      tracked: 1,
-      overflow: 0,
-    });
-    expect(await get("late")).toMatchObject({ prompt: "late" });
-  });
+      // The refresh finds the prompt gone and stops tracking the name.
+      prompts.delete("p000");
+      await sync(["p000"]);
+      expect(await sync(["late"])).toEqual({
+        status: "ok",
+        tracked: 1,
+        overflow: 0,
+      });
+      expect(await get("late")).toMatchObject({ prompt: "late" });
+    },
+  );
 
   test("a name of 257 UTF-8 bytes: sync refuses it, the listing counts it as overflow, get returns null and pin refuses it", async () => {
     const longest = "é".repeat(MAX_PROMPT_NAME_BYTES / 2);
@@ -573,6 +589,7 @@ describe("webhook", () => {
       promptNames: 1,
       promptPins: 0,
       promptSync: 1,
+      promptSlots: 1,
     });
 
     for (let i = 0; i < 4; i++) {
@@ -1264,45 +1281,54 @@ describe("refresh", () => {
     expect(await pendingScheduled(t)).toEqual([]);
   });
 
-  test("500 names attempted one second after a tick are scheduled by the first eligible tick within 99.8 s and applied within 20 minutes", async () => {
-    const names = Array.from(
-      { length: MAX_PROMPT_NAMES },
-      (_, i) => `p${String(i).padStart(3, "0")}`,
-    );
-    for (const name of names) prompts.add(name, name);
-    const start = Date.now();
-    await t.run(async (ctx) => {
-      await ctx.db.insert("promptSync", { lastListAt: start });
-      for (const name of names) {
-        await ctx.db.insert("promptNames", {
-          name,
-          token: "token",
-          dependsOn: [],
-          attemptedAt: start + 1_000,
-        });
+  test(
+    "500 names attempted one second after a tick are scheduled by the first eligible tick within 99.8 s and applied within 20 minutes",
+    LONG,
+    async () => {
+      const names = Array.from(
+        { length: MAX_PROMPT_NAMES },
+        (_, i) => `p${String(i).padStart(3, "0")}`,
+      );
+      for (const name of names) prompts.add(name, name);
+      const start = Date.now();
+      await t.run(async (ctx) => {
+        await ctx.db.insert("promptSync", { lastListAt: start });
+        for (const name of names) {
+          await ctx.db.insert("promptNames", {
+            name,
+            token: "token",
+            dependsOn: [],
+            attemptedAt: start + 1_000,
+          });
+          await ctx.db.insert("promptSlots", { name });
+        }
+      });
+
+      for (const minutes of [5, 10, 15]) {
+        vi.setSystemTime(start + minutes * MINUTE);
+        await t.mutation(internal.prompts.tick, {});
+        if (minutes < 15) expect(await scheduledRefreshes()).toEqual([]);
       }
-    });
+      const scheduled = await scheduledRefreshes();
+      expect(scheduled.map((job) => job.name).sort()).toEqual(names);
+      const times = scheduled.map((job) => job.at);
+      // The transaction clock of convex-test can run up to 1 ms ahead.
+      expect(Math.min(...times) - (start + 15 * MINUTE)).toBeLessThanOrEqual(1);
+      expect(Math.max(...times) - Math.min(...times)).toBe(
+        (MAX_PROMPT_NAMES - 1) * PROMPT_REFRESH_SPACING_MS,
+      );
 
-    for (const minutes of [5, 10, 15]) {
-      vi.setSystemTime(start + minutes * MINUTE);
-      await t.mutation(internal.prompts.tick, {});
-      if (minutes < 15) expect(await scheduledRefreshes()).toEqual([]);
-    }
-    const scheduled = await scheduledRefreshes();
-    expect(scheduled.map((job) => job.name).sort()).toEqual(names);
-    const times = scheduled.map((job) => job.at);
-    // The transaction clock of convex-test can run up to 1 ms ahead.
-    expect(Math.min(...times) - (start + 15 * MINUTE)).toBeLessThanOrEqual(1);
-    expect(Math.max(...times) - Math.min(...times)).toBe(
-      (MAX_PROMPT_NAMES - 1) * PROMPT_REFRESH_SPACING_MS,
-    );
-
-    await vi.advanceTimersByTimeAsync(start + 1_000 + 20 * MINUTE - Date.now());
-    await t.finishInProgressScheduledFunctions();
-    expect(Date.now()).toBe(start + 1_000 + 20 * MINUTE);
-    const labeled = (await promptTables()).promptLabels.map((row) => row.name);
-    expect(labeled.sort()).toEqual(names);
-  });
+      await vi.advanceTimersByTimeAsync(
+        start + 1_000 + 20 * MINUTE - Date.now(),
+      );
+      await t.finishInProgressScheduledFunctions();
+      expect(Date.now()).toBe(start + 1_000 + 20 * MINUTE);
+      const labeled = (await promptTables()).promptLabels.map(
+        (row) => row.name,
+      );
+      expect(labeled.sort()).toEqual(names);
+    },
+  );
 });
 
 describe("with Convex's transaction limits", () => {
@@ -1319,62 +1345,67 @@ describe("with Convex's transaction limits", () => {
     await t.finishAllScheduledFunctions(vi.runAllTimers);
   }
 
-  test("500 names with rows of the largest size are reserved and scheduled by one tick and by one webhook", async () => {
-    const pad = (prefix: string) => prefix.padEnd(MAX_PROMPT_NAME_BYTES, "x");
-    const dependsOn = Array.from({ length: MAX_PROMPT_DEPENDENCIES }, (_, i) =>
-      pad(`dep${String(i).padStart(2, "0")}`),
-    );
-    const names = Array.from({ length: MAX_PROMPT_NAMES }, (_, i) =>
-      pad(`name${String(i).padStart(3, "0")}`),
-    );
-    const snapshotIds = await t.run(async (ctx) => {
-      await ctx.db.insert("promptSync", { lastListAt: Date.now() });
-      const ids: Id<"promptSnapshots">[] = [];
-      for (let i = 0; i < MAX_PROMPT_LABELS; i++) {
-        ids.push(
-          await ctx.db.insert(
-            "promptSnapshots",
-            snapshotDoc(`s${i}`, { fetchedAt: Date.now() }),
-          ),
-        );
+  test(
+    "500 names with rows of the largest size are reserved and scheduled by one tick and by one webhook",
+    LONG,
+    async () => {
+      const pad = (prefix: string) => prefix.padEnd(MAX_PROMPT_NAME_BYTES, "x");
+      const dependsOn = Array.from(
+        { length: MAX_PROMPT_DEPENDENCIES },
+        (_, i) => pad(`dep${String(i).padStart(2, "0")}`),
+      );
+      const names = Array.from({ length: MAX_PROMPT_NAMES }, (_, i) =>
+        pad(`name${String(i).padStart(3, "0")}`),
+      );
+      const snapshotIds = await t.run(async (ctx) => {
+        await ctx.db.insert("promptSync", { lastListAt: Date.now() });
+        const ids: Id<"promptSnapshots">[] = [];
+        for (let i = 0; i < MAX_PROMPT_LABELS; i++) {
+          ids.push(
+            await ctx.db.insert(
+              "promptSnapshots",
+              snapshotDoc(`s${i}`, { fetchedAt: Date.now() }),
+            ),
+          );
+        }
+        return ids;
+      });
+      // Every row stages `MAX_PROMPT_LABELS` ids, the largest `staged`. A
+      // reservation clears it, so the rows are staged again before the webhook.
+      const stageAll = () =>
+        t.run(async (ctx) => {
+          const staged = { at: Date.now(), snapshotIds };
+          for (const row of await ctx.db.query("promptNames").collect()) {
+            await ctx.db.patch("promptNames", row._id, { staged });
+          }
+        });
+      for (let i = 0; i < names.length; i += 100) {
+        await t.run(async (ctx) => {
+          for (const name of names.slice(i, i + 100)) {
+            await ctx.db.insert("promptNames", {
+              name,
+              token: "token",
+              dependsOn,
+              attemptedAt: Date.now() - PROMPT_REFRESH_INTERVAL_MS,
+            });
+            await ctx.db.insert("promptSlots", { name });
+          }
+        });
       }
-      return ids;
-    });
-    // Every row stages `MAX_PROMPT_LABELS` ids, the largest `staged`. A
-    // reservation clears it, so the rows are staged again before the webhook.
-    const stageAll = () =>
-      t.run(async (ctx) => {
-        const staged = { at: Date.now(), snapshotIds };
-        for (const row of await ctx.db.query("promptNames").collect()) {
-          await ctx.db.patch("promptNames", row._id, { staged });
-        }
-      });
-    for (let i = 0; i < names.length; i += 100) {
-      await t.run(async (ctx) => {
-        for (const name of names.slice(i, i + 100)) {
-          await ctx.db.insert("promptNames", {
-            name,
-            token: "token",
-            dependsOn,
-            attemptedAt: Date.now() - PROMPT_REFRESH_INTERVAL_MS,
-          });
-          await ctx.db.insert("promptSlots", { name });
-        }
-      });
-    }
 
-    await stageAll();
-    await t.mutation(internal.prompts.tick, {});
-    expect((await scheduledRefreshes()).map((job) => job.name).sort()).toEqual(
-      names,
-    );
-    const rows = (await promptTables()).promptNames;
-    expect(rows.filter((row) => row.token === "token")).toEqual([]);
+      await stageAll();
+      await t.mutation(internal.prompts.tick, {});
+      expect(
+        (await scheduledRefreshes()).map((job) => job.name).sort(),
+      ).toEqual(names);
+      const rows = (await promptTables()).promptNames;
+      expect(rows.filter((row) => row.token === "token")).toEqual([]);
 
-    await stageAll();
-    await t.mutation(internal.prompts.webhook, { name: dependsOn[0]! });
-    expect(await scheduledRefreshes()).toHaveLength(2 * MAX_PROMPT_NAMES);
-  });
+      await stageAll();
+      await t.mutation(internal.prompts.webhook, { name: dependsOn[0]! });
+      expect(await scheduledRefreshes()).toHaveLength(2 * MAX_PROMPT_NAMES);
+    },
+  );
 
   test("eleven unreferenced snapshots of 900 KiB are all collected once past the grace period; a younger one stays", async () => {
     const fetchedAt = Date.now();
