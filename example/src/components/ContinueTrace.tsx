@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { useAction } from "convex/react";
+import { useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import { Card, Field, TextInput, Button } from "./ui";
 import { withLog } from "../lib/logStore";
+import type { Generation } from "./LogGeneration";
 
-export function ContinueTrace(props: { traceId: string | null }) {
+export function ContinueTrace(props: { conversationId: string; generation: Generation | null }) {
   const [name, setName] = useState("vector-search");
   const [input, setInput] = useState("convex components");
   const [output, setOutput] = useState("3 matches");
@@ -12,16 +13,17 @@ export function ContinueTrace(props: { traceId: string | null }) {
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
 
-  const logStep = useAction(api.example.logStep);
+  const recordStep = useMutation(api.example.recordStep);
 
   async function submit() {
-    if (!props.traceId) return;
+    if (!props.generation) return;
+    const parentObservationId = props.generation.observationId;
     setBusy(true);
     setError(null);
     setOk(null);
     try {
-      const result = await withLog(`logSpan(${name})`, () =>
-        logStep({ traceId: props.traceId!, name, input, output }),
+      const result = await withLog(`recordStep(${name})`, () =>
+        recordStep({ conversationId: props.conversationId, parentObservationId, name, input, output }),
       );
       setOk(result.observationId);
     } catch (err) {
@@ -34,15 +36,15 @@ export function ContinueTrace(props: { traceId: string | null }) {
   return (
     <Card
       title="Add a step to the trace"
-      description="Non-LLM work — a retrieval, a tool call, a guardrail check — grouped under the same trace as the generation above."
+      description="Records a span, such as a retrieval or a tool call, in the same trace, nested under the generation."
     >
-      {!props.traceId ? (
-        <div className="empty">Log a generation first to get a traceId to attach this to.</div>
+      {!props.generation ? (
+        <div className="empty">Record a generation first. The step nests under it.</div>
       ) : (
         <>
           <div className="trace-ref">
-            <span className="label">Adding to traceId</span>
-            <span className="mono">{props.traceId}</span>
+            <span className="label">Parent observation</span>
+            <span className="mono">{props.generation.observationId}</span>
           </div>
           <Field label="Step name">
             <TextInput value={name} onChange={(e) => setName(e.target.value)} />
@@ -56,7 +58,7 @@ export function ContinueTrace(props: { traceId: string | null }) {
             </Field>
           </div>
           <Button onClick={submit} disabled={busy}>
-            {busy ? "Sending…" : "Log step"}
+            {busy ? "Recording…" : "Record step"}
           </Button>
           {error && <div className="error-text">{error}</div>}
           {ok && (

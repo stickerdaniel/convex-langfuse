@@ -2,10 +2,10 @@ import { useQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import { Corners } from "./ui";
 
-export type Tab = "home" | "generation" | "explorer" | "history";
+export type Tab = "home" | "generation";
 
 export function Header(props: { tab: Tab; onTab: (tab: Tab) => void }) {
-  const stats = useQuery(api.example.getStats);
+  const health = useQuery(api.example.health);
 
   return (
     <div className="hero-frame">
@@ -13,15 +13,15 @@ export function Header(props: { tab: Tab; onTab: (tab: Tab) => void }) {
 
       <div className="hero-stats">
         <span>
-          <strong>{stats?.traces ?? 0}</strong> traces logged
+          <strong>{health?.pendingAtLeast ?? 0}</strong> pending
         </span>
-        <span className="dot">·</span>
+        <span className="dot">/</span>
         <span>
-          <strong>{stats?.observations ?? 0}</strong> observations
+          <strong>{health?.exporter.accepted ?? 0}</strong> accepted
         </span>
-        <span className="dot">·</span>
+        <span className="dot">/</span>
         <span>
-          <strong>{stats?.scores ?? 0}</strong> scores
+          <strong>{health?.deadLettersAtLeast ?? 0}</strong> dead letters
         </span>
       </div>
 
@@ -37,8 +37,8 @@ export function Header(props: { tab: Tab; onTab: (tab: Tab) => void }) {
           WIRED INTO CONVEX
         </h1>
         <p className="hero-sub">
-          Send traces, generations, and scores to Langfuse over OpenTelemetry — with a reactive
-          local copy in Convex.
+          Record traces in your Convex transactions. A transactional outbox exports them to
+          Langfuse over OpenTelemetry.
         </p>
       </div>
 
@@ -56,19 +56,7 @@ export function Header(props: { tab: Tab; onTab: (tab: Tab) => void }) {
           className={`tab${props.tab === "generation" ? " active" : ""}`}
           onClick={() => props.onTab("generation")}
         >
-          Log a generation
-        </button>
-        <button
-          className={`tab${props.tab === "explorer" ? " active" : ""}`}
-          onClick={() => props.onTab("explorer")}
-        >
-          Trace explorer
-        </button>
-        <button
-          className={`tab${props.tab === "history" ? " active" : ""}`}
-          onClick={() => props.onTab("history")}
-        >
-          History
+          Record a generation
         </button>
       </div>
     </div>

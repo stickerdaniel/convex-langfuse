@@ -1,13 +1,16 @@
 import { useState } from "react";
-import { useAction } from "convex/react";
+import { useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import { Card, Field, TextInput, TextArea, Button } from "./ui";
 import { withLog } from "../lib/logStore";
 
+/** Ids of a recorded generation. */
+export type Generation = { traceId: string; observationId: string };
+
 export function LogGeneration(props: {
   userId: string;
-  sessionId: string;
-  onTrace: (traceId: string) => void;
+  conversationId: string;
+  onGeneration: (generation: Generation) => void;
 }) {
   const [model, setModel] = useState("gpt-5");
   const [prompt, setPrompt] = useState("What is Convex?");
@@ -16,36 +19,29 @@ export function LogGeneration(props: {
   );
   const [inputTokens, setInputTokens] = useState(12);
   const [outputTokens, setOutputTokens] = useState(28);
-  const [tags, setTags] = useState("demo, chat");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lastResult, setLastResult] = useState<{ traceId: string; observationId: string } | null>(
-    null,
-  );
+  const [lastResult, setLastResult] = useState<Generation | null>(null);
 
-  const logChatCompletion = useAction(api.example.logChatCompletion);
+  const recordChatCompletion = useMutation(api.example.recordChatCompletion);
 
   async function submit() {
     setBusy(true);
     setError(null);
     try {
-      const result = await withLog("logGeneration(chat-completion)", () =>
-        logChatCompletion({
+      const result = await withLog("recordChatCompletion", () =>
+        recordChatCompletion({
+          conversationId: props.conversationId,
           userId: props.userId,
-          sessionId: props.sessionId,
           model,
           prompt,
           completion,
           inputTokens,
           outputTokens,
-          tags: tags
-            .split(",")
-            .map((t) => t.trim())
-            .filter(Boolean),
         }),
       );
       setLastResult(result);
-      props.onTrace(result.traceId);
+      props.onGeneration(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -55,17 +51,12 @@ export function LogGeneration(props: {
 
   return (
     <Card
-      title="Log a generation"
-      description="Simulates a finished LLM call — the prompt, completion, and token usage are already in hand, exactly like the return value of a real model call."
+      title="Record a generation"
+      description="A mutation saves the completion as a note and records it as a generation in the same transaction."
     >
-      <div className="row">
-        <Field label="Model">
-          <TextInput value={model} onChange={(e) => setModel(e.target.value)} />
-        </Field>
-        <Field label="Tags (comma-separated)">
-          <TextInput value={tags} onChange={(e) => setTags(e.target.value)} />
-        </Field>
-      </div>
+      <Field label="Model">
+        <TextInput value={model} onChange={(e) => setModel(e.target.value)} />
+      </Field>
       <Field label="Prompt">
         <TextArea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
       </Field>
@@ -89,7 +80,7 @@ export function LogGeneration(props: {
         </Field>
       </div>
       <Button onClick={submit} disabled={busy}>
-        {busy ? "Sending to Langfuse…" : "Log generation"}
+        {busy ? "Recording…" : "Record generation"}
       </Button>
       {error && <div className="error-text">{error}</div>}
       {lastResult && (

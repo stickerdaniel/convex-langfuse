@@ -15,14 +15,10 @@ export function Console() {
     <aside className="console">
       <div className="console-header">
         <h3>Activity</h3>
-        <p>
-          Every call this app makes into the Langfuse client, logged here. This component has no
-          incoming webhooks — Langfuse ingestion is one-way — so this is the closest thing to a
-          live feed.
-        </p>
+        <p>Every mutation this app calls, with its result.</p>
       </div>
       <div className="console-log" ref={logRef}>
-        {entries.length === 0 && <div className="empty">Nothing yet — try an action.</div>}
+        {entries.length === 0 && <div className="empty">Nothing yet. Record a generation.</div>}
         {entries.map((entry) => (
           <div
             key={entry.id}

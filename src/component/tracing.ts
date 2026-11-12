@@ -51,6 +51,15 @@ function validate(trace: TraceContext, observations: Observation[]): void {
   }
 }
 
+/** The smallest observation, for measuring what the env defaults add. */
+const PROBE: Observation = {
+  id: "0000000000000001",
+  type: "span",
+  name: "",
+  startTime: 0,
+  endTime: 0,
+};
+
 /** Fills environment and release from the component env when absent. */
 function withDefaults(trace: TraceContext): TraceContext {
   const environment = trace.environment ?? env.LANGFUSE_TRACING_ENVIRONMENT;
@@ -72,7 +81,8 @@ function withDefaults(trace: TraceContext): TraceContext {
  * export configuration, and `reason: "backlog"` without writing while the
  * admission gate is closed. Throws a `ConvexError` with a `RecordErrorCode`
  * for invalid ids, more than `MAX_CALL_RECORDS` observations, a span over
- * `MAX_ROW_BYTES` or spans over `MAX_CALL_BYTES` in total.
+ * `MAX_ROW_BYTES` before the env defaults are added, or spans over
+ * `MAX_CALL_BYTES` in total.
  *
  * Reads only the gate document and the batch-worker state, never the
  * exporter document, so it does not conflict with the running exporter.
@@ -99,10 +109,15 @@ export const record = mutation({
     if (observations.length === 0) return { enqueued: 0 };
 
     const stamped = withDefaults(trace);
+    // The client measures a span without the env defaults, so the row limit
+    // applies without them too. They add the same bytes to every span.
+    const stampBytes =
+      byteLength(encodeSpan(stamped, PROBE)) -
+      byteLength(encodeSpan(trace, PROBE));
     const spans = observations.map((observation) => {
       const data = encodeSpan(stamped, observation);
       const bytes = byteLength(data);
-      if (bytes > MAX_ROW_BYTES) refuse("row_too_large");
+      if (bytes - stampBytes > MAX_ROW_BYTES) refuse("row_too_large");
       return { ref: `${trace.traceId}:${observation.id}`, data, bytes };
     });
     const total = spans.reduce((sum, span) => sum + span.bytes, 0);

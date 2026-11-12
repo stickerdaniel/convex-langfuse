@@ -4,9 +4,9 @@
 //
 // Downloads the `convex-local-backend` binary of RELEASE into
 // `integration/.cache/`, starts it on free ports with its state in a temp
-// directory, deploys the host app in `integration/convex`, binds the
-// component's env through the app, and runs the cases against the fake
-// endpoint in `fake-langfuse.mjs`. Prints a result table and exits non-zero
+// directory, deploys the host app in `integration/convex`, which records
+// through the `Langfuse` client, binds the component's env through the app,
+// and runs the cases against the fake endpoint in `fake-langfuse.mjs`. Prints a result table and exits non-zero
 // when a case fails. Every process it starts is stopped before it exits.
 
 import { execFile, spawn } from "node:child_process";
@@ -30,12 +30,15 @@ import { promisify, stripVTControlCharacters } from "node:util";
 import { fileURLToPath } from "node:url";
 import { ConvexHttpClient } from "convex/browser";
 import { anyApi } from "convex/server";
+import { CLIENT_CALL_BYTES } from "../dist/shared/limits.js";
+import { byteLength, encodeSpan } from "../dist/shared/otlp.js";
 
 const RELEASE = "precompiled-2026-10-28-d1fcbea";
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const ROOT = join(HERE, "..");
 const CONVEX_BIN = join(ROOT, "node_modules", ".bin", "convex");
 const api = anyApi.harness;
+const nodeApi = anyApi.nodeHarness;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const run = promisify(execFile);
@@ -337,6 +340,8 @@ const TRACE_IDS = {
   4: "a0000000000000000000000000000004",
   5: "a0000000000000000000000000000005",
   6: "a0000000000000000000000000000006",
+  7: "a0000000000000000000000000000007",
+  8: "a0000000000000000000000000000008",
 };
 
 /** First span id number of a case, so cases never share ids. */
@@ -345,17 +350,17 @@ const hexId = (n) => n.toString(16).padStart(16, "0");
 
 /**
  * Runs `count` record mutations of `size` spans each, `concurrency` at a
- * time, and returns their results. Throws when a mutation fails. With
- * `throttled`, a mutation refused by the backend's write throughput limit
- * is sent again after a pause; that limit belongs to the local backend, not
- * to the component.
+ * time. A mutation fails when the client could not enqueue every span,
+ * unless `lenient` lets it log a closed gate instead. With `throttled`, a
+ * mutation refused by the backend's write throughput limit is sent again
+ * after a pause; that limit belongs to the local backend, not to the
+ * component.
  */
 async function recordMany(
   client,
   caseNo,
-  { count, size, concurrency, throttled = false },
+  { count, size, concurrency, throttled = false, lenient = false },
 ) {
-  const results = [];
   let next = 0;
   const worker = async () => {
     while (next < count) {
@@ -364,12 +369,11 @@ async function recordMany(
         traceId: TRACE_IDS[caseNo],
         from: firstId(caseNo) + i * size,
         count: size,
+        lenient,
       };
       for (;;) {
         try {
-          results[i] = await client.mutation(api.record, args, {
-            skipQueue: true,
-          });
+          await client.mutation(api.record, args, { skipQueue: true });
           break;
         } catch (error) {
           if (!throttled || !/TooManyWrites/.test(String(error))) throw error;
@@ -379,7 +383,41 @@ async function recordMany(
     }
   };
   await Promise.all(Array.from({ length: concurrency }, worker));
-  return results;
+}
+
+/**
+ * Arguments for `nodeHarness.recordLarge` with `count` spans whose encoded
+ * sizes, measured with the client's encoder, sum to just under `totalBytes`.
+ */
+function largeRecord(caseNo, count, totalBytes) {
+  const traceId = TRACE_IDS[caseNo];
+  const from = firstId(caseNo);
+  const startTime = Date.now();
+  const encodedBytes = (inputBytes) => {
+    let sum = 0;
+    for (let n = from; n < from + count; n++) {
+      sum += byteLength(
+        encodeSpan(
+          { traceId, name: "integration" },
+          {
+            id: hexId(n),
+            type: "span",
+            name: `span-${n}`,
+            startTime,
+            endTime: startTime,
+            input: "x".repeat(inputBytes),
+          },
+        ),
+      );
+    }
+    return sum;
+  };
+  const overhead = encodedBytes(0);
+  const inputBytes = Math.floor((totalBytes - 1024 - overhead) / count);
+  return {
+    args: { traceId, from, count, inputBytes, startTime },
+    bytes: encodedBytes(inputBytes),
+  };
 }
 
 /**
@@ -402,12 +440,8 @@ function startLoad(client, caseNo, { size, concurrency }) {
       };
       for (;;) {
         try {
-          const result = await client.mutation(api.record, args, {
-            skipQueue: true,
-          });
-          if (result.enqueued !== size) {
-            throw new Error(`record returned ${JSON.stringify(result)}`);
-          }
+          // The strict client throws when a span was not enqueued.
+          await client.mutation(api.record, args, { skipQueue: true });
           commits.push(Date.now());
           break;
         } catch (error) {
@@ -555,13 +589,7 @@ async function main() {
 
     await runCase("2 concurrency", async () => {
       const total = 2_000;
-      const recorded = await recordMany(client, 2, {
-        count: 200,
-        size: 10,
-        concurrency: 200,
-      });
-      const enqueued = recorded.reduce((sum, r) => sum + r.enqueued, 0);
-      if (enqueued !== total) throw new Error(`enqueued ${enqueued}`);
+      await recordMany(client, 2, { count: 200, size: 10, concurrency: 200 });
       await waitFor(
         "2,000 span ids",
         async () => received(await fake.stats(), 2, total) === total,
@@ -696,11 +724,13 @@ async function main() {
         size: 50,
         concurrency: 4,
         throttled: true,
+        lenient: true,
       });
       await client.mutation(api.record, {
         traceId: TRACE_IDS[5],
         from: firstId(5) + 25_000,
         count: 1,
+        lenient: true,
       });
       const backlog = await waitFor(
         "the gate to close",
@@ -711,13 +741,18 @@ async function main() {
         240_000,
         1_000,
       );
-      const refused = await client.mutation(api.record, {
-        traceId: TRACE_IDS[5],
-        from: firstId(5) + 25_001,
-        count: 1,
-      });
-      if (refused.reason !== "backlog") {
-        throw new Error(`record returned ${JSON.stringify(refused)}`);
+      const refused = await client
+        .mutation(api.record, {
+          traceId: TRACE_IDS[5],
+          from: firstId(5) + 25_001,
+          count: 1,
+        })
+        .then(
+          () => "committed",
+          (error) => String(error),
+        );
+      if (!/\bbacklog\b/.test(refused)) {
+        throw new Error(`record did not refuse: ${refused.slice(0, 200)}`);
       }
       const counts = (await finish()).filter((log) =>
         /outbox(\.js)?:count/.test(log.identifier),
@@ -734,7 +769,7 @@ async function main() {
         throw new Error(`outbox:count took ${longestMs.toFixed(0)} ms`);
       }
       return (
-        `closed at ${backlog.pendingCounted} counted rows, record returns ` +
+        `closed at ${backlog.pendingCounted} counted rows, record throws ` +
         `backlog; ${counts.length} count steps, longest ${longestMs.toFixed(0)} ms`
       );
     });
@@ -889,6 +924,28 @@ async function main() {
         throw new Error(`${error?.message ?? error}; ${text}`);
       }
     });
+
+    // One `trace.record` call from a Node action, `count` spans of
+    // `totalBytes` encoded bytes in all. Every span must be exported.
+    const recordFromNode = async (caseNo, count, totalBytes) => {
+      const { args, bytes } = largeRecord(caseNo, count, totalBytes);
+      const recorded = await client.action(nodeApi.recordLarge, args);
+      if (recorded !== count) throw new Error(`recorded ${recorded}`);
+      await waitFor(
+        `${count} span ids`,
+        async () => received(await fake.stats(), caseNo, count) === count,
+        180_000,
+      );
+      return `${count} spans, ${bytes} encoded bytes in one trace.record call, all exported`;
+    };
+
+    await runCase("7 node action at the split budget", () =>
+      recordFromNode(7, 30, CLIENT_CALL_BYTES),
+    );
+
+    await runCase("8 node action at twice the split budget", () =>
+      recordFromNode(8, 60, 2 * CLIENT_CALL_BYTES),
+    );
 
     const diverging = divergent(await fake.stats());
     results.push({

@@ -104,7 +104,7 @@ const realTick = () => new Promise((resolve) => realSetTimeout(resolve, 5));
  * step. `onStep` runs after every step, for sampling state.
  */
 export async function drive(
-  t: TestConvex,
+  t: Pick<TestConvex, "finishInProgressScheduledFunctions">,
   fake: FakeLangfuse,
   options: {
     until?: () => boolean | Promise<boolean>;

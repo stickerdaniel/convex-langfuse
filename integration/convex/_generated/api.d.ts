@@ -9,6 +9,7 @@
  */
 
 import type * as harness from "../harness.js";
+import type * as nodeHarness from "../nodeHarness.js";
 
 import type {
   ApiFromModules,
@@ -18,6 +19,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   harness: typeof harness;
+  nodeHarness: typeof nodeHarness;
 }>;
 
 /**

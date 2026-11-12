@@ -4,11 +4,9 @@ import { Header, type Tab } from "./components/Header";
 import { TopBanner } from "./components/TopBanner";
 import { Console } from "./components/Console";
 import { Home } from "./components/Home";
-import { LogGeneration } from "./components/LogGeneration";
+import { LogGeneration, type Generation } from "./components/LogGeneration";
 import { ContinueTrace } from "./components/ContinueTrace";
-import { ScorePanel } from "./components/ScorePanel";
-import { TraceExplorer } from "./components/TraceExplorer";
-import { History } from "./components/History";
+import { OutboxStatus } from "./components/OutboxStatus";
 
 function randomId(prefix: string): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -17,8 +15,8 @@ function randomId(prefix: string): string {
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
   const [userId] = useState(() => randomId("user"));
-  const [sessionId] = useState(() => randomId("session"));
-  const [currentTraceId, setCurrentTraceId] = useState<string | null>(null);
+  const [conversationId] = useState(() => randomId("conversation"));
+  const [generation, setGeneration] = useState<Generation | null>(null);
 
   return (
     <div className="shell">
@@ -30,17 +28,15 @@ export default function App() {
 
         {tab === "generation" && (
           <>
-            <LogGeneration userId={userId} sessionId={sessionId} onTrace={setCurrentTraceId} />
-            <ContinueTrace traceId={currentTraceId} />
-            <ScorePanel traceId={currentTraceId} />
+            <LogGeneration
+              userId={userId}
+              conversationId={conversationId}
+              onGeneration={setGeneration}
+            />
+            <ContinueTrace conversationId={conversationId} generation={generation} />
+            <OutboxStatus />
           </>
         )}
-
-        {tab === "explorer" && (
-          <TraceExplorer currentTraceId={currentTraceId} userId={userId} sessionId={sessionId} />
-        )}
-
-        {tab === "history" && <History />}
       </div>
       <Console />
     </div>
