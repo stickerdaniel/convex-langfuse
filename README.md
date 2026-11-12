@@ -210,8 +210,11 @@ Notes on the fields:
 - `usage` and `cost` hold at most 1,024 entries each. A key has 1 to 1,024
   printable ASCII characters and starts with neither `$` nor `_`.
 - `tags` are at most 8,192 strings.
+- A string cut inside an emoji holds a lone surrogate, which Convex refuses. The
+  client sends U+FFFD in its place.
 - With `cost` set, Langfuse uses your numbers and infers nothing from the model
-  name. Without it, Langfuse prices the usage from its model table.
+  name. Without it, Langfuse prices the usage from its model table. Cost values
+  are non-negative numbers.
 - `prompt` links a generation to a prompt version in Langfuse; a link without a
   name or without a positive integer version is left out. Other observation
   types ignore it.
@@ -284,7 +287,7 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | `backlog`             | The outbox is full, see [Delivery](#delivery)                | no                 |
 | `enqueue_failed`      | The component call failed                                    | no                 |
 | `unserializable`      | `input`, `output` or a JSON field cannot be serialized       | without that field |
-| `invalid_metadata`    | A metadata or model-parameter value is not a plain object    | without that field |
+| `invalid_metadata`    | Metadata or model parameters do not convert to a JSON object | without that field |
 | `invalid_tags`        | The tags are not an array of at most 8,192 strings           | without the tags   |
 | `invalid_usage`       | A usage entry has a bad key or value                         | without that entry |
 | `invalid_usage`       | `usage` has more than 1,024 entries                          | without `usage`    |
@@ -298,7 +301,8 @@ throws an `Error` whose message is the code, which rolls back a mutation.
   2xx, the row becomes a dead letter, or it expires. Langfuse answers 2xx when
   it queued a batch. An accepted row leaves the outbox. The spans of a batch
   whose answer got lost are sent again, each byte for byte with its ids, in a
-  request that can hold other spans.
+  request that can hold other spans. Langfuse can show a span it received twice
+  as two observations until its background merge.
 - **Order.** The exporter sends the oldest rows first. Langfuse places an
   observation by its ids and timestamps, not by its arrival.
 - **Backoff.** Network errors, timeouts after 20 s, 408, 425, 429 and 5xx back
