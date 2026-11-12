@@ -956,15 +956,16 @@ async function main() {
         if (during < 1) {
           throw new Error(
             "the race was not exercised: no name stopped being tracked " +
-              "during the reservation",
+              "between the two reads around the reservation",
           );
         }
         const again = executions.filter(
           (log) => log.error && lostReservation(log),
         ).length;
         return (
-          `${fresh.length} names reserved while ${during} of ${gone.length} ` +
-          `names stopped being tracked; ${again} reservations run again`
+          `${fresh.length} names reserved; ${during} of ${gone.length} names ` +
+          `stopped being tracked between the two reads around the ` +
+          `reservation; ${again} reservations run again`
         );
       },
     );
