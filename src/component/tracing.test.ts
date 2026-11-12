@@ -1,4 +1,3 @@
-import { ConvexError } from "convex/values";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, components, internal } from "./_generated/api.js";
 import { MAX_CALL_BYTES, MAX_ROW_BYTES, WORKER_NAME } from "./constants.js";
@@ -10,6 +9,7 @@ import {
   insertRows,
   observation,
   PUBLIC_KEY,
+  refusalCode,
   SECRET_KEY,
   spanOfBytes,
   startRunByHand,
@@ -30,16 +30,6 @@ afterEach(() => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
-
-async function refusalCode(promise: Promise<unknown>): Promise<unknown> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof ConvexError) return error.data;
-    throw error;
-  }
-  throw new Error("expected a refusal");
-}
 
 /** An observation whose encoded span has exactly `bytes` bytes. */
 function observationOfBytes(n: number, bytes: number) {

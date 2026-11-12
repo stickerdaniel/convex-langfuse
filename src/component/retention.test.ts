@@ -4,7 +4,9 @@ import {
   DEAD_LETTER_RETENTION_MS,
   MAX_PENDING_AGE_MS,
   MAX_ROW_BYTES,
+  RETENTION_BATCH,
   RETENTION_BATCH_BYTES,
+  SCORE_KEY_RETENTION_MS,
 } from "./constants.js";
 import {
   countStep,
@@ -189,6 +191,40 @@ describe("retention sweep", () => {
       expect(state.payloads).toEqual([]);
       expect(state.exporter[0]!.expired).toBe(rows);
     });
+  });
+
+  test("200 old keys with queued ops do not keep an idle key behind them from being deleted", async () => {
+    await t.run(async (ctx) => {
+      for (let i = 0; i < RETENTION_BATCH; i++) {
+        const payloadId = await ctx.db.insert("payloads", { data: "{}" });
+        const queued = await ctx.db.insert("outbox", {
+          kind: "scoreCreate",
+          ref: `s${i}`,
+          bytes: 2,
+          availableAt: Date.now(),
+          payloadId,
+        });
+        await ctx.db.insert("scoreKeys", {
+          scoreId: `s${i}`,
+          queued,
+          updatedAt: Date.now() + i,
+        });
+      }
+      await ctx.db.insert("scoreKeys", {
+        scoreId: "idle",
+        updatedAt: Date.now() + RETENTION_BATCH,
+      });
+    });
+    // An outage of more than a day, shorter than the expiry of the ops.
+    vi.setSystemTime(Date.now() + SCORE_KEY_RETENTION_MS + 60_000);
+    await t.mutation(internal.retention.sweep, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const state = await tables(t);
+    expect(state.scoreKeys.map((key) => key.scoreId)).not.toContain("idle");
+    expect(state.scoreKeys).toHaveLength(RETENTION_BATCH);
+    expect(state.scoreKeys.every((key) => key.queued !== undefined)).toBe(true);
+    expect(state.outbox).toHaveLength(RETENTION_BATCH);
   });
 
   test("a sweep over empty tables writes and schedules nothing", async () => {

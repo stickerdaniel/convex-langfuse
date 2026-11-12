@@ -1,29 +1,43 @@
+import type { FunctionArgs } from "convex/server";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api.js";
 import {
   BREAKER_REJECTED_SPANS,
   CONFIG_FRESH_MS,
+  CONFIG_SYNC_DEADLINE_MS,
   DEFERRED_MS,
   LEASE_MS,
   MAX_PENDING_AGE_MS,
   MAX_PENDING_DELETES,
+  MAX_ROW_BYTES,
+  PENDING_BYTES_THRESHOLD,
   SCORE_SETTLE_MS,
 } from "./constants.js";
 import {
+  consumeReceipts,
   drive,
   enableExport,
+  insertRows,
   installFakeLangfuse,
   observations,
+  pendingCounted,
   pendingScheduled,
+  refusalCode,
+  runScheduledNow,
+  serveConfigs,
   spanId,
   startRunByHand,
   tables,
+  totals,
   TRACE,
   type FakeLangfuse,
   type RecordedRequest,
+  type RemoteConfig,
   type TestConvex,
 } from "./fakeLangfuse.test-util.js";
 import { initConvexTest } from "./setup.test.js";
+import { byteLength } from "../shared/otlp.js";
+import { definitionFingerprint, scoreBytes } from "../shared/scores.js";
 
 let t: TestConvex;
 let fake: FakeLangfuse;
@@ -44,15 +58,25 @@ afterEach(() => {
 
 const TIMESTAMP = Date.parse("2026-11-11T11:59:00.000Z");
 
-async function upsert(id: string, value: number, name = "quality") {
-  return await t.mutation(api.scores.upsert, {
+/** The arguments of a numeric score, changed by `extra`. */
+function scoreArgs(
+  id: string,
+  value: number,
+  extra: { name?: string; comment?: string; fingerprint?: string } = {},
+) {
+  return {
     id,
     timestamp: TIMESTAMP,
-    name,
+    name: "quality",
     value,
-    dataType: "NUMERIC",
+    dataType: "NUMERIC" as const,
     traceId: TRACE.traceId,
-  });
+    ...extra,
+  };
+}
+
+async function upsert(...args: Parameters<typeof scoreArgs>) {
+  return await t.mutation(api.scores.upsert, scoreArgs(...args));
 }
 
 async function recordSpans(from: number, count: number) {
@@ -249,8 +273,10 @@ describe("score ops", () => {
     vi.spyOn(Math, "random").mockReturnValue(0.999);
     fake.fallback = (request) =>
       request.spanIds.length > 0 ? { status: 200 } : { status: 404 };
-    await upsert("s1", 1);
+    // The deletion request comes first: a score write enqueued before it
+    // would hold it back.
     await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await upsert("s1", 1);
     await recordSpans(0, 50);
     await recordSpans(50, 50);
     const sentSpans = () => fake.requests.flatMap((r) => r.spanIds).length;
@@ -260,13 +286,13 @@ describe("score ops", () => {
     expect(fake.requests.at(-1)!.at - fake.requests[0]!.at).toBeLessThan(100);
     const apiRequests = fake.requests.filter((r) => r.spanIds.length === 0);
     expect(apiRequests.map((r) => `${r.method} ${r.path}`)).toEqual([
-      "POST /api/public/scores",
       "DELETE /api/public/traces",
+      "POST /api/public/scores",
     ]);
     const state = await tables(t);
     expect(state.outbox.map((row) => row.kind)).toEqual([
-      "scoreCreate",
       "traceDelete",
+      "scoreCreate",
     ]);
     for (const [i, row] of state.outbox.entries()) {
       // The fake clock moves 1 ms per transaction.
@@ -282,7 +308,7 @@ describe("score ops", () => {
     expect(exporter.backoffUntil).toBeUndefined();
     expect(exporter.consecutiveFailures).toBe(0);
     expect(exporter.accepted).toBe(100);
-    expect((await scoreKey("s1"))?.queued).toBe(state.outbox[0]!._id);
+    expect((await scoreKey("s1"))?.queued).toBe(state.outbox[1]!._id);
   });
 
   test("a deferred op that ends a run leaves no backoff", async () => {
@@ -296,6 +322,154 @@ describe("score ops", () => {
     expect(exporter.lastError).toMatchObject({ class: "config", status: 404 });
     expect(exporter.backoffUntil).toBeUndefined();
     expect(exporter.consecutiveFailures).toBe(0);
+  });
+
+  test("a bad default environment refuses a score without its own, and a valid explicit one is accepted", async () => {
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "Production");
+    expect(await refusalCode(upsert("s1", 1))).toBe("invalid_environment");
+    expect((await tables(t)).outbox).toEqual([]);
+    expect(
+      await t.mutation(api.scores.upsert, {
+        ...scoreArgs("s2", 1),
+        environment: "staging",
+      }),
+    ).toEqual({ enqueued: true });
+  });
+});
+
+describe("score backlog", () => {
+  test("score upserts with distinct ids close the gate past the byte threshold while Langfuse fails, and the next upsert returns backlog", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    fake.fallback = { network: true };
+    // convex-test reads a whole table for every index query, so the 25,001
+    // upserts of the row threshold take minutes; 292 scores of the largest
+    // size cross the byte threshold.
+    const id = (i: number) => `s${String(i).padStart(3, "0")}`;
+    const base = scoreBytes(scoreArgs(id(0), 1, { comment: "" }));
+    const comment = "x".repeat(MAX_ROW_BYTES - base);
+    const rows = Math.ceil(PENDING_BYTES_THRESHOLD / MAX_ROW_BYTES);
+    for (let i = 0; i < rows; i++) await upsert(id(i), 1, { comment });
+    const deadline = Date.now() + 3_600_000;
+    await drive(t, fake, {
+      until: async () => !(await health()).accepting || Date.now() > deadline,
+    });
+
+    const { accepting, pendingCounted } = await health();
+    expect(accepting).toBe(false);
+    expect(pendingCounted.rows).toBe(rows);
+    expect(pendingCounted.bytes).toBeGreaterThan(PENDING_BYTES_THRESHOLD);
+    expect(await upsert("next", 1)).toEqual({
+      enqueued: false,
+      reason: "backlog",
+    });
+  }, 60_000);
+
+  test("a waiting score replaced twice counts as one row with the bytes of its last body", async () => {
+    await upsert("s1", 1, { comment: "the first body is the longest one" });
+    await upsert("s1", 2, { comment: "a shorter one" });
+    await upsert("s1", 3);
+    await consumeReceipts(t);
+    const { outbox, payloads } = await tables(t);
+    expect(outbox).toHaveLength(1);
+    expect(await pendingCounted(t)).toEqual({
+      rows: 1,
+      bytes: byteLength(payloads[0]!.data),
+    });
+  });
+
+  test("accepting a score op while the gate is closed reopens it before the run ends", async () => {
+    await upsert("s1", 1);
+    await insertRows(t, [{ data: "x" }]);
+    // Both rows are counted, and the gate is closed.
+    await t.run(async (ctx) => {
+      for (const receipt of await ctx.db.query("receipts").collect()) {
+        await ctx.db.delete("receipts", receipt._id);
+      }
+      await ctx.db.insert("counter", { addedRows: 2, addedBytes: 2, chain: 0 });
+      await ctx.db.insert("gate", { accepting: false, changedAt: 0 });
+    });
+    await startRunByHand(t);
+    expect(
+      await t.mutation(internal.exporter.advance, { generation: 1 }),
+    ).toMatchObject({ done: false, op: { kind: "scoreCreate" } });
+    // The span behind the score keeps the run going.
+    expect(
+      await t.mutation(internal.exporter.advance, {
+        generation: 1,
+        report: { outcome: "accepted", status: 200 },
+      }),
+    ).toEqual({ done: false, spans: ["x"] });
+    await runScheduledNow(t);
+    expect((await health()).accepting).toBe(true);
+  });
+
+  test("a run that dies with a score op in flight and a successor queued leaves equal totals once the successor is accepted", async () => {
+    await upsert("s1", 1);
+    await startRunByHand(t);
+    await t.mutation(internal.exporter.advance, { generation: 1 });
+    await upsert("s1", 2, { comment: "the successor" });
+    // Both receipts are counted, and the gate reconciled, while the
+    // successor waits, so no drift reset applies afterwards.
+    await consumeReceipts(t);
+    await runScheduledNow(t);
+    vi.setSystemTime(Date.now() + LEASE_MS + 1);
+    await t.mutation(internal.exporter.dispatch, { op: "start" });
+    await drive(t, fake);
+
+    expect(scorePosts().map((r) => scoreBody(r).value)).toEqual([2]);
+    await consumeReceipts(t);
+    const { added, removed } = await totals(t);
+    expect(added.rows).toBe(2);
+    expect(removed).toEqual(added);
+  });
+
+  test.each([
+    ["transient", 503],
+    ["deferred", 404],
+  ])(
+    "a %s failure of a score op with a waiting successor leaves equal totals once the successor is accepted",
+    async (_, status) => {
+      vi.spyOn(Math, "random").mockReturnValue(0);
+      fake.respond(async () => {
+        await upsert("s1", 2, { comment: "the successor" });
+        return { status };
+      });
+      await upsert("s1", 1);
+      await drive(t, fake);
+
+      expect(scorePosts().map((r) => scoreBody(r).value)).toEqual([1, 2]);
+      await consumeReceipts(t);
+      const { added, removed } = await totals(t);
+      expect(added.rows).toBe(2);
+      expect(removed).toEqual(added);
+    },
+  );
+
+  test("a rejected score and an expired score each add one row and their bytes to the removed totals", async () => {
+    await upsert("rejected", 1);
+    await startRunByHand(t);
+    await t.mutation(internal.exporter.advance, { generation: 1 });
+    await t.mutation(internal.exporter.advance, {
+      generation: 1,
+      report: { outcome: "rejected", status: 400 },
+    });
+    const [deadLetter] = (await tables(t)).deadLetters;
+    expect((await totals(t)).removed).toEqual({
+      rows: 1,
+      bytes: deadLetter!.bytes,
+    });
+
+    await upsert("expired", 1, { comment: "left to expire" });
+    const [row] = (await tables(t)).outbox;
+    vi.setSystemTime(Date.now() + MAX_PENDING_AGE_MS + 1_000);
+    // A fresh row keeps the outbox non-empty, so no drift reset applies.
+    await insertRows(t, [{ data: "x" }]);
+    await t.mutation(internal.retention.sweep, {});
+    expect((await tables(t)).exporter[0]).toMatchObject({ expired: 1 });
+    expect((await totals(t)).removed).toEqual({
+      rows: 2,
+      bytes: deadLetter!.bytes + row!.bytes,
+    });
   });
 });
 
@@ -357,6 +531,100 @@ describe("trace deletion requests", () => {
     ).rejects.toThrow("too_many_pending_deletes");
   });
 
+  test.each([
+    [0, 1_000, "too_many_pending_deletes"],
+    [600, 400, "too_many_pending_deletes"],
+    [600, 399, "admitted"],
+  ])(
+    "with %i requests in the outbox and %i rejected ones the next request is %s",
+    async (queued, rejected, outcome) => {
+      await t.run(async (ctx) => {
+        for (let i = 0; i < queued + rejected; i++) {
+          const row = {
+            kind: "traceDelete" as const,
+            ref: TRACE.traceId,
+            bytes: 2,
+            payloadId: await ctx.db.insert("payloads", { data: "{}" }),
+          };
+          if (i < queued) {
+            await ctx.db.insert("outbox", { ...row, availableAt: Date.now() });
+          } else {
+            await ctx.db.insert("deadLetters", {
+              ...row,
+              reason: "rejected",
+              status: 400,
+              failedAt: Date.now(),
+            });
+          }
+        }
+      });
+      const remove = t.mutation(api.traces.remove, {
+        traceIds: [TRACE.traceId],
+      });
+      if (outcome === "admitted") {
+        expect(await remove).toEqual({ enqueued: true });
+      } else {
+        expect(await refusalCode(remove)).toBe(outcome);
+      }
+    },
+  );
+
+  const isTraceDelete = (r: RecordedRequest) =>
+    r.method === "DELETE" && r.path === "/api/public/traces";
+  const requestLog = () =>
+    fake.requests.map((r) =>
+      isScorePost(r)
+        ? `score ${scoreBody(r).value}`
+        : isTraceDelete(r)
+          ? "trace delete"
+          : `spans ${r.spanIds.length}`,
+    );
+
+  /** Runs the exporter until the first score is accepted, and no longer. */
+  const acceptFirst = () =>
+    drive(t, fake, { until: () => scorePosts().length === 1 });
+
+  test("a score written again before its trace is deleted is sent before the deletion request", async () => {
+    await upsert("s1", 1);
+    await acceptFirst();
+    // The second write waits SCORE_SETTLE_MS after the first was accepted.
+    await upsert("s1", 2);
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await drive(t, fake);
+
+    expect(requestLog()).toEqual(["score 1", "score 2", "trace delete"]);
+    expect((await tables(t)).outbox).toEqual([]);
+  });
+
+  test("a score written after the deletion request does not delay it", async () => {
+    await upsert("s1", 1);
+    await acceptFirst();
+    const requestedAt = Date.now();
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await upsert("s1", 2);
+    await drive(t, fake);
+
+    expect(requestLog()).toEqual(["score 1", "trace delete", "score 2"]);
+    expect(fake.requests[1]!.at - requestedAt).toBeLessThan(SCORE_SETTLE_MS);
+  });
+
+  test("the claim that holds back a deletion request goes on with the spans behind it", async () => {
+    await upsert("s1", 1);
+    await acceptFirst();
+    await upsert("s1", 2);
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await recordSpans(0, 3);
+    await startRunByHand(t);
+
+    const step = await t.mutation(internal.exporter.advance, { generation: 1 });
+    expect(step).toMatchObject({ done: false, spans: { length: 3 } });
+    // The request now waits just behind the score write enqueued before it.
+    const { outbox } = await tables(t);
+    const score = outbox.find((row) => row.kind === "scoreCreate")!;
+    const deletion = outbox.find((row) => row.kind === "traceDelete")!;
+    expect(deletion.availableAt).toBe(score.availableAt + 1);
+  });
+
   test("returns disabled without writing on a disabled component", async () => {
     vi.stubEnv("LANGFUSE_BASE_URL", "");
     expect(
@@ -365,18 +633,6 @@ describe("trace deletion requests", () => {
     expect((await tables(t)).outbox).toEqual([]);
   });
 });
-
-/** A remote score config as the list endpoint returns it. */
-type Remote = {
-  id: string;
-  name: string;
-  dataType: string;
-  isArchived: boolean;
-  minValue?: number | null;
-  maxValue?: number | null;
-  categories?: { label: string; value: number }[] | null;
-  createdAt: string;
-};
 
 const DEFINITIONS = [
   { name: "helpful", dataType: "BOOLEAN" as const },
@@ -388,51 +644,6 @@ const DEFINITIONS = [
   },
 ];
 
-/**
- * Serves `remote` as the score config endpoints, newest first like
- * Langfuse, and appends created configs to it. `onPage` can replace the
- * answer of a page.
- */
-function serveConfigs(
-  remote: Remote[],
-  onPage?: (page: number) => Promise<{ status: number } | undefined>,
-) {
-  let created = 0;
-  fake.fallback = async (request) => {
-    const url = new URL(request.url);
-    if (url.pathname !== "/api/public/score-configs") return { status: 200 };
-    if (request.method === "POST") {
-      const body = JSON.parse(request.body) as Omit<Remote, "id">;
-      created += 1;
-      const config: Remote = {
-        ...body,
-        id: `created-${created}`,
-        isArchived: false,
-        createdAt: new Date().toISOString(),
-      };
-      remote.push(config);
-      return { status: 200, body: config };
-    }
-    const page = Number(url.searchParams.get("page"));
-    const limit = Number(url.searchParams.get("limit"));
-    const replaced = await onPage?.(page);
-    if (replaced) return replaced;
-    const sorted = [...remote].reverse();
-    return {
-      status: 200,
-      body: {
-        data: sorted.slice((page - 1) * limit, page * limit),
-        meta: {
-          page,
-          limit,
-          totalItems: sorted.length,
-          totalPages: Math.ceil(sorted.length / limit),
-        },
-      },
-    };
-  };
-}
-
 const configPosts = () =>
   fake.requests.filter(
     (r) => r.method === "POST" && r.path === "/api/public/score-configs",
@@ -443,12 +654,13 @@ const stored = () =>
       ({ name, configId }) => ({ name, configId }),
     ),
   );
-const sync = (definitions = DEFINITIONS) =>
+type Definitions = FunctionArgs<typeof api.scores.syncConfigs>["definitions"];
+const sync = (definitions: Definitions = DEFINITIONS) =>
   t.action(api.scores.syncConfigs, { definitions });
 
 describe("score config sync", () => {
   test("creates a config for every definition without one", async () => {
-    serveConfigs([]);
+    serveConfigs(fake, []);
     const result = await sync();
 
     expect(result).toEqual({
@@ -479,7 +691,7 @@ describe("score config sync", () => {
 
   test("reuses the oldest compatible config of duplicates, reports conflicts and stores none of them", async () => {
     const at = (day: number) => `2026-01-0${day}T00:00:00.000Z`;
-    serveConfigs([
+    serveConfigs(fake, [
       // Compatible duplicates of "rating"; the oldest wins.
       {
         id: "r-new",
@@ -550,7 +762,7 @@ describe("score config sync", () => {
 
   test("a second call while a sync runs returns running", async () => {
     let second: unknown;
-    serveConfigs([], async () => {
+    serveConfigs(fake, [], async () => {
       second ??= await sync();
       return undefined;
     });
@@ -559,7 +771,7 @@ describe("score config sync", () => {
   });
 
   test("a failing page makes the run incomplete: nothing created, nothing stored", async () => {
-    const remote: Remote[] = Array.from({ length: 150 }, (_, i) => ({
+    const remote: RemoteConfig[] = Array.from({ length: 150 }, (_, i) => ({
       id: `other-${i}`,
       name: `other-${i}`,
       dataType: "BOOLEAN",
@@ -567,7 +779,7 @@ describe("score config sync", () => {
       createdAt: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
     }));
     let failing = false;
-    serveConfigs(remote, async (page) =>
+    serveConfigs(fake, remote, async (page) =>
       failing && page === 2 ? { status: 500 } : undefined,
     );
     await sync();
@@ -588,7 +800,7 @@ describe("score config sync", () => {
   });
 
   test("the result of a superseded sync is not stored", async () => {
-    serveConfigs([], async () => {
+    serveConfigs(fake, [], async () => {
       await t.run(async (ctx) => {
         const state = (await ctx.db.query("scoreConfigSync").first())!;
         await ctx.db.patch("scoreConfigSync", state._id, {
@@ -602,8 +814,8 @@ describe("score config sync", () => {
   });
 
   test("a configId is attached while fresh, not after 3 hours, and not after a resync found it archived", async () => {
-    const remote: Remote[] = [];
-    serveConfigs(remote);
+    const remote: RemoteConfig[] = [];
+    serveConfigs(fake, remote);
     await sync();
     const queuedBody = async (id: string) => {
       const state = await tables(t);
@@ -613,21 +825,25 @@ describe("score config sync", () => {
       return JSON.parse(payload.data) as { configId?: string };
     };
 
-    await upsert("fresh", 3, "rating");
+    const rating = {
+      name: "rating",
+      fingerprint: await definitionFingerprint(DEFINITIONS[1]!),
+    };
+    await upsert("fresh", 3, rating);
     expect((await queuedBody("fresh")).configId).toBe("created-2");
     // Another data type than the synced config gets no id.
     await t.mutation(api.scores.upsert, {
-      id: "other-type",
-      timestamp: TIMESTAMP,
-      name: "rating",
+      ...scoreArgs("other-type", 0, rating),
       value: "high",
       dataType: "CATEGORICAL",
-      traceId: TRACE.traceId,
     });
     expect((await queuedBody("other-type")).configId).toBeUndefined();
+    // Neither does a score without a fingerprint.
+    await upsert("unchecked", 3, { name: "rating" });
+    expect((await queuedBody("unchecked")).configId).toBeUndefined();
 
     vi.setSystemTime(Date.now() + CONFIG_FRESH_MS + 1);
-    await upsert("stale", 3, "rating");
+    await upsert("stale", 3, rating);
     expect((await queuedBody("stale")).configId).toBeUndefined();
 
     remote.find((config) => config.id === "created-2")!.isArchived = true;
@@ -637,20 +853,95 @@ describe("score config sync", () => {
       configId: "created-2",
       reason: "archived",
     });
-    await upsert("resynced", 3, "rating");
+    await upsert("resynced", 3, rating);
     expect((await queuedBody("resynced")).configId).toBe("created-4");
   });
 
-  test("resyncTick writes and schedules nothing before the first sync, and schedules a sync after it", async () => {
+  test("resyncTick writes and schedules nothing before the first sync, and schedules a resync after it", async () => {
     await t.mutation(internal.scores.resyncTick, {});
     expect(await pendingScheduled(t)).toEqual([]);
     expect(
       await t.run(async (ctx) => ctx.db.query("scoreConfigSync").collect()),
     ).toEqual([]);
 
-    serveConfigs([]);
+    serveConfigs(fake, []);
     await sync();
     await t.mutation(internal.scores.resyncTick, {});
-    expect(await pendingScheduled(t)).toContain("scores:syncConfigs");
+    expect(await pendingScheduled(t)).toContain("scores:resync");
+  });
+
+  test("a resync scheduled before a newer sync completed keeps the definitions and configs of the newer sync", async () => {
+    serveConfigs(fake, []);
+    await sync();
+    await t.mutation(internal.scores.resyncTick, {});
+    const newer = [{ name: "accuracy", dataType: "BOOLEAN" as const }];
+    const result = await sync(newer);
+    await runScheduledNow(t);
+
+    const state = await t.run(
+      async (ctx) => await ctx.db.query("scoreConfigSync").first(),
+    );
+    expect(JSON.parse(state!.definitions)).toEqual(newer);
+    expect(state!.generation).toBe(3);
+    expect(await stored()).toEqual(
+      result.configs.map(({ name, configId }) => ({ name, configId })),
+    );
+  });
+
+  test("a sync whose creations reach the deadline creates no more, stores what it has and returns incomplete", async () => {
+    serveConfigs(fake, []);
+    const served = fake.fallback;
+    fake.fallback = async (request) => {
+      // The listing takes 200 s and each creation 9 s, below the timeout.
+      vi.setSystemTime(
+        Date.now() + (request.method === "GET" ? 200_000 : 9_000),
+      );
+      return typeof served === "function" ? await served(request) : served;
+    };
+    const definitions = Array.from({ length: 8 }, (_, i) => ({
+      name: `slow-${i}`,
+      dataType: "BOOLEAN" as const,
+    }));
+    const startedAt = Date.now();
+    const result = await sync(definitions);
+
+    // Creations start at 200, 209, 218, 227 and 236 s; the next would
+    // start at 245 s, past the deadline of 240 s.
+    expect(result.status).toBe("incomplete");
+    expect(configPosts().map((r) => r.at - startedAt)).toEqual(
+      [200, 209, 218, 227, 236].map((s) => expect.closeTo(s * 1_000, -2)),
+    );
+    expect(
+      configPosts().every((r) => r.at - startedAt <= CONFIG_SYNC_DEADLINE_MS),
+    ).toBe(true);
+    expect((await stored()).map(({ name }) => name)).toEqual(
+      definitions.slice(0, 5).map(({ name }) => name),
+    );
+  });
+
+  test.each([
+    ["a name of 81 characters", { name: "a".repeat(81) }],
+    ["an empty name", { name: "" }],
+    ["a name with a character Langfuse refuses", { name: "rating!" }],
+    [
+      "an empty category label",
+      { dataType: "CATEGORICAL" as const, categories: ["ok", ""] },
+    ],
+    ["a minimum that is not a number", { min: NaN }],
+    ["an infinite maximum", { max: Infinity }],
+  ])("refuses a definition with %s", async (_, change) => {
+    serveConfigs(fake, []);
+    const definition = { name: "rating", dataType: "NUMERIC" as const };
+    expect(await refusalCode(sync([{ ...definition, ...change }]))).toBe(
+      "invalid_score_definitions",
+    );
+    expect(configPosts()).toEqual([]);
+  });
+
+  test("accepts a name with letters outside ASCII, digits, spaces and punctuation Langfuse allows", async () => {
+    serveConfigs(fake, []);
+    const name = "Qualität (ñ) 2.0_über-π";
+    expect((await sync([{ name, dataType: "BOOLEAN" }])).status).toBe("ok");
+    expect((await stored()).map((entry) => entry.name)).toEqual([name]);
   });
 });

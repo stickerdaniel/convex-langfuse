@@ -22,10 +22,13 @@ import {
   drive,
   enableExport,
   installFakeLangfuse,
+  refusalCode,
+  serveConfigs,
   type Tables,
 } from "../component/fakeLangfuse.test-util.js";
-import { MAX_CALL_BYTES } from "../shared/limits.js";
+import { MAX_CALL_BYTES, MAX_ROW_BYTES } from "../shared/limits.js";
 import { byteLength, encodeSpan } from "../shared/otlp.js";
+import { scoreBytes } from "../shared/scores.js";
 import type { Observation, TraceContext } from "../shared/validators.js";
 import {
   defineScores,
@@ -37,6 +40,7 @@ import {
   type LangfuseOptions,
   type ObservationFields,
   type ObservationType,
+  type ScoreDefinitions,
   type Trace,
   type TraceFields,
 } from "./index.js";
@@ -1263,19 +1267,17 @@ describe("scores", () => {
     );
     expect(posts).toHaveLength(1);
     const traceId = await traceIdFromSeed("chat");
-    expect(posts[0]!.body).toBe(
-      JSON.stringify({
-        id: "score-1",
-        timestamp: "2026-11-11T11:00:00.000Z",
-        name: "helpful",
-        value: 1,
-        dataType: "BOOLEAN",
-        traceId,
-        observationId: await observationIdFromKey(traceId, "llm"),
-        comment: "good",
-        metadata: { a: 2, b: 1 },
-      }),
-    );
+    expect(JSON.parse(posts[0]!.body)).toEqual({
+      id: "score-1",
+      timestamp: "2026-11-11T11:00:00.000Z",
+      name: "helpful",
+      value: 1,
+      dataType: "BOOLEAN",
+      traceId,
+      observationId: await observationIdFromKey(traceId, "llm"),
+      comment: "good",
+      metadata: { a: 2, b: 1 },
+    });
   });
 
   test("without an id the score gets a new UUID and the current time", async () => {
@@ -1343,7 +1345,7 @@ describe("scores", () => {
     expect(bodies[0]).toMatchObject({ value: 0, dataType: "BOOLEAN" });
   });
 
-  test("a refused score logs its code, and an id only when it is valid", async () => {
+  test("a refused score logs its code and a trace id only when it is valid, never the score id", async () => {
     const MARKER = "MARKER-5c0e";
     const t = createTest();
     await inMutation(t, async (ctx) => {
@@ -1352,7 +1354,8 @@ describe("scores", () => {
         name: "rating",
         value: 6,
         trace: { seed: MARKER },
-        id: "score-1",
+        // A valid score id can hold user content too.
+        id: "user@example.com",
         timestamp: 1_000,
         comment: MARKER,
       });
@@ -1370,13 +1373,178 @@ describe("scores", () => {
     expect(consoleError.mock.calls).toEqual([
       [
         "[convex-langfuse] invalid_score",
-        { traceId: await traceIdFromSeed(MARKER), scoreId: "score-1" },
+        { traceId: await traceIdFromSeed(MARKER) },
       ],
-      ["[convex-langfuse] invalid_id", { traceId: "", scoreId: "" }],
-      ["[convex-langfuse] invalid_score", { traceId: "", scoreId: "" }],
+      ["[convex-langfuse] invalid_id", { traceId: "" }],
+      ["[convex-langfuse] invalid_score", { traceId: "" }],
     ]);
-    expect(JSON.stringify(consoleLines)).not.toContain(MARKER);
+    const logged = JSON.stringify([consoleError.mock.calls, consoleLines]);
+    expect(logged).not.toContain(MARKER);
+    expect(logged).not.toContain("user@example.com");
     expect((await tables(t)).outbox).toHaveLength(0);
+  });
+
+  test("a comment with a lone surrogate arrives with U+FFFD in its place", async () => {
+    const t = createTest();
+    await inMutation(t, (ctx) =>
+      scoring().score(ctx, {
+        name: "helpful",
+        value: true,
+        trace: { seed: "chat" },
+        comment: "cut 😀".slice(0, -1),
+      }),
+    );
+    expect(loggedCodes()).toEqual([]);
+    expect(await scoreBodies(t)).toMatchObject([{ comment: "cut �" }]);
+  });
+
+  test("a name, an id, a categorical value and a deleted id with a lone surrogate are refused before the component call", async () => {
+    const t = createTest();
+    const calls: unknown[] = [];
+    const lone = "cut 😀".slice(0, -1);
+    await inMutation(t, async (ctx) => {
+      const langfuse = client({ content: "full" });
+      const trace = { seed: "chat" };
+      await langfuse.score(counting(ctx, calls), {
+        name: lone,
+        value: 1,
+        trace,
+      });
+      await langfuse.score(counting(ctx, calls), {
+        name: "rating",
+        value: 1,
+        trace,
+        id: lone,
+        timestamp: 1_000,
+      });
+      await langfuse.score(counting(ctx, calls), {
+        name: "tone",
+        value: lone,
+        trace,
+      });
+      await langfuse.deleteScore(counting(ctx, calls), { id: lone });
+    });
+    expect(loggedCodes()).toEqual([
+      "invalid_score",
+      "invalid_score",
+      "invalid_score",
+      "invalid_score",
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  test("syncScoreConfigs refuses a category label with a lone surrogate", async () => {
+    const fake = installFakeLangfuse();
+    const t = createTest();
+    const langfuse = new Langfuse(app.components.convexLangfuse, {
+      content: "full",
+      scores: defineScores({
+        tone: {
+          dataType: "CATEGORICAL",
+          categories: ["ok", "cut 😀".slice(0, -1)],
+        },
+      }),
+    });
+    expect(
+      await refusalCode(t.action((ctx) => langfuse.syncScoreConfigs(ctx))),
+    ).toBe("invalid_score_definitions");
+    expect(fake.requests).toEqual([]);
+  });
+
+  test("a bad default environment refuses a score, which logs invalid_environment", async () => {
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", "Production");
+    const t = createTest();
+    await inMutation(t, (ctx) =>
+      scoring().score(ctx, {
+        name: "helpful",
+        value: true,
+        trace: { seed: "chat" },
+      }),
+    );
+    expect(loggedCodes()).toEqual(["invalid_environment"]);
+    expect((await tables(t)).outbox).toEqual([]);
+  });
+
+  test("a synced config id is attached while the definition is unchanged, not after its range or categories changed, and again after the next sync", async () => {
+    const fake = installFakeLangfuse();
+    serveConfigs(fake, []);
+    const t = createTest();
+    const withScores = (scores: ScoreDefinitions) =>
+      new Langfuse(app.components.convexLangfuse, { content: "full", scores });
+    const current = withScores(SCORES);
+    const range = withScores({
+      ...SCORES,
+      rating: { dataType: "NUMERIC", min: 0, max: 10 },
+    });
+    const categories = withScores({
+      ...SCORES,
+      tone: { dataType: "CATEGORICAL", categories: ["formal", "neutral"] },
+    });
+    const trace = { seed: "chat" };
+
+    // helpful, rating and tone get created-1, created-2 and created-3.
+    await t.action((ctx) => current.syncScoreConfigs(ctx));
+    await inMutation(t, async (ctx) => {
+      await current.score(ctx, { name: "rating", value: 3, trace });
+      await current.score(ctx, { name: "tone", value: "formal", trace });
+      await range.score(ctx, { name: "rating", value: 3, trace });
+      await categories.score(ctx, { name: "tone", value: "formal", trace });
+    });
+    // The changed range gets a config of its own, created-4.
+    await t.action((ctx) => range.syncScoreConfigs(ctx));
+    await inMutation(t, (ctx) =>
+      range.score(ctx, { name: "rating", value: 3, trace }),
+    );
+
+    expect((await scoreBodies(t)).map((body) => body.configId)).toEqual([
+      "created-2",
+      "created-3",
+      undefined,
+      undefined,
+      "created-4",
+    ]);
+  });
+
+  test("a score of exactly the row limit is enqueued with a 40-character default environment and a config id, and one byte more is refused by the client", async () => {
+    const environment = "e".repeat(40);
+    vi.stubEnv("LANGFUSE_TRACING_ENVIRONMENT", environment);
+    const fake = installFakeLangfuse();
+    serveConfigs(fake, []);
+    const t = createTest();
+    const langfuse = scoring({ maxFieldBytes: MAX_ROW_BYTES });
+    await t.action((ctx) => langfuse.syncScoreConfigs(ctx));
+    const traceId = await traceIdFromSeed("chat");
+    const timestamp = Date.parse("2026-11-11T11:00:00.000Z");
+    const base = scoreBytes({
+      id: "score-1",
+      timestamp,
+      name: "helpful",
+      value: 1,
+      dataType: "BOOLEAN",
+      traceId,
+      comment: "",
+    });
+    const calls: unknown[] = [];
+    await inMutation(t, async (ctx) => {
+      for (const [id, bytes] of [
+        ["score-1", MAX_ROW_BYTES],
+        ["score-2", MAX_ROW_BYTES + 1],
+      ] as const) {
+        await langfuse.score(counting(ctx, calls), {
+          name: "helpful",
+          value: true,
+          trace: { traceId },
+          id,
+          timestamp,
+          comment: "x".repeat(bytes - base),
+        });
+      }
+    });
+    expect(loggedCodes()).toEqual(["score_too_large"]);
+    expect(calls).toHaveLength(1);
+    expect(await scoreBodies(t)).toMatchObject([
+      { id: "score-1", environment, configId: expect.any(String) },
+    ]);
   });
 
   test("deleteScore enqueues a deletion of the id", async () => {

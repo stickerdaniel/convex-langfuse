@@ -28,6 +28,7 @@ import {
   isCostValue,
   promptLink,
 } from "../shared/otlp.js";
+import { definitionFingerprint, scoreBytes } from "../shared/scores.js";
 import type {
   Level,
   Observation,
@@ -460,7 +461,8 @@ function scoreValue(
       return { dataType, value };
     }
     case "CATEGORICAL":
-      if (typeof value !== "string") return null;
+      // A replaced character would name another category.
+      if (typeof value !== "string" || hasLoneSurrogate(value)) return null;
       if (
         definition?.dataType === "CATEGORICAL" &&
         !definition.categories.includes(value)
@@ -471,10 +473,51 @@ function scoreValue(
   }
 }
 
-/** A score id has 1 to `MAX_SCORE_ID_BYTES` UTF-8 bytes. */
+/**
+ * Whether `text` holds a lone surrogate. Convex refuses such an argument,
+ * and `wellFormed` would replace it, so a name, id or category with one is
+ * refused instead: the replaced text would name another thing.
+ */
+function hasLoneSurrogate(text: string): boolean {
+  return /\p{Cs}/u.test(text);
+}
+
+/** A score id has 1 to `MAX_SCORE_ID_BYTES` UTF-8 bytes and no lone surrogate. */
 function isScoreId(id: string): boolean {
   const bytes = byteLength(id);
-  return bytes >= 1 && bytes <= MAX_SCORE_ID_BYTES;
+  return bytes >= 1 && bytes <= MAX_SCORE_ID_BYTES && !hasLoneSurrogate(id);
+}
+
+/** A score definition of the `scores` option as `scores.syncConfigs` takes it. */
+function configDefinition(name: string, definition: ScoreDefinition) {
+  switch (definition.dataType) {
+    case "BOOLEAN":
+      return { name, dataType: definition.dataType };
+    case "NUMERIC":
+      return {
+        name,
+        dataType: definition.dataType,
+        ...(definition.min === undefined ? {} : { min: definition.min }),
+        ...(definition.max === undefined ? {} : { max: definition.max }),
+      };
+    case "CATEGORICAL":
+      return {
+        name,
+        dataType: definition.dataType,
+        categories: [...definition.categories],
+      };
+  }
+}
+
+/**
+ * The code for a component call that threw. A bad
+ * `LANGFUSE_TRACING_ENVIRONMENT` refuses every call without an environment
+ * of its own, so that refusal keeps its code.
+ */
+function callFailure(error: unknown): ErrorCode {
+  return error instanceof ConvexError && error.data === "invalid_environment"
+    ? "invalid_environment"
+    : "enqueue_failed";
 }
 
 async function resolveTraceId(init: TraceInit): Promise<string> {
@@ -519,6 +562,8 @@ export class Langfuse<
 > {
   readonly #component: ComponentApi;
   readonly #options: LangfuseOptions<S>;
+  /** `definitionFingerprint` per defined score name, computed once. */
+  readonly #fingerprints = new Map<string, Promise<string>>();
 
   constructor(component: ComponentApi, options: LangfuseOptions<S>) {
     this.#component = component;
@@ -567,6 +612,9 @@ export class Langfuse<
    * definition before the component call; a boolean is sent as 1 or 0.
    * Processing follows the observations: `redact`, content mode (which
    * removes `comment`), serialization of `metadata`. Errors follow `onError`.
+   * A defined score carries the fingerprint of its definition, so the
+   * component attaches a synced config id only while the config was synced
+   * for that definition.
    *
    * The component coalesces pending operations per score id and submits
    * them one at a time in enqueue order; Langfuse does not order two
@@ -582,7 +630,7 @@ export class Langfuse<
     const timestamp = init.timestamp ?? Date.now();
     const traceId = await resolveTraceId(init.trace).catch(() => "");
     const observationId = await tryResolveRef(traceId, init.observation);
-    const ids = { traceId, scoreId };
+    const ids = { traceId };
     const maxFieldBytes =
       this.#options.maxFieldBytes ?? DEFAULT_MAX_FIELD_BYTES;
 
@@ -612,15 +660,17 @@ export class Langfuse<
     }
     const { name, value, comment, metadata } = redacted.score;
 
-    // 2. Content mode, 3. serialization and truncation.
+    // 2. Content mode, 3. serialization and truncation. Every string sent
+    // is well-formed UTF-16; the name, the id and a categorical value are
+    // refused below instead.
     const problems = new Set<ErrorCode>();
-    const args = {
+    const args = wellFormed({
       comment:
         this.#options.content === "full"
           ? serializeContent(comment, maxFieldBytes, problems)
           : undefined,
       metadata: serializeObject(metadata, maxFieldBytes, problems),
-    };
+    });
     for (const code of problems) this.#fail(code, ids);
 
     // 4. Validation and size.
@@ -639,6 +689,7 @@ export class Langfuse<
     if (
       typed === null ||
       name === "" ||
+      hasLoneSurrogate(name) ||
       (scores !== undefined && definition === undefined) ||
       !isScoreId(scoreId) ||
       !Number.isFinite(timestamp)
@@ -656,16 +707,22 @@ export class Langfuse<
       ...(args.comment === undefined ? {} : { comment: args.comment }),
       ...(args.metadata === undefined ? {} : { metadata: args.metadata }),
     };
-    if (byteLength(JSON.stringify(upsert)) > MAX_ROW_BYTES) {
+    // The component holds the same measure against the same limit.
+    if (scoreBytes(upsert) > MAX_ROW_BYTES) {
       this.#fail("score_too_large", ids);
       return { scoreId };
     }
+    const fingerprint =
+      definition && (await this.#fingerprint(name, definition));
 
     let result;
     try {
-      result = await ctx.runMutation(this.#component.scores.upsert, upsert);
-    } catch {
-      this.#fail("enqueue_failed", ids);
+      result = await ctx.runMutation(this.#component.scores.upsert, {
+        ...upsert,
+        ...(fingerprint === undefined ? {} : { fingerprint }),
+      });
+    } catch (error) {
+      this.#fail(callFailure(error), ids);
       return { scoreId };
     }
     if (result.reason === "backlog") this.#fail("backlog", ids);
@@ -682,7 +739,7 @@ export class Langfuse<
     ctx: RunMutationCtx,
     { id }: { id: string },
   ): Promise<void> {
-    const ids = { traceId: "", scoreId: id };
+    const ids = { traceId: "" };
     if (!isScoreId(id)) {
       this.#fail("invalid_score", ids);
       return;
@@ -731,59 +788,64 @@ export class Langfuse<
    * Makes Langfuse hold a score config for every name of the `scores`
    * option, creating missing ones, and lets the component attach their ids
    * to scores. Run it from an action after deploying changed definitions;
-   * the component repeats it hourly. Throws without `scores`.
+   * the component repeats it hourly. Throws without `scores`, and throws a
+   * `ConvexError` with `invalid_score_definitions` for definitions Langfuse
+   * refuses, as the component does, also for a name or category with a lone
+   * surrogate, which Convex would refuse as an argument.
    */
   async syncScoreConfigs(ctx: RunActionCtx): Promise<SyncResult> {
     const { scores } = this.#options;
     if (scores === undefined) {
       throw new Error("syncScoreConfigs: the scores option is not set");
     }
-    const definitions = Object.entries(scores).map(([name, definition]) => {
-      switch (definition.dataType) {
-        case "BOOLEAN":
-          return { name, dataType: definition.dataType };
-        case "NUMERIC":
-          return {
-            name,
-            dataType: definition.dataType,
-            ...(definition.min === undefined ? {} : { min: definition.min }),
-            ...(definition.max === undefined ? {} : { max: definition.max }),
-          };
-        case "CATEGORICAL":
-          return {
-            name,
-            dataType: definition.dataType,
-            categories: [...definition.categories],
-          };
-      }
-    });
+    const definitions = Object.entries(scores).map(([name, definition]) =>
+      configDefinition(name, definition),
+    );
+    if (
+      definitions.some(({ name, categories = [] }) =>
+        [name, ...categories].some(hasLoneSurrogate),
+      )
+    ) {
+      throw new ConvexError("invalid_score_definitions");
+    }
     return await ctx.runAction(this.#component.scores.syncConfigs, {
       definitions,
     });
   }
 
   /**
+   * `definitionFingerprint` of the definition of `name`, computed once per
+   * client: the definitions of a client do not change.
+   */
+  #fingerprint(name: string, definition: ScoreDefinition): Promise<string> {
+    let fingerprint = this.#fingerprints.get(name);
+    if (fingerprint === undefined) {
+      fingerprint = definitionFingerprint(configDefinition(name, definition));
+      this.#fingerprints.set(name, fingerprint);
+    }
+    return fingerprint;
+  }
+
+  /**
    * Logs `code` with ids only, or throws it with `onError: "throw"`. Never
    * logs field content or error messages, which can carry user data. An id
    * the caller passed is logged only when it is a valid id: an invalid one
-   * can be any text.
+   * can be any text. A score line carries the trace id only, because a
+   * valid score id can be any text too.
    */
-  #fail(
-    code: ErrorCode,
-    ids: Recorded | { traceId: string; scoreId: string },
-  ): void {
+  #fail(code: ErrorCode, ids: Recorded | { traceId: string }): void {
     if (this.#options.onError === "throw") throw new CodeError(code);
     const traceId = isTraceId(ids.traceId) ? ids.traceId : "";
     console.error(
       `[convex-langfuse] ${code}`,
-      "scoreId" in ids
-        ? { traceId, scoreId: isScoreId(ids.scoreId) ? ids.scoreId : "" }
-        : {
+      "observationId" in ids
+        ? {
             traceId,
             observationId: isObservationId(ids.observationId)
               ? ids.observationId
               : "",
-          },
+          }
+        : { traceId },
     );
   }
 
@@ -825,14 +887,7 @@ export class Langfuse<
           observations: call.map(({ observation }) => observation),
         });
       } catch (error) {
-        // A bad `LANGFUSE_TRACING_ENVIRONMENT` refuses every call without an
-        // environment of its own, so that refusal keeps its code.
-        this.#fail(
-          error instanceof ConvexError && error.data === "invalid_environment"
-            ? "invalid_environment"
-            : "enqueue_failed",
-          ids,
-        );
+        this.#fail(callFailure(error), ids);
         continue;
       }
       if (result.reason === "backlog") this.#fail("backlog", ids);
@@ -975,10 +1030,7 @@ export class Langfuse<
     if (cost.invalid || (cost.kept && !exported)) problems.add("invalid_cost");
     // Only a generation exports its prompt link, and only a complete one.
     let link: Prompt | undefined;
-    if (
-      observation.type === "generation" &&
-      observation.prompt !== undefined
-    ) {
+    if (observation.type === "generation" && observation.prompt !== undefined) {
       link = promptLink(observation.prompt);
       if (!link) problems.add("invalid_prompt");
     }

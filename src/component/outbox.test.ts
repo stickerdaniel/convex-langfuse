@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api.js";
 import { COUNT_BATCH, PENDING_ROWS_THRESHOLD } from "./constants.js";
 import {
+  consumeReceipts,
   countStep,
   drive,
   enableExport,
@@ -16,6 +17,7 @@ import {
   startRunByHand,
   startScheduledNow,
   tables,
+  totals,
   TRACE,
   type TestConvex,
 } from "./fakeLangfuse.test-util.js";
@@ -448,9 +450,136 @@ describe("counting", () => {
       }),
     ).toEqual({ done: true });
     await runScheduledNow(t);
-    const health = await t.query(api.outbox.health, {});
-    expect(health.pendingCounted).toEqual({ rows: 0, bytes: 0 });
-    expect(health.accepting).toBe(true);
+    expect((await t.query(api.outbox.health, {})).accepting).toBe(true);
+    // The totals are reset once the row's receipt is consumed.
+    await countStep(t);
+    await runScheduledNow(t);
+    expect(await pendingCounted(t)).toEqual({ rows: 0, bytes: 0 });
+  });
+
+  /** Totals of `added` and `removed` with a run of generation 1. */
+  async function setTotals(
+    t: TestConvex,
+    added: { rows: number; bytes: number },
+    removed: { rows: number; bytes: number },
+  ) {
+    await t.run(async (ctx) => {
+      await ctx.db.insert("counter", {
+        addedRows: added.rows,
+        addedBytes: added.bytes,
+        chain: 0,
+      });
+      await ctx.db.insert(
+        "exporter",
+        exporterDoc({
+          generation: 1,
+          leaseExpiresAt: Date.now() + 120_000,
+          runStartedAt: Date.now(),
+          removedRows: removed.rows,
+          removedBytes: removed.bytes,
+        }),
+      );
+    });
+  }
+
+  test.each([
+    ["below", { rows: 5, bytes: 50 }, { rows: 2, bytes: 20 }],
+    ["above", { rows: 2, bytes: 20 }, { rows: 5, bytes: 50 }],
+  ])(
+    "removed totals %s the added ones over an outbox without counted rows and receipts are reset",
+    async (_, added, removed) => {
+      const t = initConvexTest();
+      await setTotals(t, added, removed);
+      await t.mutation(internal.outbox.reconcileGate, {});
+      expect(await totals(t)).toEqual({ added, removed: added });
+    },
+  );
+
+  test("drifted totals with a receipt left are not written until the receipt is consumed", async () => {
+    const t = initConvexTest();
+    const added = { rows: 5, bytes: 50 };
+    const removed = { rows: 2, bytes: 20 };
+    await setTotals(t, added, removed);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("receipts", {
+        rows: 1,
+        bytes: 3,
+        seq: ctx.db.vars.commitTs,
+      });
+    });
+    await t.mutation(internal.outbox.reconcileGate, {});
+    expect(await totals(t)).toEqual({ added, removed });
+
+    await countStep(t);
+    await runScheduledNow(t);
+    const counted = { rows: 6, bytes: 53 };
+    expect(await totals(t)).toEqual({ added: counted, removed: counted });
+  });
+
+  test("a waiting score replaced by a smaller one, accepted before the replacement is counted, leaves exact totals", async () => {
+    const t = initConvexTest();
+    const upsert = (comment: string) =>
+      t.mutation(api.scores.upsert, {
+        id: "s1",
+        timestamp: Date.now(),
+        name: "quality",
+        value: 1,
+        dataType: "NUMERIC",
+        traceId: TRACE.traceId,
+        comment,
+      });
+    await upsert("x".repeat(100));
+    await countStep(t);
+    // The replacement writes a receipt with a negative byte difference.
+    await upsert("");
+    await startRunByHand(t);
+    await t.mutation(internal.exporter.advance, { generation: 1 });
+    await t.mutation(internal.exporter.advance, {
+      generation: 1,
+      report: accepted,
+    });
+    // A gate reconciliation runs before that receipt is consumed.
+    await t.mutation(internal.outbox.reconcileGate, {});
+    await consumeReceipts(t);
+    await runScheduledNow(t);
+
+    const { added, removed } = await totals(t);
+    expect(added.rows).toBe(1);
+    expect(removed).toEqual(added);
+  });
+
+  test("a closed gate opens when the last counted row is accepted while a trace deletion request is deferred", async () => {
+    const fake = installFakeLangfuse();
+    fake.fallback = (request) =>
+      request.path === "/api/public/traces" ? { status: 404 } : { status: 200 };
+    const t = initConvexTest();
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await t.mutation(api.tracing.record, {
+      trace: TRACE,
+      observations: observations(0, 1),
+    });
+    await countStep(t);
+    // Drifted totals far above the threshold and a closed gate.
+    await t.run(async (ctx) => {
+      const counter = (await ctx.db.query("counter").first())!;
+      await ctx.db.patch("counter", counter._id, { addedRows: 30_000 });
+      await ctx.db.insert("gate", { accepting: false, changedAt: 0 });
+    });
+    await t.mutation(internal.exporter.kick, {});
+    const health = () => t.query(api.outbox.health, {});
+    await drive(t, fake, {
+      until: async () =>
+        (await health()).accepting || fake.requests.length > 10,
+    });
+
+    expect((await health()).accepting).toBe(true);
+    expect(fake.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "DELETE /api/public/traces",
+      "POST /api/public/otel/v1/traces",
+    ]);
+    expect((await tables(t)).outbox.map((row) => row.kind)).toEqual([
+      "traceDelete",
+    ]);
   });
 
   test("a pending trace deletion request does not keep drifted totals alive", async () => {
@@ -464,19 +593,30 @@ describe("counting", () => {
     expect((await tables(t)).outbox).toHaveLength(1);
   });
 
-  test("stale totals stay while the outbox holds a row", async () => {
-    const t = initConvexTest();
-    await drift(t);
-    // The row is not available yet, so the run claims nothing and ends.
-    await insertRows(t, [{ data: "x" }], { availableAt: Date.now() + 60_000 });
-    expect(
-      await t.mutation(internal.exporter.advance, { generation: 1 }),
-    ).toEqual({ done: true });
-    await runScheduledNow(t);
-    const health = await t.query(api.outbox.health, {});
-    expect(health.pendingCounted).toEqual({ rows: 30_000, bytes: 5_000 });
-    expect(health.accepting).toBe(false);
-  });
+  test.each(["span", "scoreCreate", "scoreDelete"] as const)(
+    "stale totals and a closed gate stay while the outbox holds a %s row",
+    async (kind) => {
+      const t = initConvexTest();
+      await drift(t);
+      // The row is not available yet, so the run claims nothing and ends.
+      const [id] = await insertRows(t, [{ data: "x" }], {
+        availableAt: Date.now() + 60_000,
+      });
+      await t.run(async (ctx) => {
+        await ctx.db.patch("outbox", id!, { kind });
+        for (const receipt of await ctx.db.query("receipts").collect()) {
+          await ctx.db.delete("receipts", receipt._id);
+        }
+      });
+      expect(
+        await t.mutation(internal.exporter.advance, { generation: 1 }),
+      ).toEqual({ done: true });
+      await runScheduledNow(t);
+      const health = await t.query(api.outbox.health, {});
+      expect(health.pendingCounted).toEqual({ rows: 30_000, bytes: 5_000 });
+      expect(health.accepting).toBe(false);
+    },
+  );
 });
 
 describe("health", () => {

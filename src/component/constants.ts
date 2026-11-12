@@ -75,29 +75,43 @@ export const RETENTION_BATCH_BYTES = 8 * MIB;
 export const HEALTH_COUNT_CAP = 1_000;
 
 /**
- * Shortest time between two submissions for one score id. Langfuse applies a
- * score up to 15 s after it accepted it (`LANGFUSE_INGESTION_QUEUE_DELAY_MS`,
- * used for scores around the UTC date boundary) but a deletion at once, so a
- * deletion sent sooner can overtake the write it follows.
+ * Shortest time between two submissions for one score id. Around midnight
+ * UTC Langfuse queues a score it accepted for 15 s before it applies it
+ * (`LANGFUSE_INGESTION_QUEUE_DELAY_MS`), and applying it can take longer;
+ * a deletion is queued without that delay, so a deletion sent soon after a
+ * write can overtake it. The 30 s are load shaping that lowers the chance of
+ * an overlap, not a guarantee of order.
  */
 export const SCORE_SETTLE_MS = 30 * SECOND;
 /** Timeout of one API op request. */
 export const API_TIMEOUT_MS = 10 * SECOND;
 /** How far a route error (404, 405, 3xx) moves an API op ahead. */
 export const DEFERRED_MS = 30 * MINUTE;
-/** Pending trace deletion requests at which `traces.remove` throws. */
+/**
+ * Trace deletion requests in the outbox and the dead letters together at
+ * which `traces.remove` throws.
+ */
 export const MAX_PENDING_DELETES = 1_000;
 /** `scoreKeys` rows without pointers are deleted after this idle time. */
 export const SCORE_KEY_RETENTION_MS = 24 * HOUR;
 /** A synced score config is attached for this long after its sync. */
 export const CONFIG_FRESH_MS = 3 * HOUR;
-/** A config sync that started this recently makes another call return `running`. */
+/**
+ * A config sync that started this recently makes another call return
+ * `running`. A sync starts a request only before `CONFIG_SYNC_DEADLINE_MS`,
+ * and a request ends within `API_TIMEOUT_MS`: 4 min + 10 s is shorter than
+ * this lease, so no creation of an old sync overlaps a successor and
+ * Langfuse gets no duplicate configs from two syncs.
+ */
 export const CONFIG_SYNC_LEASE_MS = 5 * MINUTE;
 /** Pages of `CONFIG_PAGE_LIMIT` configs one sync reads at most. */
 export const CONFIG_SYNC_MAX_PAGES = 50;
 /** Configs per page of `GET /api/public/score-configs`, the server maximum. */
 export const CONFIG_PAGE_LIMIT = 100;
-/** Wall time within which one sync must read every page. */
+/**
+ * Wall time after which one sync starts no request: no page read and no
+ * config creation. A sync that reaches it returns `incomplete`.
+ */
 export const CONFIG_SYNC_DEADLINE_MS = 4 * MINUTE;
 /** Score definitions per config sync. */
 export const MAX_SCORE_DEFINITIONS = 500;

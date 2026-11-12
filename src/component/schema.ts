@@ -47,9 +47,12 @@ export default defineSchema({
   payloads: defineTable({ data: v.string() }),
 
   /**
-   * One document per mutation that added span rows to the outbox: their
-   * number and summed `bytes`. A count step adds it to the `counter` totals
-   * and deletes it, so the backlog is counted without reading outbox rows.
+   * One document per mutation that added rows of a counted kind
+   * (`COUNTED_KINDS`) to the outbox: their number and summed `bytes`. A
+   * replacement of a waiting score op writes zero rows and the byte
+   * difference, which can be negative. A count step adds it to the `counter`
+   * totals and deletes it, so the backlog is counted without reading outbox
+   * rows.
    */
   receipts: defineTable({
     rows: v.number(),
@@ -101,8 +104,9 @@ export default defineSchema({
     /** Rows still to be sent one at a time after a rejected batch. */
     isolateRemaining: v.number(),
     /**
-     * Totals of every span row that left the outbox and of its `bytes`:
-     * accepted, dead-lettered, without payload or expired.
+     * Totals of every row of a counted kind that left the outbox and of its
+     * `bytes`: accepted, dead-lettered, without payload, expired, or a
+     * failed score op superseded by its waiting successor.
      */
     removedRows: v.number(),
     removedBytes: v.number(),
@@ -145,6 +149,12 @@ export default defineSchema({
     name: v.string(),
     configId: v.string(),
     dataType: vScoreDataType,
+    /**
+     * `definitionFingerprint` of the definition the config was synced for.
+     * `scores.upsert` attaches `configId` only to a score that passes the
+     * same fingerprint.
+     */
+    fingerprint: v.string(),
     syncedAt: v.number(),
   }).index("by_name", ["name"]),
 

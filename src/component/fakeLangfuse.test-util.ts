@@ -1,6 +1,7 @@
 // Test-only fake of the Langfuse OTLP endpoint, a driver for the exporter
 // loop under fake timers, and fixtures. Not part of the build.
 
+import { ConvexError } from "convex/values";
 import { vi } from "vitest";
 import { api, internal } from "./_generated/api.js";
 import type { Doc, Id } from "./_generated/dataModel.js";
@@ -357,4 +358,100 @@ export async function pendingCounted(
   t: TestConvex,
 ): Promise<{ rows: number; bytes: number }> {
   return (await t.query(api.outbox.health, {})).pendingCounted;
+}
+
+type Amount = { rows: number; bytes: number };
+
+/** The stored added and removed totals, without the clamping of `health`. */
+export async function totals(
+  t: TestConvex,
+): Promise<{ added: Amount; removed: Amount }> {
+  return await t.run(async (ctx) => {
+    const counter = await ctx.db.query("counter").first();
+    const exporter = await ctx.db.query("exporter").first();
+    return {
+      added: { rows: counter?.addedRows ?? 0, bytes: counter?.addedBytes ?? 0 },
+      removed: {
+        rows: exporter?.removedRows ?? 0,
+        bytes: exporter?.removedBytes ?? 0,
+      },
+    };
+  });
+}
+
+/** Runs count steps until no receipt is left. */
+export async function consumeReceipts(t: TestConvex): Promise<void> {
+  while (await t.run(async (ctx) => await ctx.db.query("receipts").first())) {
+    await countStep(t);
+  }
+}
+
+/** The `ConvexError` data a call is refused with. */
+export async function refusalCode(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error) {
+    if (error instanceof ConvexError) return error.data;
+    throw error;
+  }
+  throw new Error("expected a refusal");
+}
+
+/** A remote score config as the list endpoint returns it. */
+export type RemoteConfig = {
+  id: string;
+  name: string;
+  dataType: string;
+  isArchived: boolean;
+  minValue?: number | null;
+  maxValue?: number | null;
+  categories?: { label: string; value: number }[] | null;
+  createdAt: string;
+};
+
+/**
+ * Serves `remote` as the score config endpoints of `fake`, newest first like
+ * Langfuse, and appends created configs to it with the ids `created-1`,
+ * `created-2` and so on. `onPage` can replace the answer of a page. Any other
+ * request gets a 200.
+ */
+export function serveConfigs(
+  fake: FakeLangfuse,
+  remote: RemoteConfig[],
+  onPage?: (page: number) => Promise<{ status: number } | undefined>,
+): void {
+  let created = 0;
+  fake.fallback = async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname !== "/api/public/score-configs") return { status: 200 };
+    if (request.method === "POST") {
+      const body = JSON.parse(request.body) as Omit<RemoteConfig, "id">;
+      created += 1;
+      const config: RemoteConfig = {
+        ...body,
+        id: `created-${created}`,
+        isArchived: false,
+        createdAt: new Date().toISOString(),
+      };
+      remote.push(config);
+      return { status: 200, body: config };
+    }
+    const page = Number(url.searchParams.get("page"));
+    const limit = Number(url.searchParams.get("limit"));
+    const replaced = await onPage?.(page);
+    if (replaced) return replaced;
+    const sorted = [...remote].reverse();
+    return {
+      status: 200,
+      body: {
+        data: sorted.slice((page - 1) * limit, page * limit),
+        meta: {
+          page,
+          limit,
+          totalItems: sorted.length,
+          totalPages: Math.ceil(sorted.length / limit),
+        },
+      },
+    };
+  };
 }

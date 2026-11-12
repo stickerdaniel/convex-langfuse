@@ -87,6 +87,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           comment?: string;
           dataType: "BOOLEAN" | "NUMERIC" | "CATEGORICAL";
           environment?: string;
+          fingerprint?: string;
           id: string;
           metadata?: string;
           name: string;

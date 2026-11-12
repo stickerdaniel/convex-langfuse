@@ -31,11 +31,11 @@ const EXPIRING = ["span", "scoreCreate", "scoreDelete"] as const;
  * rows without pointers idle for `SCORE_KEY_RETENTION_MS`. At most
  * `RETENTION_BATCH` of each and `RETENTION_BATCH_BYTES` of payloads in total
  * per run; a run that reaches a limit schedules the next one at once.
- * Expired span rows add to the removed totals, and an expired score op
- * leaves no pointer to it. Starts a count chain while rows are pending or
- * receipts are left, then sets the gate from both totals and resets drifted
- * totals once no span row is left. A run that finds nothing to do writes and
- * schedules nothing.
+ * Expired span and score rows add to the removed totals, and an expired
+ * score op leaves no pointer to it. Starts a count chain while rows are
+ * pending or receipts are left, then sets the gate from both totals and
+ * resets drifted totals once no counted row and no receipt is left
+ * (`reconcile`). A run that finds nothing to do writes and schedules nothing.
  */
 export const sweep = internalMutation({
   args: {},
@@ -113,18 +113,23 @@ export const sweep = internalMutation({
       await ctx.db.delete("deadLetters", deadLetter._id);
     }
 
-    // A key with a pointer stays; its op expires within `MAX_PENDING_AGE_MS`.
-    const idleKeys = await ctx.db
+    // A key is idle only while no op of it is pending. A key with a pointer
+    // stays and moves to the end of the index, so keys with ops queued
+    // during a long outage do not hide idle keys behind them; its op
+    // expires within `MAX_PENDING_AGE_MS`. Every key read is deleted or
+    // moved, so a full batch can continue without reading it again.
+    const oldKeys = await ctx.db
       .query("scoreKeys")
       .withIndex("by_updatedAt", (q) =>
         q.lt("updatedAt", now - SCORE_KEY_RETENTION_MS),
       )
       .take(RETENTION_BATCH);
-    let deletedKeys = 0;
-    for (const key of idleKeys) {
-      if (key.queued !== undefined || key.inFlight !== undefined) continue;
-      await ctx.db.delete("scoreKeys", key._id);
-      deletedKeys += 1;
+    for (const key of oldKeys) {
+      if (key.queued !== undefined || key.inFlight !== undefined) {
+        await ctx.db.patch("scoreKeys", key._id, { updatedAt: now });
+      } else {
+        await ctx.db.delete("scoreKeys", key._id);
+      }
     }
 
     // Receipts stay behind when traffic stops before the next chain is due.
@@ -140,7 +145,7 @@ export const sweep = internalMutation({
       overBudget ||
       stale.length === RETENTION_BATCH ||
       deadLetters.length === RETENTION_BATCH ||
-      (idleKeys.length === RETENTION_BATCH && deletedKeys > 0)
+      oldKeys.length === RETENTION_BATCH
     ) {
       await ctx.scheduler.runAfter(0, internal.retention.sweep, {});
     }

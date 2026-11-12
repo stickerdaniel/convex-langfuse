@@ -19,6 +19,7 @@ import {
   internalAction,
   internalMutation,
   internalQuery,
+  type QueryCtx,
 } from "./_generated/server.js";
 import {
   API_TIMEOUT_MS,
@@ -43,6 +44,7 @@ import {
 } from "./scoreKeys.js";
 import { vApiKind } from "./schema.js";
 import {
+  COUNTED_KINDS,
   getExporter,
   getOrCreateExporter,
   gateClosed,
@@ -168,7 +170,8 @@ export const claimable = internalQuery({
  *
  * A start after a run died treats a score op still listed in `claimed` like
  * a transient failure, so no `inFlight` marker survives into the new
- * generation.
+ * generation. An op that a waiting successor supersedes there adds to the
+ * removed totals; the run it starts asks `reconcileGate` when it ends.
  */
 export const dispatch = internalMutation({
   args: vMutationArgs,
@@ -183,13 +186,16 @@ export const dispatch = internalMutation({
     if (backoff > 0) {
       return { debounceMs: Math.min(backoff, BACKOFF_POLL_MS) };
     }
+    // A superseded op left the outbox and adds to the removed totals.
+    const superseded: Doc<"outbox">[] = [];
     for (const id of exporter.claimed) {
       const row = await ctx.db.get("outbox", id);
-      if (row) await markFailed(ctx, row, now);
+      if (row && (await markFailed(ctx, row, now))) superseded.push(row);
     }
     // `nextWork` saw an available row. If it is gone, the run ends at once.
     const generation = exporter.generation + 1;
     await ctx.db.patch("exporter", exporter._id, {
+      ...withRemoved(exporter, superseded),
       generation,
       leaseExpiresAt: now + LEASE_MS,
       runStartedAt: now,
@@ -242,10 +248,12 @@ function backoffDelay(report: Report, failures: number, cap: number): number {
  * superseded, the request failed, the run budget is spent or nothing is
  * available.
  *
- * An API op differs from a span batch: it never counts toward the removed
- * totals or the breaker, a rejected op becomes a dead letter at once, and a
- * `deferred` op moves `DEFERRED_MS` ahead while the run goes on. Score ops
- * also move through their `scoreKeys` state on claim and with the outcome.
+ * An API op differs from a span batch: it never counts toward the breaker, a
+ * rejected op becomes a dead letter at once, and a `deferred` op moves
+ * `DEFERRED_MS` ahead while the run goes on. Score ops also move through
+ * their `scoreKeys` state on claim and with the outcome; every score op that
+ * leaves the outbox, also one superseded by a waiting successor, adds to the
+ * removed totals. Trace deletion requests never count.
  */
 export const advance = internalMutation({
   args: { generation: v.number(), report: v.optional(vReport) },
@@ -266,8 +274,9 @@ export const advance = internalMutation({
       await scheduleReconcile(ctx);
     };
     const settle = async (): Promise<Removed> => {
-      // Only spans count toward the backlog the gate decides on.
-      if (removed.some((row) => row.kind === "span")) await reopen();
+      if (removed.some((row) => COUNTED_KINDS.includes(row.kind))) {
+        await reopen();
+      }
       return withRemoved(exporter, removed);
     };
     const endRun = async (patch: Partial<Doc<"exporter">>) => {
@@ -354,8 +363,10 @@ export const advance = internalMutation({
           break;
         case "deferred":
           // A route error of one endpoint: only this op waits, the run goes
-          // on with the rows behind it.
-          if (op && !(await markFailed(ctx, op, now))) {
+          // on with the rows behind it. A waiting successor supersedes it.
+          if (op && (await markFailed(ctx, op, now))) {
+            removed.push(op);
+          } else if (op) {
             await ctx.db.patch("outbox", op._id, {
               availableAt: now + DEFERRED_MS,
             });
@@ -368,7 +379,7 @@ export const advance = internalMutation({
           break;
         case "transient":
         case "config": {
-          if (op) await markFailed(ctx, op, now);
+          if (op && (await markFailed(ctx, op, now))) removed.push(op);
           const consecutiveFailures = exporter.consecutiveFailures + 1;
           const cap =
             outcome === "transient" ? BACKOFF_CAP_MS : CONFIG_BACKOFF_CAP_MS;
@@ -392,8 +403,9 @@ export const advance = internalMutation({
     }
 
     // Candidates come from a stale snapshot, so this mutation takes no read
-    // dependency on the range that enqueues write into. Each row is read by
-    // id; one that is gone or not available any more is skipped.
+    // dependency on the range that enqueues write into; the hold-back of a
+    // trace deletion request is the one exception. Each row is read by id;
+    // one that is gone or not available any more is skipped.
     const window = await ctx.runQuery(
       internal.exporter.claimable,
       { now },
@@ -417,6 +429,13 @@ export const advance = internalMutation({
           bytes + row.bytes > BATCH_MAX_BYTES)
       ) {
         break;
+      }
+      if (row.kind === "traceDelete") {
+        const heldUntil = await behindOlderScoreWrites(ctx, row);
+        if (heldUntil !== undefined) {
+          await ctx.db.patch("outbox", row._id, { availableAt: heldUntil });
+          continue;
+        }
       }
       const payload = await ctx.db.get("payloads", row.payloadId);
       if (!payload) {
@@ -446,6 +465,34 @@ export const advance = internalMutation({
     return op ? { done: false, op } : { done: false, spans };
   },
 });
+
+/**
+ * The `availableAt` just after the latest one among the first `CLAIM_WINDOW`
+ * score writes created before the trace deletion request `row`, or
+ * `undefined` when the outbox holds none. Langfuse deletes a trace with its
+ * scores, and a score write sent after that creates a score for the purged
+ * trace, so a deletion request waits until the score writes enqueued before
+ * it left the outbox: accepted, rejected or expired. A later claim evaluates
+ * again. Score writes created after the request and score deletions do not
+ * hold it back.
+ *
+ * `advance` calls it only while a deletion request is first in line. It is
+ * the one place where `advance` reads an outbox index range, so a score
+ * enqueue that commits into that range meanwhile makes `advance` run again.
+ */
+async function behindOlderScoreWrites(
+  ctx: QueryCtx,
+  row: Doc<"outbox">,
+): Promise<number | undefined> {
+  const older = await ctx.db
+    .query("outbox")
+    .withIndex("by_kind", (q) =>
+      q.eq("kind", "scoreCreate").lt("_creationTime", row._creationTime),
+    )
+    .take(CLAIM_WINDOW);
+  if (older.length === 0) return undefined;
+  return Math.max(...older.map((score) => score.availableAt)) + 1;
+}
 
 /**
  * Clears a pending backoff and restarts the loop at once. For operators,

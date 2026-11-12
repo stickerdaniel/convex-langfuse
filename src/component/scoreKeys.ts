@@ -36,6 +36,11 @@ async function deleteRow(ctx: MutationCtx, row: Row): Promise<void> {
  * same id, if any, and makes the new one wait in its place. The new op
  * becomes available `SCORE_SETTLE_MS` after the last accepted op of the id,
  * or `SCORE_SETTLE_MS` from now while an op of the id is in flight.
+ *
+ * Writes one receipt for the backlog count: one row and its bytes for a new
+ * op, zero rows and the byte difference, which can be negative, for a
+ * replacement. A replaced op never adds to the removed totals, so the
+ * totals stay exact without an exporter write on the enqueue path.
  */
 export async function enqueueScoreOp(
   ctx: MutationCtx,
@@ -46,10 +51,15 @@ export async function enqueueScoreOp(
 ): Promise<void> {
   const now = Date.now();
   const key = await getScoreKey(ctx, scoreId);
+  let receipt = { rows: 1, bytes };
   if (key?.queued !== undefined) {
     const queued = await ctx.db.get("outbox", key.queued);
-    if (queued) await deleteRow(ctx, queued);
+    if (queued) {
+      await deleteRow(ctx, queued);
+      receipt = { rows: 0, bytes: bytes - queued.bytes };
+    }
   }
+  await ctx.db.insert("receipts", { ...receipt, seq: ctx.db.vars.commitTs });
   const availableAt =
     key?.inFlight !== undefined
       ? now + SCORE_SETTLE_MS

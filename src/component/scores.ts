@@ -7,12 +7,14 @@
 // value Langfuse finally stores is not guaranteed and not verified.
 
 import { ConvexError, v, type Infer } from "convex/values";
-import { api, internal } from "./_generated/api.js";
+import { internal } from "./_generated/api.js";
 import {
   action,
   env,
+  internalAction,
   internalMutation,
   mutation,
+  type ActionCtx,
   type MutationCtx,
 } from "./_generated/server.js";
 import {
@@ -32,6 +34,7 @@ import { vScoreDataType } from "./schema.js";
 import { basicAuth, exportConfig, type ExportConfig } from "./settings.js";
 import { isEnvironmentName } from "../shared/ids.js";
 import { byteLength } from "../shared/otlp.js";
+import { definitionFingerprint, scoreBytes } from "../shared/scores.js";
 
 /** Codes `upsert` and `remove` throw as `ConvexError` data. */
 export type ScoreErrorCode =
@@ -73,9 +76,7 @@ async function enqueue(
   id: string,
   data: string,
 ): Promise<EnqueueResult> {
-  const bytes = byteLength(data);
-  if (bytes > MAX_ROW_BYTES) refuse("score_too_large");
-  await enqueueScoreOp(ctx, kind, id, data, bytes);
+  await enqueueScoreOp(ctx, kind, id, data, byteLength(data));
   await pingExporter(ctx);
   return { enqueued: true };
 }
@@ -98,14 +99,17 @@ function parseMetadata(metadata: string): Record<string, unknown> {
  * Enqueues a score for `POST /api/public/scores`, in the caller's
  * transaction. The request body is encoded once here, with `timestamp` as an
  * ISO string, the default environment from the component env, and the
- * `configId` of a config synced for the name and data type less than
- * `CONFIG_FRESH_MS` ago. A score op that waits for the same id is replaced.
+ * `configId` of a config synced less than `CONFIG_FRESH_MS` ago for the
+ * definition whose `fingerprint` (`definitionFingerprint`) the caller
+ * passes. Without a fingerprint the score gets no config id. A score op that
+ * waits for the same id is replaced.
  *
  * Returns `reason: "disabled"` without writing when the component has no
  * export configuration, and `reason: "backlog"` while the admission gate is
  * closed. Throws a `ConvexError` with a `ScoreErrorCode` for invalid
- * arguments. Re-sending a score with the same id, timestamp and value is
- * idempotent in Langfuse.
+ * arguments, an invalid environment after the default is applied, and a
+ * score whose `scoreBytes` exceed `MAX_ROW_BYTES`. Re-sending a score with
+ * the same id, timestamp and value is idempotent in Langfuse.
  */
 export const upsert = mutation({
   args: {
@@ -120,12 +124,13 @@ export const upsert = mutation({
     /** A JSON object string. */
     metadata: v.optional(v.string()),
     environment: v.optional(v.string()),
+    fingerprint: v.optional(v.string()),
   },
   returns: vEnqueueResult,
   handler: async (ctx, args): Promise<EnqueueResult> => {
     const refused = await admission(ctx);
     if (refused) return refused;
-    const { id, timestamp, name, value, dataType, traceId } = args;
+    const { id, timestamp, name, value, dataType, traceId, fingerprint } = args;
     validateId(id);
     if (name === "") refuse("invalid_score_name");
     if (traceId === "") refuse("invalid_trace_id");
@@ -139,17 +144,24 @@ export const upsert = mutation({
     if (!valid) refuse("invalid_score_value");
     const date = new Date(timestamp);
     if (Number.isNaN(date.getTime())) refuse("invalid_timestamp");
+    // The environment Langfuse files the score under, default included.
     const environment =
       args.environment ?? (env.LANGFUSE_TRACING_ENVIRONMENT || undefined);
-    if (
-      args.environment !== undefined &&
-      !isEnvironmentName(args.environment)
-    ) {
+    if (environment !== undefined && !isEnvironmentName(environment)) {
       refuse("invalid_environment");
     }
     const metadata =
       args.metadata === undefined ? undefined : parseMetadata(args.metadata);
+    // The client's measure, with `metadata` as it is stored. For metadata
+    // the client serialized, both strings are equal.
+    if (
+      scoreBytes({ ...args, metadata: metadata && JSON.stringify(metadata) }) >
+      MAX_ROW_BYTES
+    ) {
+      refuse("score_too_large");
+    }
 
+    // A stored fingerprint is always set, so a score without one gets no id.
     const now = Date.now();
     const config = (
       await ctx.db
@@ -158,7 +170,9 @@ export const upsert = mutation({
         .take(10)
     ).find(
       (entry) =>
-        entry.dataType === dataType && now - entry.syncedAt < CONFIG_FRESH_MS,
+        entry.fingerprint === fingerprint &&
+        entry.dataType === dataType &&
+        now - entry.syncedAt < CONFIG_FRESH_MS,
     );
 
     const body = JSON.stringify({
@@ -229,6 +243,7 @@ const vEntry = v.object({
   name: v.string(),
   configId: v.string(),
   dataType: vScoreDataType,
+  fingerprint: v.string(),
 });
 
 /** A score config as `GET /api/public/score-configs` returns it. */
@@ -244,14 +259,20 @@ type RemoteConfig = {
 };
 
 /**
- * Starts a sync: returns its generation, or `null` while another sync that
- * started less than `CONFIG_SYNC_LEASE_MS` ago runs. Stores the definitions
- * for the hourly resync.
+ * Starts a sync: returns its generation and the JSON of its definitions, or
+ * `null` while another sync that started less than `CONFIG_SYNC_LEASE_MS`
+ * ago runs. With `definitions` it stores them for the hourly resync; without,
+ * it reads the stored ones in this transaction, so a resync never runs with
+ * definitions older than the last sync call. `null` too without definitions
+ * when none are stored.
  */
 export const reserve = internalMutation({
-  args: { definitions: v.string() },
-  returns: v.union(v.number(), v.null()),
-  handler: async (ctx, { definitions }): Promise<number | null> => {
+  args: { definitions: v.optional(v.string()) },
+  returns: v.union(
+    v.object({ generation: v.number(), definitions: v.string() }),
+    v.null(),
+  ),
+  handler: async (ctx, args) => {
     const now = Date.now();
     const sync = await ctx.db.query("scoreConfigSync").first();
     if (
@@ -260,6 +281,8 @@ export const reserve = internalMutation({
     ) {
       return null;
     }
+    const definitions = args.definitions ?? sync?.definitions;
+    if (definitions === undefined) return null;
     const generation = (sync?.generation ?? 0) + 1;
     if (sync) {
       await ctx.db.patch("scoreConfigSync", sync._id, {
@@ -274,7 +297,7 @@ export const reserve = internalMutation({
         definitions,
       });
     }
-    return generation;
+    return { generation, definitions };
   },
 });
 
@@ -310,6 +333,21 @@ export const finish = internalMutation({
   },
 });
 
+/**
+ * Langfuse's rule for a score config name at 4.78.0 (`ScoreConfigNameSchema`):
+ * 1 to 80 UTF-16 code units, as zod counts them, of letters, digits, `_`,
+ * space, `.`, `(`, `)` and `-`.
+ */
+function isConfigName(name: string): boolean {
+  return (
+    name.length >= 1 && name.length <= 80 && /^[\p{L}\p{N}_ .()-]+$/u.test(name)
+  );
+}
+
+/**
+ * Refuses definitions Langfuse would refuse or that cannot be stored as
+ * given: `JSON.stringify` turns a bound that is not finite into `null`.
+ */
 function validateDefinitions(definitions: Definition[]): void {
   const invalid = () => {
     throw new ConvexError("invalid_score_definitions");
@@ -317,10 +355,14 @@ function validateDefinitions(definitions: Definition[]): void {
   if (definitions.length > MAX_SCORE_DEFINITIONS) invalid();
   const names = new Set<string>();
   for (const { name, dataType, min, max, categories } of definitions) {
-    if (name === "" || names.has(name)) invalid();
+    if (!isConfigName(name) || names.has(name)) invalid();
     names.add(name);
     if (dataType === "CATEGORICAL") {
-      if (!categories?.length || new Set(categories).size < categories.length) {
+      if (
+        !categories?.length ||
+        categories.includes("") ||
+        new Set(categories).size < categories.length
+      ) {
         invalid();
       }
     } else if (categories !== undefined) {
@@ -328,6 +370,9 @@ function validateDefinitions(definitions: Definition[]): void {
     }
     if (dataType !== "NUMERIC" && (min !== undefined || max !== undefined)) {
       invalid();
+    }
+    for (const bound of [min, max]) {
+      if (bound !== undefined && !Number.isFinite(bound)) invalid();
     }
     if (min !== undefined && max !== undefined && !(min < max)) invalid();
   }
@@ -452,80 +497,128 @@ async function createConfig(
 }
 
 /**
+ * The work of sync `generation`, reserved at `startedAt`: lists the configs,
+ * reuses or creates one per definition, and stores the result when no newer
+ * sync started. A creation starts only before `CONFIG_SYNC_DEADLINE_MS`;
+ * after it the run creates nothing more, stores what it has and returns
+ * `incomplete`.
+ */
+async function runSync(
+  ctx: ActionCtx,
+  config: ExportConfig,
+  startedAt: number,
+  generation: number,
+  definitions: Definition[],
+): Promise<SyncResult> {
+  const remote = await listConfigs(config, startedAt);
+  if (!remote) {
+    await ctx.runMutation(internal.scores.finish, {
+      generation,
+      result: "incomplete",
+    });
+    return { status: "incomplete", configs: [], conflicts: [] };
+  }
+
+  const result: SyncResult = { status: "ok", configs: [], conflicts: [] };
+  const entries: Infer<typeof vEntry>[] = [];
+  for (const definition of definitions) {
+    const named = remote.filter((item) => item.name === definition.name);
+    const fitting = named.filter((item) => compatible(definition, item));
+    for (const item of named) {
+      if (fitting.includes(item)) continue;
+      result.conflicts.push({
+        name: definition.name,
+        configId: item.id,
+        reason: item.isArchived ? "archived" : "incompatible",
+      });
+    }
+    const oldest = fitting.sort(byAge)[0];
+    const created = oldest === undefined;
+    let configId: string | null = oldest?.id ?? null;
+    if (created && Date.now() - startedAt <= CONFIG_SYNC_DEADLINE_MS) {
+      configId = await createConfig(config, definition);
+    }
+    if (configId === null) {
+      result.status = "incomplete";
+      continue;
+    }
+    result.configs.push({ name: definition.name, configId, created });
+    entries.push({
+      name: definition.name,
+      configId,
+      dataType: definition.dataType,
+      fingerprint: await definitionFingerprint(definition),
+    });
+  }
+
+  const applied = await ctx.runMutation(internal.scores.finish, {
+    generation,
+    entries,
+    result: result.status === "ok" ? "ok" : "incomplete",
+  });
+  if (!applied) result.status = "incomplete";
+  return result;
+}
+
+/**
  * Makes Langfuse hold a compatible score config for every definition and
  * stores which one each name uses. Single-flight: a call while another sync
  * runs returns `running`. A run that cannot read every page returns
  * `incomplete` and creates and stores nothing. For each definition the
  * oldest compatible config is used, or one is created; archived and
  * incompatible configs of a defined name are returned as `conflicts`. A
- * failed creation leaves that name without a config and makes the result
- * `incomplete`. The result is stored only when no newer sync started.
+ * failed creation, or one the run deadline left out, leaves that name
+ * without a config and makes the result `incomplete`. The result is stored
+ * only when no newer sync started.
  */
 export const syncConfigs = action({
   args: { definitions: v.array(vDefinition) },
   returns: vSyncResult,
   handler: async (ctx, { definitions }): Promise<SyncResult> => {
-    const empty = { configs: [], conflicts: [] };
     const config = exportConfig();
-    if (!config) return { status: "disabled", ...empty };
+    if (!config) return { status: "disabled", configs: [], conflicts: [] };
     validateDefinitions(definitions);
     const startedAt = Date.now();
-    const generation = await ctx.runMutation(internal.scores.reserve, {
+    const reserved = await ctx.runMutation(internal.scores.reserve, {
       definitions: JSON.stringify(definitions),
     });
-    if (generation === null) return { status: "running", ...empty };
-
-    const remote = await listConfigs(config, startedAt);
-    if (!remote) {
-      await ctx.runMutation(internal.scores.finish, {
-        generation,
-        result: "incomplete",
-      });
-      return { status: "incomplete", ...empty };
+    if (reserved === null) {
+      return { status: "running", configs: [], conflicts: [] };
     }
-
-    const result: SyncResult = { status: "ok", ...empty };
-    const entries: Infer<typeof vEntry>[] = [];
-    for (const definition of definitions) {
-      const named = remote.filter((item) => item.name === definition.name);
-      const fitting = named.filter((item) => compatible(definition, item));
-      for (const item of named) {
-        if (fitting.includes(item)) continue;
-        result.conflicts.push({
-          name: definition.name,
-          configId: item.id,
-          reason: item.isArchived ? "archived" : "incompatible",
-        });
-      }
-      const oldest = fitting.sort(byAge)[0];
-      const created = oldest === undefined;
-      const configId = oldest?.id ?? (await createConfig(config, definition));
-      if (configId === null) {
-        result.status = "incomplete";
-        continue;
-      }
-      result.configs.push({ name: definition.name, configId, created });
-      entries.push({
-        name: definition.name,
-        configId,
-        dataType: definition.dataType,
-      });
-    }
-
-    const applied = await ctx.runMutation(internal.scores.finish, {
-      generation,
-      entries,
-      result: result.status === "ok" ? "ok" : "incomplete",
-    });
-    if (!applied) result.status = "incomplete";
-    return result;
+    return await runSync(
+      ctx,
+      config,
+      startedAt,
+      reserved.generation,
+      definitions,
+    );
   },
 });
 
 /**
- * Hourly: runs the config sync again with the definitions of the last sync
- * call, so archived or changed configs stop being attached. Does nothing
- * when no sync ever ran, while one runs, or when the component is disabled.
+ * The hourly resync: a sync with the definitions of the last sync call,
+ * which its reservation reads, so a sync that completed after `resyncTick`
+ * scheduled this is not undone with older definitions.
+ */
+export const resync = internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const config = exportConfig();
+    if (!config) return null;
+    const startedAt = Date.now();
+    const reserved = await ctx.runMutation(internal.scores.reserve, {});
+    if (reserved === null) return null;
+    const definitions = JSON.parse(reserved.definitions) as Definition[];
+    await runSync(ctx, config, startedAt, reserved.generation, definitions);
+    return null;
+  },
+});
+
+/**
+ * Hourly: schedules `resync`, so archived or changed configs stop being
+ * attached. Does nothing when no sync ever ran, while one runs, or when the
+ * component is disabled.
  */
 export const resyncTick = internalMutation({
   args: {},
@@ -540,8 +633,7 @@ export const resyncTick = internalMutation({
     ) {
       return null;
     }
-    const definitions = JSON.parse(sync.definitions) as Definition[];
-    await ctx.scheduler.runAfter(0, api.scores.syncConfigs, { definitions });
+    await ctx.scheduler.runAfter(0, internal.scores.resync, {});
     return null;
   },
 });
