@@ -201,6 +201,7 @@ async function publicApi(req, res, url) {
       tags: [],
       lastUpdatedAt: new Date().toISOString(),
       type: "text",
+      lastConfig: {},
     }));
     const totalPages = Math.ceil(names.length / limit);
     return json(res, 200, {

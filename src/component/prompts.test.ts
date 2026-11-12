@@ -10,7 +10,8 @@ import {
   MAX_PROMPT_SCOPE_BYTES,
   MAX_SNAPSHOT_BYTES,
   PIN_TTL_MS,
-  PROMPT_LIST_MAX_PAGES,
+  PROMPT_LIST_MAX_NAMES,
+  PROMPT_LIST_MAX_REQUESTS,
   PROMPT_REFRESH_INTERVAL_MS,
   PROMPT_REFRESH_MAX_MS,
   PROMPT_REFRESH_SPACING_MS,
@@ -330,7 +331,7 @@ describe("sync and get", () => {
     expect(state.promptPins).toEqual([]);
   });
 
-  test("a listing cut at its page cap returns incomplete, and the next tick starts no listing", async () => {
+  test("a listing cut at its name cap returns incomplete, and the next tick starts no listing", async () => {
     prompts.override = (request) => {
       const url = new URL(request.url);
       if (
@@ -344,19 +345,143 @@ describe("sync and get", () => {
         status: 200,
         body: {
           data: [{ name: `p${page}`, labels: ["production"] }],
-          meta: { page, totalPages: PROMPT_LIST_MAX_PAGES + 1 },
+          meta: { page, totalItems: PROMPT_LIST_MAX_NAMES + 1 },
         },
       };
     };
     expect(await sync()).toEqual({
       status: "incomplete",
-      tracked: PROMPT_LIST_MAX_PAGES,
+      tracked: PROMPT_LIST_MAX_NAMES / 100,
       overflow: 0,
     });
 
     vi.setSystemTime(Date.now() + 5 * MINUTE);
     await t.mutation(internal.prompts.tick, {});
     expect(await pendingScheduled(t)).toEqual([]);
+  });
+});
+
+describe("listing", () => {
+  /** Query strings of the project listing's requests, in order. */
+  const listingQueries = () =>
+    fake.requests
+      .map((request) => new URL(request.url))
+      .filter(
+        (url) =>
+          url.pathname === "/api/public/v2/prompts" &&
+          !url.searchParams.has("name"),
+      )
+      .map((url) => url.search);
+
+  const names = (count: number) =>
+    Array.from({ length: count }, (_, i) => `p${String(i).padStart(3, "0")}`);
+
+  /** Lets the tick start the hourly listing and its refreshes finish. */
+  async function hourlyListing(): Promise<void> {
+    await t.run(async (ctx) => {
+      await ctx.db.insert("promptSync", {});
+    });
+    await t.mutation(internal.prompts.tick, {});
+    await settle();
+  }
+
+  test.each(["sync", "the hourly listing"])(
+    "names whose configs fit one by one but not on one page are all tracked and cached through %s",
+    async (via) => {
+      const config = { pad: "x".repeat(800 * 1024) };
+      // The fewest names whose latest configs pass the response cap together.
+      const big = names(
+        Math.floor(MAX_PROMPT_RESPONSE_BYTES / (800 * 1024)) + 1,
+      );
+      for (const name of big) prompts.add(name, name, ["production"], config);
+
+      if (via === "sync") {
+        expect(await sync()).toEqual({
+          status: "ok",
+          tracked: big.length,
+          overflow: 0,
+        });
+      } else {
+        await hourlyListing();
+      }
+      // The pages of 100 and of 10 pass the cap; every name is read alone.
+      expect(listingQueries()).toEqual([
+        "?page=1&limit=100",
+        "?page=1&limit=10",
+        ...big.map((_, i) => `?page=${i + 1}&limit=1`),
+      ]);
+      for (const name of big) {
+        const cached = await get(name);
+        expect(cached?.prompt).toBe(name);
+        expect(cached?.config === JSON.stringify(config)).toBe(true);
+      }
+    },
+  );
+
+  test("a name whose listing entry alone passes the cap is skipped and makes sync incomplete; the other 249 are tracked", async () => {
+    const all = names(250);
+    const huge = all[149]!;
+    for (const name of all) {
+      prompts.add(
+        name,
+        name,
+        ["production"],
+        name === huge ? { pad: "x".repeat(MAX_PROMPT_RESPONSE_BYTES) } : {},
+      );
+    }
+    expect(await t.action(api.prompts.sync, {})).toEqual({
+      status: "incomplete",
+      tracked: 249,
+      overflow: 0,
+    });
+    expect(listingQueries()).toContain("?page=150&limit=1");
+    const tracked = (await promptTables()).promptNames.map((row) => row.name);
+    expect(tracked.sort()).toEqual(all.filter((name) => name !== huge));
+  });
+
+  test("a listing that reaches its request cap returns incomplete, and the next tick starts no listing", async () => {
+    for (const name of names(250)) prompts.add(name, name);
+    // Every page of more than one name passes the cap.
+    prompts.override = (request) => {
+      const url = new URL(request.url);
+      return url.pathname === "/api/public/v2/prompts" &&
+        Number(url.searchParams.get("limit")) > 1
+        ? {
+            status: 200,
+            headers: {
+              "content-length": String(MAX_PROMPT_RESPONSE_BYTES + 1),
+            },
+            body: {},
+          }
+        : undefined;
+    };
+    // A block of 100 names takes 1 + 10 × (1 + 10) = 111 requests. The 39
+    // left read the next page of 100 and three blocks of 10 in 1 + 3 × 11
+    // requests, then a page of 10 and four names alone: 100 + 30 + 4 names.
+    expect(await sync()).toEqual({
+      status: "incomplete",
+      tracked: 134,
+      overflow: 0,
+    });
+    expect(listingQueries()).toHaveLength(PROMPT_LIST_MAX_REQUESTS);
+
+    vi.setSystemTime(Date.now() + 5 * MINUTE);
+    await t.mutation(internal.prompts.tick, {});
+    expect(await pendingScheduled(t)).toEqual([]);
+  });
+
+  test("a project of 250 small names is listed in three requests", async () => {
+    for (const name of names(250)) prompts.add(name, name);
+    expect(await t.action(api.prompts.sync, {})).toEqual({
+      status: "ok",
+      tracked: 250,
+      overflow: 0,
+    });
+    expect(listingQueries()).toEqual([
+      "?page=1&limit=100",
+      "?page=2&limit=100",
+      "?page=3&limit=100",
+    ]);
   });
 });
 
@@ -761,6 +886,18 @@ describe("snapshots", () => {
     expect(cached?.prompt === prompt).toBe(true);
   });
 
+  test("a text prompt of control characters with a snapshot just under the largest size is cached", async () => {
+    // With the config `{}` the snapshot has `MAX_SNAPSHOT_BYTES` - 1 bytes;
+    // each character escapes to six bytes of the response.
+    const prompt = "\u0001".repeat(MAX_SNAPSHOT_BYTES - 3);
+    expect(byteLength(JSON.stringify(prompt))).toBeGreaterThan(5 * 1024 * 1024);
+    prompts.add("control", prompt);
+    await sync(["control"]);
+    const cached = await get("control");
+    expect(cached?.config).toBe("{}");
+    expect(cached?.prompt === prompt).toBe(true);
+  });
+
   test("a version returns what the last refresh resolved it to, while a pin keeps an earlier resolution", async () => {
     prompts.add("child", "A");
     prompts.add("parent", "@@@langfusePrompt:name=child|label=production@@@");
@@ -902,7 +1039,7 @@ describe("refresh", () => {
     await stopped;
   });
 
-  test("a refresh of 50 labels has at most PROMPT_STEP_LABELS label requests in flight at once", async () => {
+  test("a refresh of 50 labels has at most two label requests in flight at once", async () => {
     const labels = Array.from(
       { length: MAX_PROMPT_LABELS },
       (_, i) => `l${String(i).padStart(2, "0")}`,
@@ -918,7 +1055,7 @@ describe("refresh", () => {
       return prompts.answer(request);
     };
     await sync(["wide"]);
-    expect(most).toBe(PROMPT_STEP_LABELS);
+    expect(most).toBe(2);
     expect((await promptTables()).promptLabels).toHaveLength(MAX_PROMPT_LABELS);
   });
 

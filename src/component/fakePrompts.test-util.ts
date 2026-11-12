@@ -97,6 +97,7 @@ export class FakePrompts {
         tags: [],
         lastUpdatedAt: new Date().toISOString(),
         type: versions.at(-1)!.type,
+        lastConfig: versions.at(-1)!.config,
       };
     });
     return {

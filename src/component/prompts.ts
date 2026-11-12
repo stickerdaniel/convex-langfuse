@@ -39,8 +39,9 @@ import {
   MAX_SNAPSHOT_DOCUMENT_BYTES,
   PIN_TTL_MS,
   PROMPT_LIST_INTERVAL_MS,
-  PROMPT_LIST_MAX_PAGES,
-  PROMPT_PAGE_LIMIT,
+  PROMPT_LIST_MAX_NAMES,
+  PROMPT_LIST_MAX_REQUESTS,
+  PROMPT_PAGE_SIZES,
   PROMPT_REFRESH_INTERVAL_MS,
   PROMPT_REFRESH_MAX_MS,
   PROMPT_REFRESH_SPACING_MS,
@@ -750,14 +751,17 @@ async function fetchLabel(
  * Refreshes one name for the reservation `token`. It lists the name's
  * labels, at most `MAX_PROMPT_LABELS`, then fetches them
  * `PROMPT_STEP_LABELS` at a time and stores each step's snapshots with
- * `store`, which publishes nothing. Of a stored step it keeps only label,
- * snapshot id, version and the bounded dependency names, so it holds at most
- * one step of candidates at once: `PROMPT_STEP_LABELS` × `MAX_SNAPSHOT_BYTES`,
- * 3.5 MiB of prompt text, plus the responses of that step while they are
- * parsed, each read up to `MAX_PROMPT_RESPONSE_BYTES`. Last, `publish`
- * applies the whole result at once. It stops once `store` reports a newer
- * reservation. Does nothing when the component is disabled. Errors are
- * fixed codes: `http_<status>`, `network`, `timeout`,
+ * `store`, which publishes nothing. The listing entry carries the config of
+ * the name's latest version; when that alone passes
+ * `MAX_PROMPT_RESPONSE_BYTES`, the listing fails as any failed listing does:
+ * the labels stay and `oversize` is recorded. Of a stored step it keeps only
+ * label, snapshot id, version and the bounded dependency names, so it holds
+ * at most one step of candidates at once: `PROMPT_STEP_LABELS` ×
+ * `MAX_SNAPSHOT_BYTES`, 1800 KiB of content, plus the responses of that step
+ * while they are parsed, each read up to `MAX_PROMPT_RESPONSE_BYTES`. Last,
+ * `publish` applies the whole result at once. It stops once `store` reports
+ * a newer reservation. Does nothing when the component is disabled. Errors
+ * are fixed codes: `http_<status>`, `network`, `timeout`,
  * `invalid_response`, `oversize`, `too_many_labels`,
  * `too_many_dependencies`; the first one is recorded.
  */
@@ -1013,7 +1017,7 @@ export const tick = internalMutation({
   },
 });
 
-/** Sets `lastListAt` after a listing ended, on its last page or at the page cap. */
+/** Sets `lastListAt` after a listing ended, complete or incomplete. */
 export const listed = internalMutation({
   args: {},
   returns: v.null(),
@@ -1025,13 +1029,21 @@ export const listed = internalMutation({
 });
 
 /**
- * Pages through every prompt name of the project, at most
- * `PROMPT_LIST_MAX_PAGES` pages, and requests a refresh for the names of
- * each page; with `onlyNew`, only for names that are not tracked. Sets
- * `lastListAt` once it read the last page or stopped at the page cap, so
- * the next listing is due `PROMPT_LIST_INTERVAL_MS` later either way.
- * Returns the summed counts and whether it read every page, or `null` when
- * a page failed.
+ * Pages through every prompt name of the project and requests a refresh for
+ * the names of each page; with `onlyNew`, only for names that are not
+ * tracked. A listing entry carries the config of the name's latest version,
+ * so a page can pass `MAX_PROMPT_RESPONSE_BYTES` although each of its names
+ * fits. `offset` counts the names read so far in name order. A page over
+ * the cap is read again in pages of the next smaller of
+ * `PROMPT_PAGE_SIZES`, and once the block of the larger size is done, the
+ * listing goes back to it. A single name over the cap is skipped.
+ *
+ * The listing ends at the response's `totalItems`. It stops early after
+ * `PROMPT_LIST_MAX_NAMES` names or `PROMPT_LIST_MAX_REQUESTS` requests.
+ * Sets `lastListAt` once it ended or stopped, so the next listing is due
+ * `PROMPT_LIST_INTERVAL_MS` later either way. Returns the summed counts and
+ * whether it read every name, or `null` when a page failed for another
+ * reason than its size.
  */
 async function listAndRequest(
   ctx: ActionCtx,
@@ -1039,31 +1051,58 @@ async function listAndRequest(
   onlyNew: boolean,
 ): Promise<{ tracked: number; overflow: number; complete: boolean } | null> {
   const total = { tracked: 0, overflow: 0 };
-  for (let page = 1; ; page++) {
+  let complete = true;
+  let offset = 0;
+  let level = 0;
+  let requests = 0;
+  // Unknown until a page arrives.
+  let totalItems = Infinity;
+  while (offset < totalItems) {
+    if (
+      offset >= PROMPT_LIST_MAX_NAMES ||
+      requests >= PROMPT_LIST_MAX_REQUESTS
+    ) {
+      complete = false;
+      break;
+    }
+    const limit = PROMPT_PAGE_SIZES[level]!;
+    requests += 1;
     const fetched = await getJson(
       config,
-      `/api/public/v2/prompts?page=${page}&limit=${PROMPT_PAGE_LIMIT}`,
+      `/api/public/v2/prompts?page=${offset / limit + 1}&limit=${limit}`,
     );
-    if (!fetched.ok || !isRecord(fetched.body)) return null;
-    const { data, meta } = fetched.body;
-    const totalPages = isRecord(meta) ? meta.totalPages : undefined;
-    if (!Array.isArray(data) || typeof totalPages !== "number") return null;
-    const names = data
-      .map((item: unknown) => (isRecord(item) ? item.name : undefined))
-      .filter(
-        (name): name is string => typeof name === "string" && name !== "",
-      );
-    const counts = await ctx.runMutation(internal.prompts.request, {
-      names,
-      onlyNew,
-    });
-    total.tracked += counts.tracked;
-    total.overflow += counts.overflow;
-    if (page >= totalPages || page === PROMPT_LIST_MAX_PAGES) {
-      await ctx.runMutation(internal.prompts.listed, {});
-      return { ...total, complete: page >= totalPages };
+    if (!fetched.ok && fetched.error === "oversize") {
+      if (level < PROMPT_PAGE_SIZES.length - 1) {
+        level += 1;
+        continue;
+      }
+      complete = false;
+    } else {
+      if (!fetched.ok || !isRecord(fetched.body)) return null;
+      const { data, meta } = fetched.body;
+      const items = isRecord(meta) ? meta.totalItems : undefined;
+      if (!Array.isArray(data) || typeof items !== "number") return null;
+      totalItems = items;
+      const names = data
+        .map((item: unknown) => (isRecord(item) ? item.name : undefined))
+        .filter(
+          (name): name is string => typeof name === "string" && name !== "",
+        );
+      const counts = await ctx.runMutation(internal.prompts.request, {
+        names,
+        onlyNew,
+      });
+      total.tracked += counts.tracked;
+      total.overflow += counts.overflow;
+    }
+    offset += limit;
+    // Back to the larger size once its block is done.
+    while (level > 0 && offset % PROMPT_PAGE_SIZES[level - 1]! === 0) {
+      level -= 1;
     }
   }
+  await ctx.runMutation(internal.prompts.listed, {});
+  return { ...total, complete };
 }
 
 /**
@@ -1082,8 +1121,10 @@ export const list = internalAction({
 
 const vSyncResult = v.object({
   /**
-   * `incomplete`: the listing stopped at `PROMPT_LIST_MAX_PAGES` pages, so
-   * names on later pages are not tracked.
+   * `incomplete`: the listing stopped at `PROMPT_LIST_MAX_NAMES` names or
+   * `PROMPT_LIST_MAX_REQUESTS` requests, or skipped a name whose listing
+   * entry alone passes `MAX_PROMPT_RESPONSE_BYTES`, so those names are not
+   * tracked.
    */
   status: v.union(
     v.literal("ok"),
@@ -1105,8 +1146,8 @@ export type SyncResult = Infer<typeof vSyncResult>;
  * names; without, for every name the list endpoint returns. Refreshes run in
  * the background. Returns `disabled` without writing when the component has
  * no export configuration. Throws `prompt_list_failed` when a page of the
- * listing fails and `invalid_prompt_name` for a name that is empty or has
- * more than `MAX_PROMPT_NAME_BYTES`.
+ * listing fails for another reason than its size, and `invalid_prompt_name`
+ * for a name that is empty or has more than `MAX_PROMPT_NAME_BYTES`.
  */
 export const sync = action({
   args: { names: v.optional(v.array(v.string())) },

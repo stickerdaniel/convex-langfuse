@@ -139,10 +139,22 @@ export const PROMPT_REFRESH_SPACING_MS = 200;
 export const PROMPT_REFRESH_MAX_MS = 30 * MINUTE;
 /** The tick lists the project's prompts again once the last listing is this old. */
 export const PROMPT_LIST_INTERVAL_MS = HOUR;
-/** Pages of `PROMPT_PAGE_LIMIT` names one listing reads at most. */
-export const PROMPT_LIST_MAX_PAGES = 50;
-/** Names per page of `GET /api/public/v2/prompts`, the server maximum. */
-export const PROMPT_PAGE_LIMIT = 100;
+/** Names one listing reads at most, in name order. */
+export const PROMPT_LIST_MAX_NAMES = 5_000;
+/**
+ * Names per page of `GET /api/public/v2/prompts`: the server maximum first,
+ * then the smaller sizes a page over `MAX_PROMPT_RESPONSE_BYTES` is read
+ * again in. Each size divides the one before.
+ */
+export const PROMPT_PAGE_SIZES = [100, 10, 1] as const;
+/**
+ * Requests one listing sends at most. Each ends within `PROMPT_TIMEOUT_MS`,
+ * so 150 requests take at most 25 min of the 30 min an action may run
+ * (`PROMPT_REFRESH_MAX_MS`), and 5 min are left for the mutations that
+ * request the refreshes. A listing of `PROMPT_LIST_MAX_NAMES` names in pages
+ * of 100 takes 50 requests.
+ */
+export const PROMPT_LIST_MAX_REQUESTS = 150;
 /** Prompt names the cache tracks at most. */
 export const MAX_PROMPT_NAMES = 500;
 /**
@@ -156,22 +168,26 @@ export const MAX_PROMPT_NAME_BYTES = 256;
 export const MAX_PROMPT_DEPENDENCIES = 32;
 /** Labels of one prompt name a refresh fetches at most, in sorted order. */
 export const MAX_PROMPT_LABELS = 50;
-/** Labels a refresh fetches at once and stores in one mutation. */
-export const PROMPT_STEP_LABELS = 4;
+/**
+ * Labels a refresh fetches at once and stores in one mutation. A response
+ * in flight holds its chunks, up to `MAX_PROMPT_RESPONSE_BYTES` = 6 MiB, and
+ * its decoded text, up to 12 MiB as a JavaScript string of two-byte
+ * characters: 18 MiB. Two responses hold 2 × 18 MiB = 36 MiB of the 64 MiB
+ * an action may use, and 28 MiB are left for the values parsed from them.
+ */
+export const PROMPT_STEP_LABELS = 2;
 /** Summed UTF-8 bytes of prompt, config and resolution graph of a snapshot. */
 export const MAX_SNAPSHOT_BYTES = 900 * KIB;
 /**
- * Bytes of one prompt API response that a refresh or a listing reads. A
- * text prompt arrives as a JSON string, where escaping a quote, a backslash
- * or a line break doubles its bytes; chat messages, config and resolution
- * graph arrive as JSON of the size they are stored at. So a snapshot of
- * `MAX_SNAPSHOT_BYTES` takes at most 2 × 900 KiB = 1800 KiB of a response,
- * and 248 KiB are left for the other fields. A text prompt of control
- * characters, which escape to 6 bytes, can exceed the cap. A refresh reads
- * `PROMPT_STEP_LABELS` responses at once, so it holds the text of at most
- * 4 × 2 MiB = 8 MiB of responses at a time, plus the values parsed from it.
+ * Bytes of one prompt API response that a refresh or a listing reads, a
+ * transport bound that admits every snapshot the cache accepts. A text
+ * prompt arrives as a JSON string, where a control character escapes to 6
+ * bytes; chat messages, config and resolution graph arrive as JSON of the
+ * size they are stored at. So a snapshot of `MAX_SNAPSHOT_BYTES` takes at
+ * most 6 × 900 KiB = 5400 KiB of a response, and 744 KiB are left for the
+ * other fields.
  */
-export const MAX_PROMPT_RESPONSE_BYTES = 2 * MIB;
+export const MAX_PROMPT_RESPONSE_BYTES = 6 * MIB;
 /**
  * Bytes of a snapshot document: `MAX_SNAPSHOT_BYTES` of content plus its
  * key, its name of at most `MAX_PROMPT_NAME_BYTES` and the small fields.

@@ -206,8 +206,9 @@ export interface Prompts {
    * Turns the cache on and schedules refreshes: for `names`, or for every
    * prompt of the project. Run it from an action after deploying; the
    * refreshes run in the background. Without it or a webhook delivery, the
-   * cache stays empty. A listing that stops at its page cap of 50 pages
-   * returns `incomplete`. A name has 1 to 256 UTF-8 bytes;
+   * cache stays empty. A listing that stops at 5,000 names or 150 requests,
+   * or skips a name whose listing entry alone passes the response cap of
+   * 6 MiB, returns `incomplete`. A name has 1 to 256 UTF-8 bytes;
    * `invalid_prompt_name` refuses another.
    */
   sync(
