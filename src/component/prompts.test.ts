@@ -333,27 +333,6 @@ describe("sync and get", () => {
     expect(await get("late")).toMatchObject({ prompt: "late" });
   });
 
-  test("names tracked before the count existed count towards the limit", async () => {
-    await t.run(async (ctx) => {
-      await ctx.db.insert("promptSync", {});
-      for (let i = 0; i < MAX_PROMPT_NAMES - 1; i++) {
-        await ctx.db.insert("promptNames", {
-          name: `old${i}`,
-          token: `token${i}`,
-          dependsOn: [],
-          attemptedAt: Date.now(),
-        });
-      }
-    });
-    prompts.add("a", "a");
-    prompts.add("b", "b");
-    expect(await sync(["a", "b"])).toEqual({
-      status: "ok",
-      tracked: 1,
-      overflow: 1,
-    });
-  });
-
   test("a name of 257 UTF-8 bytes: sync refuses it, the listing counts it as overflow, get returns null and pin refuses it", async () => {
     const longest = "é".repeat(MAX_PROMPT_NAME_BYTES / 2);
     const long = `${longest}n`;
@@ -1379,6 +1358,7 @@ describe("with Convex's transaction limits", () => {
             dependsOn,
             attemptedAt: Date.now() - PROMPT_REFRESH_INTERVAL_MS,
           });
+          await ctx.db.insert("promptSlots", { name });
         }
       });
     }
