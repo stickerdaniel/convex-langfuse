@@ -55,6 +55,8 @@ jobs:
           fail() { echo "::error::$1"; exit 1; }
           version="$(jq -r .version package.json)"
           [ "$GITHUB_REF_NAME" = "v$version" ] || fail "Tag $GITHUB_REF_NAME does not name version $version."
+          # npm publishes a prerelease only with an explicit dist-tag.
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Only stable versions are released."
           # A clean build: a leftover build info file makes tsc skip files.
           rm -rf dist ./*.tsbuildinfo
           mkdir -p "$OUT"
@@ -69,6 +71,16 @@ jobs:
             grep -qx "package/${file#./}" "$OUT/files.txt" || fail "The tarball lacks $file."
           done
           ! grep -E '\.test(-d|-util)?\.ts$' "$OUT/files.txt" || fail "The tarball holds test files."
+          # A consumer installs the tarball and loads both runtime entries,
+          # which load every file they import.
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke"
+          (
+            cd "$smoke"
+            npm init -y > /dev/null
+            npm install --no-audit --no-fund --ignore-scripts "$OUT/package.tgz" > /dev/null
+            node --input-type=module -e 'await import("@stickerdaniel/convex-langfuse"); await import("@stickerdaniel/convex-langfuse/ids");'
+          ) || fail "The installed tarball does not load."
           status="$(curl --silent --show-error --retry 3 --max-time 30 --output /dev/null \
             --write-out '%{http_code}' "https://registry.npmjs.org/@stickerdaniel%2fconvex-langfuse/$version")"
           case "$status" in

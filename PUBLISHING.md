@@ -5,7 +5,11 @@ The package is published to npm as `@stickerdaniel/convex-langfuse` by the
 publishing. No npm token is involved: the publish job proves its identity to npm
 with a GitHub OIDC token. npm's package settings name the repository
 `stickerdaniel/convex-langfuse`, the workflow `release.yml` and the environment
-`npm` as the trusted publisher.
+`npm` as the trusted publisher, with `npm publish` allowed. Until that entry
+exists, the workflow cannot publish (issue #14).
+
+Only repository admins can create, move or delete a `v*` tag, and only a `v*`
+tag may deploy to the environment `npm`.
 
 ## Releasing a version
 
@@ -21,10 +25,12 @@ with a GitHub OIDC token. npm's package settings name the repository
    git push origin v0.1.2
    ```
 
-The workflow runs the tests, packs a clean build, checks that the tag names the
-package version and that the tarball holds every file of the `exports` map and
-no test file, and publishes it. A version that is already on npm is skipped.
-Create the GitHub release from the changelog section afterwards.
+The workflow runs the tests and packs a clean build. It checks that the tag
+names the package version, which must be a stable version, that the tarball
+holds every file of the `exports` map and none of the excluded test files, and
+that a project which installs it can load both runtime entries. Then it
+publishes the tarball. A version that is already on npm is skipped. Create the
+GitHub release from the changelog section afterwards.
 
 ## Checking a tarball by hand
 
