@@ -5,8 +5,9 @@
 // the host. The answer goes back unchanged too.
 //
 // It records each forwarded delivery: the relay clock's arrival time `at`,
-// the path, the event's `type` and the name of its `skill` or `prompt`, and
-// the status the route answered. It records no body and no header, so no
+// the path, the event's `type` and `action`, the name of its `skill` or
+// `prompt`, a skill's `version` and `labels`, and the status the route
+// answered. It records no body and no header, so no
 // signature. `GET /deliveries` on port 8080 returns `{ now, deliveries }`,
 // with `now` from the relay's clock, so the runner can move `at` to its own.
 
@@ -15,14 +16,23 @@ import { createServer, request } from "node:http";
 const target = new URL(process.env.RELAY_TARGET);
 const deliveries = [];
 
-/** The event type and name of a webhook body, or nothing it can read. */
+/** The metadata of a webhook body, or nothing it can read. */
 function eventOf(body) {
   try {
     const event = JSON.parse(body.toString("utf8"));
     const name = event?.skill?.name ?? event?.prompt?.name;
+    const labels = event?.skill?.labels;
     return {
       type: typeof event?.type === "string" ? event.type : undefined,
+      action: typeof event?.action === "string" ? event.action : undefined,
       name: typeof name === "string" ? name : undefined,
+      version:
+        typeof event?.skill?.version === "number"
+          ? event.skill.version
+          : undefined,
+      labels: Array.isArray(labels)
+        ? labels.filter((label) => typeof label === "string")
+        : undefined,
     };
   } catch {
     return {};

@@ -332,19 +332,32 @@ export default [
           `\n  ${report("reported, delivery time from health on the Convex clock", deliveredAt)}`
         );
       }
-      // The relay's record proves that the signed delivery for this skill
-      // reached the route, and that the refresh started after it.
+      // The relay's record proves that the signed delivery of this move
+      // reached the route, and that the refresh started after it. Only the
+      // move sends version 2 with `production`: before it, version 2 held
+      // `latest` alone, so a delayed earlier delivery does not match.
       const seen = (await deliveries()).filter((d) => d.at >= movedFrom);
       const receipt = seen.find(
         (d) =>
-          d.type === "skill-version" && d.name === name && d.status === 200,
+          d.path === "/langfuse/skill-webhook" &&
+          d.type === "skill-version" &&
+          d.action === "updated" &&
+          d.name === name &&
+          d.version === 2 &&
+          d.labels?.includes("production") &&
+          d.status === 200,
       );
       if (!receipt) {
         throw new Error(
-          `no skill-version delivery for ${name} answered 200 after the PATCH; ` +
-            `the relay forwarded: ${
-              seen.map((d) => `${d.type} ${d.name} ${d.status}`).join(", ") ||
-              "nothing"
+          `no delivery of the move of ${name} (updated, version 2 with ` +
+            `production) answered 200 after the PATCH; the relay forwarded: ${
+              seen
+                .map(
+                  (d) =>
+                    `${d.type} ${d.action} ${d.name} v${d.version} ` +
+                    `[${d.labels?.join(",") ?? ""}] ${d.status}`,
+                )
+                .join(", ") || "nothing"
             }`,
         );
       }
