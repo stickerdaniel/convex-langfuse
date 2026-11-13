@@ -136,7 +136,8 @@ export type Skill = Infer<typeof vSkill>;
 
 /**
  * The version `get({ version })` serves: the row a label holds with that
- * number, otherwise, of the rows with that number, one that a label held
+ * number, the later published one if both labels hold it, otherwise, of the
+ * rows with that number, one that a label held
  * within `SKILL_VERSION_WINDOW_MS` and that the sweep is not deleting, the
  * latest published one if Langfuse recreated the number. The scan reads the
  * `MAX_SKILL_VERSION_ROWS` newest rows.
@@ -147,12 +148,17 @@ async function windowedVersion(
   version: number,
   now: number,
 ): Promise<Doc<"skillVersions"> | null> {
+  // Both labels can hold the same number with different ids for a moment,
+  // when a recreation fell between the two GETs: the later publication wins.
+  let held: Doc<"skillVersions"> | null = null;
   for (const label of ["production", "latest"] as const) {
     const pointer = await labelRow(ctx, name, label);
     if (pointer?.version !== version) continue;
-    const held = await ctx.db.get("skillVersions", pointer.versionId);
-    if (held && !held.deleting) return held;
+    const row = await ctx.db.get("skillVersions", pointer.versionId);
+    if (!row || row.deleting) continue;
+    if (!held || (row.publishedAt ?? 0) > (held.publishedAt ?? 0)) held = row;
   }
+  if (held) return held;
   const rows = await ctx.db
     .query("skillVersions")
     .withIndex("by_name_version", (q) =>
@@ -695,7 +701,8 @@ async function applyPage(
     return {
       list: undefined,
       lastListAt: now,
-      listError: listError ?? (overflow ? "too_many_skills" : undefined),
+      // An overflow seen on an earlier page outranks a later page's error.
+      listError: overflow ? "too_many_skills" : listError,
     };
   };
   if (!page.ok) return await end(page.error);

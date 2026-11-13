@@ -305,6 +305,41 @@ describe("refresh", () => {
     expect(await get(NAME, { version: 1 })).toEqual(await get(NAME));
   });
 
+  test("get({ version }) serves the later publication when both labels hold that number", async () => {
+    skills.add(NAME);
+    await cached(NAME);
+    // A recreation between the two GETs: latest holds a newer version 1.
+    await t.run(async (ctx) => {
+      const old = (await ctx.db.query("skillVersions").first())!;
+      const { _id, _creationTime, ...fields } = old;
+      const id = await ctx.db.insert("skillVersions", {
+        ...fields,
+        remoteId: "recreated-id",
+        description: "Recreated",
+        publishedAt: old.publishedAt! + 1,
+      });
+      const files = await ctx.db
+        .query("skillFiles")
+        .withIndex("by_version", (q) => q.eq("versionId", _id))
+        .collect();
+      for (const { path, content } of files) {
+        await ctx.db.insert("skillFiles", { versionId: id, path, content });
+      }
+      const latest = (await ctx.db
+        .query("skillLabels")
+        .withIndex("by_name_label", (q) =>
+          q.eq("name", NAME).eq("label", "latest"),
+        )
+        .unique())!;
+      await ctx.db.patch("skillLabels", latest._id, {
+        versionId: id,
+        remoteId: "recreated-id",
+      });
+    });
+
+    expect((await get(NAME, { version: 1 }))?.description).toBe("Recreated");
+  });
+
   test("get refuses a label and a version together, a bad version and a bad name", async () => {
     expect(
       await refusalCode(
@@ -1079,6 +1114,22 @@ describe("bound", () => {
       tracked: MAX_SKILL_NAMES,
       listError: "too_many_skills",
     });
+    expect((await sync()).status).toBe("incomplete");
+  });
+
+  test("in mode all, an overflow outlasts a later page's error", async () => {
+    for (const name of skillNames("skill", MAX_SKILL_NAMES + 200)) {
+      skills.add(name);
+    }
+    // Page 6 lists names over the bound, page 7 fails.
+    fake.fallback = (request) =>
+      pathOf(request) === "/api/public/skills" && pageOf(request) === 7
+        ? { status: 500 }
+        : skills.answer(request);
+    await sync();
+    await firstWalk();
+
+    expect((await health()).listError).toBe("too_many_skills");
     expect((await sync()).status).toBe("incomplete");
   });
 
