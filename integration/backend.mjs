@@ -333,6 +333,12 @@ function cliEnv(backend) {
 }
 
 /**
+ * Longest run of one Convex CLI call; a call past it is killed and fails.
+ * It keeps a stalled network request from holding a run, or its cleanup.
+ */
+const CLI_TIMEOUT_MS = 10 * 60_000;
+
+/**
  * The Convex CLI for the host app in `dir`, whose `convex/` folder it
  * deploys. `backend` is anything with `url` and `adminKey`, or with
  * `deployKey` for a Convex Cloud deployment.
@@ -344,6 +350,7 @@ export function convexCli(dir) {
         cwd: dir,
         env: cliEnv(backend),
         maxBuffer: 16 * 1024 * 1024,
+        timeout: CLI_TIMEOUT_MS,
       });
     } catch (error) {
       throw new Error(
@@ -362,6 +369,7 @@ export function convexCli(dir) {
       cwd: dir,
       env: cliEnv(backend),
       stdio: ["pipe", "ignore", "pipe"],
+      timeout: CLI_TIMEOUT_MS,
     });
     let stderr = "";
     child.stderr.on("data", (chunk) => (stderr += chunk));

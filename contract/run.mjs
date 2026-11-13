@@ -836,7 +836,9 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const boot = async () => {
     const bootStart = Date.now();
     const health = await (
-      await fetch(`${langfuseUrl}/api/public/health`)
+      await fetch(`${langfuseUrl}/api/public/health`, {
+        signal: AbortSignal.timeout(30_000),
+      })
     ).json();
     print(
       `run ${runId}: Langfuse ${health.version} at ${langfuseUrl}, ` +
@@ -844,14 +846,15 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     );
     // The tunnel must lead to this run's proxy, and the proxy to Langfuse.
     const probe = `/api/public/health?run=${runId}`;
-    await fetch(`${proxyUrl}${probe}`, {
+    const answer = await fetch(`${proxyUrl}${probe}`, {
       signal: AbortSignal.timeout(15_000),
-    }).catch(() => undefined);
+    }).catch((error) => error);
     const probed = proxy.records.find((record) => record.path === probe);
-    if (probed?.status !== 200) {
+    if (answer?.status !== 200 || probed?.status !== 200) {
       throw new Error(
         `${proxyUrl} does not lead through the proxy on port ${proxyPort} ` +
-          `to Langfuse: ${probed ? `HTTP ${probed.status}` : "no request"}`,
+          `to Langfuse: tunnel ${answer?.status ?? answer?.message}, ` +
+          `proxy ${probed ? `HTTP ${probed.status}` : "no request"}`,
       );
     }
     const canary = randomBytes(16).toString("hex");
@@ -895,6 +898,9 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
       () => undefined,
     );
     started = await booting;
+    // A signal during the boot started the cleanup; no case may start now.
+    // The signal handler exits once the cleanup ends.
+    if (stopping !== undefined) await new Promise(() => {});
   } catch (error) {
     error.logs = await stop().catch((cleanup) => {
       console.error(cleanup.message);
