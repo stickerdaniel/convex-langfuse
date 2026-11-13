@@ -409,6 +409,8 @@ export default defineSchema({
         startedAt: v.number(),
         /** Tracked names the pages read so far listed. */
         seen: v.array(v.string()),
+        /** Set once a page listed a name mode `all` could not track. */
+        overflow: v.optional(v.boolean()),
       }),
     ),
     /** When the last walk ended. */

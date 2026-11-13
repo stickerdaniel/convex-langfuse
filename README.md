@@ -478,7 +478,9 @@ export const syncSkills = internalMutation({
   here stays tracked while Langfuse has no such skill.
 - Both return `{ status, tracked }` and refresh in the background, so content
   appears shortly after. `status` is `incomplete` when a name was not tracked
-  because the cache tracks 500 names.
+  because the cache tracks 500 names. In mode `all`, the listing finds names
+  over the bound: the walk then ends with `listError: "too_many_skills"`, and
+  later `sync()` calls return `incomplete`.
 
 To set up the webhook:
 

@@ -121,6 +121,9 @@ const gets = (name: string) =>
   fake.requests.filter(
     (request) => pathOf(request) === `/api/public/skills/${name}`,
   );
+/** The `production` GETs of `name`, in order: one per refresh. */
+const productionGets = (name: string) =>
+  gets(name).filter((request) => labelOf(request) === "production");
 const listings = () =>
   fake.requests.filter((request) => pathOf(request) === "/api/public/skills");
 /** Gaps between consecutive request starts, in fake milliseconds. */
@@ -264,6 +267,42 @@ describe("refresh", () => {
     vi.setSystemTime(Date.now() + 2 * MINUTE);
     expect(await get(NAME, { version: 1 })).toBeNull();
     expect((await get(NAME, { version: 2 }))?.version).toBe(2);
+  });
+
+  test("a refused production version leaves latest refreshed", async () => {
+    skills.add(NAME);
+    skills.add(NAME, { labels: [] });
+    skills.mangle = (body) => {
+      if (body.version === 1) {
+        (body.files as Array<Record<string, unknown>>)[0]!.sha256Hash =
+          sha256Base64("other");
+      }
+    };
+    await sync([NAME]);
+    await run(serves(NAME, 2, { label: "latest" }));
+
+    expect(await get(NAME)).toBeNull();
+    expect((await health()).errors).toBe(1);
+  });
+
+  test("get({ version }) serves the held version among more than 100 recreations", async () => {
+    skills.add(NAME);
+    await cached(NAME);
+    await t.run(async (ctx) => {
+      const held = (await ctx.db.query("skillVersions").first())!;
+      for (let i = 0; i < 101; i++) {
+        await ctx.db.insert("skillVersions", {
+          ...held,
+          _id: undefined,
+          _creationTime: undefined,
+          remoteId: `old-${i}`,
+          description: `old ${i}`,
+          publishedAt: held.publishedAt! + 1 + i,
+        } as never);
+      }
+    });
+
+    expect(await get(NAME, { version: 1 })).toEqual(await get(NAME));
   });
 
   test("get refuses a label and a version together, a bad version and a bad name", async () => {
@@ -529,13 +568,15 @@ describe("wake", () => {
     await firstWalk();
     fake.respond({ status: 503 });
     await notify(NAME);
-    await run(() => gets(NAME).length === 1);
-    const failed = gets(NAME)[0]!.at;
+    await run(async () => (await health()).errors === 1);
+    // The refresh failed at its `latest` GET's end; its backoff starts there.
+    const failed = gets(NAME).at(-1)!.at;
     await strandLoop();
     await run(serves(NAME, 1));
 
-    expect(gets(NAME)[1]!.at - failed).toBeGreaterThanOrEqual(5 * SECOND);
-    expect(gets(NAME)[1]!.at - failed).toBeLessThan(5 * SECOND + 100);
+    const retry = productionGets(NAME)[1]!.at;
+    expect(retry - failed).toBeGreaterThanOrEqual(5 * SECOND);
+    expect(retry - failed).toBeLessThan(5 * SECOND + 100);
   });
 });
 
@@ -590,10 +631,9 @@ describe("requests", () => {
     skills.add("other-skill");
     await sync([NAME, "other-skill"]);
     await run(async () => (await health()).due === 0);
-    const before = gets(NAME).length;
     fake.respond({ status: 500 });
     await notify(NAME);
-    await run(() => gets(NAME).length === before + 1);
+    await run(async () => (await health()).errors === 1);
     const failed = gets(NAME).at(-1)!.at;
     expect(await health()).toMatchObject({ errors: 1, due: 1 });
     await notify("other-skill");
@@ -601,26 +641,52 @@ describe("requests", () => {
 
     const other = gets("other-skill").at(-1)!.at;
     expect(other).toBeLessThan(failed + 5 * SECOND);
-    expect(gets(NAME).at(-1)!.at - failed).toBeGreaterThanOrEqual(5 * SECOND);
+    expect(productionGets(NAME).at(-1)!.at - failed).toBeGreaterThanOrEqual(
+      5 * SECOND,
+    );
     expect(await health()).toMatchObject({ errors: 0, due: 0 });
   });
 
   test("a webhook during a backoff is fetched at its own due time", async () => {
     skills.add(NAME);
     await cached(NAME);
-    const before = gets(NAME).length;
+    const before = productionGets(NAME).length;
     fake.respond({ status: 500 });
     await notify(NAME);
-    await run(() => gets(NAME).length === before + 1);
+    await run(async () => (await health()).errors === 1);
     const failed = gets(NAME).at(-1)!.at;
     await runFor(500);
     const again = Date.now();
     await notify(NAME);
-    await run(() => gets(NAME).length === before + 2);
+    await run(() => productionGets(NAME).length === before + 2);
 
-    const retry = gets(NAME).at(-1)!.at;
+    const retry = productionGets(NAME).at(-1)!.at;
     expect(retry).toBeGreaterThanOrEqual(again + 2 * SECOND);
     expect(retry).toBeLessThan(failed + 5 * SECOND);
+  });
+
+  test("a webhook during a GET that fails keeps its own due time", async () => {
+    skills.add(NAME);
+    await cached(NAME);
+    const before = productionGets(NAME).length;
+    let delivered = false;
+    fake.fallback = async (request) => {
+      if (!delivered && labelOf(request) === "production") {
+        delivered = true;
+        await notify(NAME);
+        return { status: 500 };
+      }
+      return skills.answer(request);
+    };
+    await notify(NAME);
+    await run(() => productionGets(NAME).length === before + 2);
+
+    // The latest GET and two spacings lie between; the 5 s backoff from the
+    // failed refresh's end would add 2.5 s more.
+    const [failed, retry] = productionGets(NAME).slice(before);
+    expect(retry!.at - failed!.at).toBeLessThan(
+      2 * SKILL_REQUEST_SPACING_MS + SECOND,
+    );
   });
 
   test.each([
@@ -1000,6 +1066,20 @@ describe("bound", () => {
       status: "ok",
       tracked: 500,
     });
+  });
+
+  test("in mode all, a listing over the bound reports the overflow", async () => {
+    for (const name of skillNames("skill", MAX_SKILL_NAMES + 1)) {
+      skills.add(name);
+    }
+    expect((await sync()).status).toBe("ok");
+    await firstWalk();
+
+    expect(await health()).toMatchObject({
+      tracked: MAX_SKILL_NAMES,
+      listError: "too_many_skills",
+    });
+    expect((await sync()).status).toBe("incomplete");
   });
 
   test("in mode all, names deleted at the bound free their slots for new ones", async () => {

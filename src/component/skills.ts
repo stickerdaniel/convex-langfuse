@@ -135,9 +135,11 @@ const vSkill = v.object({
 export type Skill = Infer<typeof vSkill>;
 
 /**
- * The version `get({ version })` serves: of the rows with that number, one
- * that a label held within `SKILL_VERSION_WINDOW_MS` and that the sweep is
- * not deleting, the latest published one if Langfuse recreated the number.
+ * The version `get({ version })` serves: the row a label holds with that
+ * number, otherwise, of the rows with that number, one that a label held
+ * within `SKILL_VERSION_WINDOW_MS` and that the sweep is not deleting, the
+ * latest published one if Langfuse recreated the number. The scan reads the
+ * `MAX_SKILL_VERSION_ROWS` newest rows.
  */
 async function windowedVersion(
   ctx: QueryCtx,
@@ -145,11 +147,18 @@ async function windowedVersion(
   version: number,
   now: number,
 ): Promise<Doc<"skillVersions"> | null> {
+  for (const label of ["production", "latest"] as const) {
+    const pointer = await labelRow(ctx, name, label);
+    if (pointer?.version !== version) continue;
+    const held = await ctx.db.get("skillVersions", pointer.versionId);
+    if (held && !held.deleting) return held;
+  }
   const rows = await ctx.db
     .query("skillVersions")
     .withIndex("by_name_version", (q) =>
       q.eq("name", name).eq("version", version),
     )
+    .order("desc")
     .take(MAX_SKILL_VERSION_ROWS);
   let served: Doc<"skillVersions"> | null = null;
   let servedAt = -Infinity;
@@ -361,6 +370,13 @@ export const sync = mutation({
       await requestNow(ctx, row, now);
     }
     await pingSkills(ctx);
+    // In mode `all`, the last listing walk shows whether every name fit.
+    if (
+      mode === "all" &&
+      (await getFetcher(ctx))?.listError === "too_many_skills"
+    ) {
+      incomplete = true;
+    }
     return {
       status: incomplete ? "incomplete" : "ok",
       tracked: MAX_SKILL_NAMES - (await freeSlots(ctx)),
@@ -673,9 +689,14 @@ async function applyPage(
   page: Page,
   now: number,
 ): Promise<FetcherPatch> {
+  let overflow = walk.overflow ?? false;
   const end = async (listError: string | undefined) => {
     await scheduleWake(ctx, now + SKILL_LIST_INTERVAL_MS);
-    return { list: undefined, lastListAt: now, listError };
+    return {
+      list: undefined,
+      lastListAt: now,
+      listError: listError ?? (overflow ? "too_many_skills" : undefined),
+    };
   };
   if (!page.ok) return await end(page.error);
   const seen = new Set(walk.seen);
@@ -685,7 +706,10 @@ async function applyPage(
     if (!row) {
       if (sync?.mode !== "all") continue;
       free ??= await freeSlots(ctx);
-      if (free <= 0) continue;
+      if (free <= 0) {
+        overflow = true;
+        continue;
+      }
       free -= 1;
       const tracked = await track(ctx, entry.name, now, false);
       await ctx.db.patch(
@@ -703,7 +727,14 @@ async function applyPage(
   }
   if (page.hasNextPage) {
     if (walk.page < SKILL_LIST_MAX_PAGES) {
-      return { list: { ...walk, page: walk.page + 1, seen: [...seen] } };
+      return {
+        list: {
+          ...walk,
+          page: walk.page + 1,
+          seen: [...seen],
+          ...(overflow ? { overflow } : {}),
+        },
+      };
     }
     return await end("too_many_skills");
   }
@@ -935,12 +966,14 @@ export const run = internalAction({
         pending = undefined;
         continue;
       }
-      // A failed `production` GET ends the refresh; a 404 still needs
-      // `latest`, which a skill without a `production` label has.
+      // `latest` is fetched unless the `production` response holds it, so a
+      // 404 or a refused `production` version still refreshes `latest`. A
+      // 429 ends the refresh.
       const holdsLatest =
         fetched.outcome === "ok" && fetched.labels.includes("latest");
       if (
         fetched.outcome === "gone" ||
+        fetched.outcome === "failed" ||
         (fetched.outcome === "ok" && !holdsLatest)
       ) {
         pending = { name: step.name, production: outcome };
@@ -1260,7 +1293,8 @@ export const store = internalMutation({
  * on its first publication; `releasedAt` is set on a version no label
  * holds and cleared on one a label holds again. A failure adds to
  * `failures`, records `error` and makes the name eligible again after its
- * backoff, with a wake at that time; a 429 leaves the request as it is.
+ * backoff, with a wake at that time, unless a newer request keeps its own
+ * due time; a 429 leaves the request as it is.
  * After a refresh without failure, the request is cleared only when no
  * newer one raised `requested` since the claim. In mode `all`, a name that
  * answered 404 for both labels and has no newer request stops being
@@ -1338,6 +1372,15 @@ export const publish = internalMutation({
 
     if (failure !== undefined) {
       const failures = row.failures + 1;
+      // A request newer than the claim keeps its own, earlier due time.
+      if (row.requested !== row.claimed!.requested) {
+        await ctx.db.patch("skillNames", row._id, {
+          claimed: undefined,
+          failures,
+          error: failure,
+        });
+        return null;
+      }
       const eligibleAt =
         now +
         SKILL_BACKOFF_MS[Math.min(failures, SKILL_BACKOFF_MS.length) - 1]!;
