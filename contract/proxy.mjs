@@ -1,9 +1,10 @@
 // The recording proxy of the contract suite. The Convex backend's
 // LANGFUSE_BASE_URL points here, so it sees exactly the component's requests
 // to Langfuse and none of the runner's own. It forwards each request
-// unchanged and records method, path, request body, the status Langfuse
-// answered and whether the answer was dropped. It never records a header,
-// so the Authorization header is not stored.
+// unchanged and records the arrival time `at`, method, path, request body,
+// the status Langfuse answered, the time `answeredAt` its answer was read
+// in full and whether the answer was dropped. It never records a header, so
+// the Authorization header is not stored.
 //
 // Two faults:
 // - `dropResponse(match)`: the next request for which `match(record)` is
@@ -37,6 +38,7 @@ export async function startProxy(target, port = 0) {
       path: incoming.url,
       body: body.toString("utf8"),
       status: undefined,
+      answeredAt: undefined,
       dropped: false,
     };
     records.push(record);
@@ -67,6 +69,7 @@ export async function startProxy(target, port = 0) {
       return;
     }
     const answered = Buffer.from(await answer.arrayBuffer());
+    record.answeredAt = Date.now();
     record.status = answer.status;
     if (dropMatch?.(record)) {
       dropMatch = undefined;

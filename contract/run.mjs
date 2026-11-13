@@ -14,13 +14,13 @@
 // the client's result in Convex, or from the proxy's record of the
 // component's requests. Each case names that oracle.
 //
-// Every run has an id. Every trace seed, prompt name, score id, model name
-// and the environment carry it, and the stack runs as its own Compose
-// project, so two runs at the same time share nothing. Every key, password
-// and secret is generated per run. Those of the stack reach Docker and the
-// containers through the environment only. The Convex backend takes its
-// instance secret as an argument (`integration/backend.mjs`), which a local
-// process can read while the run lasts. A run prints one line per case,
+// Every run has an id. Every trace seed, prompt name, skill name, score id,
+// model name and the environment carry it, and the stack runs as its own
+// Compose project, so two runs at the same time share nothing. Every key,
+// password and secret is generated per run. Those of the stack reach Docker
+// and the containers through the environment only. The Convex backend takes
+// its instance secret as an argument (`integration/backend.mjs`), which a
+// local process can read while the run lasts. A run prints one line per case,
 // writes its logs to `contract/logs/<run id>/` after scanning them for every
 // generated secret, and removes what it started, also when it is interrupted.
 
@@ -58,6 +58,7 @@ import scores from "./cases/scores.mjs";
 import prompts from "./cases/prompts.mjs";
 import privacy from "./cases/privacy.mjs";
 import delivery from "./cases/delivery.mjs";
+import skills from "./cases/skills.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const COMPOSE_FILE = join(HERE, "stack", "compose.yml");
@@ -73,6 +74,7 @@ export const CASES = [
   ...prompts,
   ...privacy,
   ...delivery,
+  ...skills,
 ];
 
 /** The stack must answer the canary within this time after `compose up`. */
@@ -267,11 +269,14 @@ async function postSpan(langfuse, span) {
 }
 
 /**
- * Signs in as the provisioned user and creates the prompt webhook through
- * the `automations.createAutomation` procedure, which the UI uses too.
- * Returns the signing secret Langfuse generated.
+ * Signs in as the provisioned user and creates the prompt webhook and the
+ * skill webhook through the `automations.createAutomation` procedure, which
+ * the UI uses too. Each targets its route of the component through the
+ * relay. Stores the signing secret Langfuse generated for each in
+ * `secrets.prompt` and `secrets.skill` as soon as it is created, so the log
+ * scan covers a secret also when a later step fails.
  */
-async function createWebhook(webUrl, { email, password, projectId }) {
+async function createWebhooks(webUrl, { email, password, projectId }, secrets) {
   const cookies = new Map();
   const keep = (response) => {
     for (const line of response.headers.getSetCookie()) {
@@ -298,36 +303,60 @@ async function createWebhook(webUrl, { email, password, projectId }) {
   if (!cookies.has("next-auth.session-token")) {
     throw new Error(`sign-in failed: HTTP ${login.status}`);
   }
-  const created = await fetch(
-    `${webUrl}/api/trpc/automations.createAutomation`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json", cookie: cookie() },
-      body: JSON.stringify({
-        json: {
-          projectId,
-          name: "convex-langfuse prompt webhook",
-          eventSource: "prompt",
-          eventAction: ["created", "updated", "deleted"],
-          filter: [],
-          status: "ACTIVE",
-          actionType: "WEBHOOK",
-          actionConfig: {
-            type: "WEBHOOK",
-            url: "http://webhook-relay/langfuse/prompt-webhook",
-            apiVersion: { prompt: "v1" },
-            requestHeaders: {},
+  const create = async (source) => {
+    const created = await fetch(
+      `${webUrl}/api/trpc/automations.createAutomation`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie: cookie() },
+        body: JSON.stringify({
+          json: {
+            projectId,
+            name: `convex-langfuse ${source} webhook`,
+            eventSource: source,
+            eventAction: ["created", "updated", "deleted"],
+            filter: [],
+            status: "ACTIVE",
+            actionType: "WEBHOOK",
+            actionConfig: {
+              type: "WEBHOOK",
+              url: `http://webhook-relay/langfuse/${source}-webhook`,
+              apiVersion: { [source]: "v1" },
+              requestHeaders: {},
+            },
           },
-        },
-      }),
-    },
-  );
-  const body = await created.json();
-  const secret = body?.result?.data?.json?.webhookSecret;
-  if (!created.ok || typeof secret !== "string") {
-    throw new Error(`webhook creation failed: HTTP ${created.status}`);
-  }
-  return secret;
+        }),
+      },
+    );
+    const body = await created.json();
+    const secret = body?.result?.data?.json?.webhookSecret;
+    if (!created.ok || typeof secret !== "string") {
+      throw new Error(
+        `${source} webhook creation failed: HTTP ${created.status}`,
+      );
+    }
+    secrets[source] = secret;
+  };
+  await create("prompt");
+  await create("skill");
+}
+
+/**
+ * The deliveries the stack's relay forwarded, from its `GET /deliveries` at
+ * `relayUrl`, with `at` moved to this process's clock. The offset between
+ * the two clocks is the relay's `now` minus the midpoint of the request.
+ */
+async function relayDeliveries(relayUrl) {
+  const sentAt = Date.now();
+  const response = await fetch(`${relayUrl}/deliveries`, {
+    signal: AbortSignal.timeout(10_000),
+  });
+  const { now, deliveries } = await response.json();
+  const offset = now - (sentAt + Date.now()) / 2;
+  return deliveries.map((delivery) => ({
+    ...delivery,
+    at: Math.round(delivery.at - offset),
+  }));
 }
 
 /**
@@ -350,8 +379,11 @@ const CLOUD_PACE = { scale: 4, pauseMs: 3_000, awaitRemoval: false };
  * returns the context every case gets, with `deploy` to deploy again and the
  * Convex CLI's `convex`. `backend` has `url` and either `adminKey` or, for a
  * Convex Cloud deployment, `deployKey`. `baseUrl` is where the component
- * reaches the proxy. `webhook` returns the signing secret of the prompt
- * webhook and runs once the host app is deployed.
+ * reaches the proxy. `webhooks` returns the signing secrets of the prompt
+ * webhook and the skill webhook as `{ prompt, skill }` and runs once the
+ * host app is deployed. The cases add the name of every skill they create
+ * to `ownSkills`. `deliveries`, where the run sees the webhooks, returns the
+ * relay's record of them on this process's clock.
  */
 async function prepareCases({
   runId,
@@ -360,7 +392,9 @@ async function prepareCases({
   proxy,
   baseUrl,
   keys,
-  webhook,
+  webhooks,
+  deliveries,
+  ownSkills = new Set(),
   pace = DEFAULT_PACE,
 }) {
   const { convex, setEnv, linkPackage } = convexCli(HERE);
@@ -369,12 +403,14 @@ async function prepareCases({
     convex(backend, ["deploy", "--yes", "--codegen", "disable"]);
   await deploy();
   const environment = `contract-${runId}`;
+  const secrets = await webhooks();
   const settings = {
     LANGFUSE_PUBLIC_KEY: keys.publicKey,
     LANGFUSE_SECRET_KEY: keys.secretKey,
     LANGFUSE_BASE_URL: baseUrl,
     LANGFUSE_TRACING_ENVIRONMENT: environment,
-    LANGFUSE_WEBHOOK_SECRET: await webhook(),
+    LANGFUSE_WEBHOOK_SECRET: secrets.prompt,
+    LANGFUSE_SKILL_WEBHOOK_SECRET: secrets.skill,
   };
   for (const [name, value] of Object.entries(settings)) {
     await setEnv(backend, name, value);
@@ -409,6 +445,15 @@ async function prepareCases({
     awaitRemoval: pace.awaitRemoval,
     /** The pause between two reads of a loop that runs outside `poll`. */
     readPauseMs: Math.max(1_000, pace.pauseMs),
+    /** The factor of every case deadline, for a wait that runs outside `poll`. */
+    scale: pace.scale,
+    /** Names of the skills the cases create, added before the creation. */
+    ownSkills,
+    /**
+     * The webhook deliveries the relay forwarded, each `{ at, path, type,
+     * name, status }`; `undefined` where the webhooks bypass the runner.
+     */
+    deliveries,
     steps: [],
     postSpan: (span) => postSpan(langfuse, span),
     poll: (what, read, check, deadlineMs) =>
@@ -554,7 +599,8 @@ export async function startSuite({ stackFile, version }) {
   const measures = { peakMemoryMib: 0 };
   const steps = [];
   let proxy;
-  let webhookSecret;
+  /** Filled by `createWebhooks` as each automation is created. */
+  const webhookSecrets = {};
   let stopped = false;
   process.on("exit", () => {
     if (stopped) return;
@@ -591,7 +637,8 @@ export async function startSuite({ stackFile, version }) {
         ).toString("base64"),
         "the backend's instance secret": backend.secret,
         "the backend's admin key": backend.adminKey,
-        "the webhook secret": webhookSecret,
+        "the webhook secret": webhookSecrets.prompt,
+        "the skill webhook secret": webhookSecrets.skill,
       },
     });
     await proxy?.stop();
@@ -617,6 +664,7 @@ export async function startSuite({ stackFile, version }) {
       `http://${(await compose.exec("port", service, String(port))).trim()}`;
     const webUrl = await portOf("langfuse-web", 3000);
     const workerUrl = await portOf("langfuse-worker", 3030);
+    const relayUrl = await portOf("webhook-relay", 8080);
     const langfuse = publicApi({
       baseUrl: webUrl,
       publicKey: secrets.LANGFUSE_PUBLIC_KEY,
@@ -708,7 +756,11 @@ export async function startSuite({ stackFile, version }) {
         publicKey: secrets.LANGFUSE_PUBLIC_KEY,
         secretKey: secrets.LANGFUSE_SECRET_KEY,
       },
-      webhook: async () => (webhookSecret = await createWebhook(webUrl, user)),
+      webhooks: async () => {
+        await createWebhooks(webUrl, user, webhookSecrets);
+        return webhookSecrets;
+      },
+      deliveries: () => relayDeliveries(relayUrl),
     });
   };
 
@@ -737,12 +789,19 @@ export async function startSuite({ stackFile, version }) {
  *   deployed to. Use one for tests: its functions are public.
  * - `LANGFUSE_WEBHOOK_SECRET`: the signing secret of a prompt webhook that
  *   the Langfuse project sends to `<site URL>/langfuse/prompt-webhook`.
+ * - `LANGFUSE_SKILL_WEBHOOK_SECRET`: the signing secret of a skill webhook
+ *   that the Langfuse project sends to `<site URL>/langfuse/skill-webhook`.
+ *   The skill cases switch the deployment's skill cache to track every
+ *   skill of the project. The webhooks go from Langfuse straight to the
+ *   deployment, so the runner sees no delivery: the label move case checks
+ *   a request queued after the move in `health` instead of a receipt of
+ *   the signed delivery for its skill.
  * - `CONTRACT_PROXY_PORT`, `CONTRACT_PROXY_URL`: the local port of the
  *   recording proxy, and the public URL of a tunnel to that port. The
  *   deployment sends to Langfuse through it, as the local backend does.
  *
  * `stop` unbinds the component's base URL, which disables the export, and
- * deletes the prompts of the run.
+ * deletes the prompts and skills of the run.
  */
 export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const need = (name) => {
@@ -761,6 +820,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     deployKey: need("CONVEX_DEPLOY_KEY"),
   };
   const webhookSecret = need("LANGFUSE_WEBHOOK_SECRET");
+  const skillWebhookSecret = need("LANGFUSE_SKILL_WEBHOOK_SECRET");
   const proxyUrl = need("CONTRACT_PROXY_URL").replace(/\/+$/, "");
   const proxyPort = Number(need("CONTRACT_PROXY_PORT"));
 
@@ -774,6 +834,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const langfuse = publicApi({ baseUrl: langfuseUrl, ...keys });
   const proxy = await startProxy(langfuseUrl, proxyPort);
   const { convex } = convexCli(HERE);
+  const ownSkills = new Set();
 
   // Runs once, also from a signal. A failed unbinding fails the run, because
   // the deployment would go on exporting through the tunnel. It waits for
@@ -796,6 +857,9 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     await deletePrompts(langfuse, `contract-${runId}-`).catch((error) =>
       failures.push(`prompts of the run left in Langfuse: ${error.message}`),
     );
+    await deleteSkills(langfuse, ownSkills, pace.pauseMs).catch((error) =>
+      failures.push(`skills of the run left in Langfuse: ${error.message}`),
+    );
     for (const failure of failures) print(`cleanup failed: ${failure}`);
     const logs = await collectLogs({
       runId,
@@ -810,6 +874,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
         ).toString("base64"),
         "the deploy key": backend.deployKey,
         "the webhook secret": webhookSecret,
+        "the skill webhook secret": skillWebhookSecret,
       },
     });
     await proxy.stop();
@@ -883,7 +948,11 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
       proxy,
       baseUrl: proxyUrl,
       keys,
-      webhook: async () => webhookSecret,
+      webhooks: async () => ({
+        prompt: webhookSecret,
+        skill: skillWebhookSecret,
+      }),
+      ownSkills,
       pace,
     });
     measures.bootMs = Date.now() - bootStart;
@@ -930,6 +999,102 @@ async function deletePrompts(langfuse, prefix) {
     );
     if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
   }
+}
+
+/**
+ * Tries per cleanup request: a 429, a 5xx or a network error is tried
+ * again until this many tries are used.
+ */
+const CLEANUP_TRIES = 3;
+/** Wait after a 429 without a `Retry-After` the cleanup can read. */
+const CLEANUP_RETRY_AFTER_MS = 60_000;
+/** A 429 that asks for a longer wait ends the tries. */
+const CLEANUP_MAX_WAIT_MS = 5 * 60_000;
+/** Wait after a 5xx or a network error. */
+const CLEANUP_BACKOFF_MS = 5_000;
+
+/** A `Retry-After` value, in seconds or as an HTTP date, in milliseconds. */
+function retryAfterMs(value, now) {
+  if (value === null) return undefined;
+  if (/^\d+$/.test(value.trim())) return Number(value) * 1_000;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+/**
+ * `langfuse.send` for the cleanup. A 429 is sent again after its
+ * `Retry-After`, 60 s without one; a 5xx or a network error after 5 s.
+ * Returns the last response, or throws the last network error, once
+ * `CLEANUP_TRIES` tries are used.
+ */
+async function sendRetrying(langfuse, method, path) {
+  for (let attempt = 1; ; attempt++) {
+    let response;
+    let wait = CLEANUP_BACKOFF_MS;
+    try {
+      response = await langfuse.send(method, path);
+    } catch (error) {
+      if (attempt >= CLEANUP_TRIES) throw error;
+    }
+    if (response && response.status !== 429 && response.status < 500) {
+      return response;
+    }
+    if (response?.status === 429) {
+      wait =
+        retryAfterMs(response.headers.get("retry-after"), Date.now()) ??
+        CLEANUP_RETRY_AFTER_MS;
+    }
+    if (response && (attempt >= CLEANUP_TRIES || wait > CLEANUP_MAX_WAIT_MS)) {
+      return response;
+    }
+    await response?.body?.cancel();
+    await sleep(wait);
+  }
+}
+
+/**
+ * Deletes every version of each skill in `names`, `pauseMs` between two
+ * requests. The public API deletes one version at a time and moves
+ * `latest` to the highest version left, so the cleanup deletes the version
+ * `latest` holds until the label answers 404, which shows that no version
+ * is left. A failed name does not stop the others; the error names every
+ * skill left.
+ */
+async function deleteSkills(langfuse, names, pauseMs) {
+  const left = [];
+  for (const name of names) {
+    const path = `/api/public/skills/${encodeURIComponent(name)}`;
+    try {
+      let deleted;
+      for (;;) {
+        await sleep(pauseMs);
+        const latest = await sendRetrying(
+          langfuse,
+          "GET",
+          `${path}?label=latest`,
+        );
+        if (latest.status === 404) break;
+        if (!latest.ok) throw new Error(`latest: HTTP ${latest.status}`);
+        const { version } = await latest.json();
+        if (version === deleted) {
+          throw new Error(`version ${version} still latest after its deletion`);
+        }
+        await sleep(pauseMs);
+        const response = await sendRetrying(
+          langfuse,
+          "DELETE",
+          `${path}/versions/${version}`,
+        );
+        if (!response.ok && response.status !== 404) {
+          throw new Error(`version ${version}: HTTP ${response.status}`);
+        }
+        deleted = version;
+      }
+    } catch (error) {
+      left.push(`${name} (${error.message})`);
+    }
+  }
+  if (left.length > 0) throw new Error(left.join(", "));
 }
 
 /**

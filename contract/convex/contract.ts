@@ -220,3 +220,16 @@ export const pinPrompt = mutation({
   },
   handler: async (ctx, args) => await clients.full.prompts.pin(ctx, args),
 });
+
+export const syncSkills = mutation({
+  args: { names: v.optional(v.array(v.string())) },
+  handler: async (ctx, args) => await clients.full.skills.sync(ctx, args),
+});
+
+export const getSkill = query({
+  args: {
+    name: v.string(),
+    label: v.optional(v.union(v.literal("production"), v.literal("latest"))),
+  },
+  handler: async (ctx, args) => await clients.full.skills.get(ctx, args),
+});
