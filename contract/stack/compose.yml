@@ -19,7 +19,8 @@
 # - The webhook relay listens on port 80, the only plain HTTP port Langfuse
 #   accepts for a webhook, and forwards to the Convex backend's HTTP actions
 #   on the host. `LANGFUSE_WEBHOOK_ALLOWED_HOSTS` lets Langfuse post to its
-#   private address.
+#   private address. It publishes its record of the deliveries on port 8080
+#   of 127.0.0.1.
 # - No AI gateway, no telemetry.
 
 x-langfuse-env: &langfuse-env
@@ -106,6 +107,8 @@ services:
     # besides the pinned ones.
     image: ${LANGFUSE_WEB_IMAGE}
     entrypoint: ["node", "/relay.mjs"]
+    ports:
+      - 127.0.0.1::8080
     environment:
       RELAY_TARGET: http://host.docker.internal:${CONVEX_SITE_PORT}
     volumes:

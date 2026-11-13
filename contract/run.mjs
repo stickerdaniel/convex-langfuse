@@ -342,6 +342,24 @@ async function createWebhooks(webUrl, { email, password, projectId }, secrets) {
 }
 
 /**
+ * The deliveries the stack's relay forwarded, from its `GET /deliveries` at
+ * `relayUrl`, with `at` moved to this process's clock. The offset between
+ * the two clocks is the relay's `now` minus the midpoint of the request.
+ */
+async function relayDeliveries(relayUrl) {
+  const sentAt = Date.now();
+  const response = await fetch(`${relayUrl}/deliveries`, {
+    signal: AbortSignal.timeout(10_000),
+  });
+  const { now, deliveries } = await response.json();
+  const offset = now - (sentAt + Date.now()) / 2;
+  return deliveries.map((delivery) => ({
+    ...delivery,
+    at: Math.round(delivery.at - offset),
+  }));
+}
+
+/**
  * How a suite waits: every deadline of a case times `scale`, `pauseMs`
  * between two reads, and whether a deleted trace or score must be gone from
  * Langfuse.
@@ -364,7 +382,8 @@ const CLOUD_PACE = { scale: 4, pauseMs: 3_000, awaitRemoval: false };
  * reaches the proxy. `webhooks` returns the signing secrets of the prompt
  * webhook and the skill webhook as `{ prompt, skill }` and runs once the
  * host app is deployed. The cases add the name of every skill they create
- * to `ownSkills`.
+ * to `ownSkills`. `deliveries`, where the run sees the webhooks, returns the
+ * relay's record of them on this process's clock.
  */
 async function prepareCases({
   runId,
@@ -374,6 +393,7 @@ async function prepareCases({
   baseUrl,
   keys,
   webhooks,
+  deliveries,
   ownSkills = new Set(),
   pace = DEFAULT_PACE,
 }) {
@@ -429,6 +449,11 @@ async function prepareCases({
     scale: pace.scale,
     /** Names of the skills the cases create, added before the creation. */
     ownSkills,
+    /**
+     * The webhook deliveries the relay forwarded, each `{ at, path, type,
+     * name, status }`; `undefined` where the webhooks bypass the runner.
+     */
+    deliveries,
     steps: [],
     postSpan: (span) => postSpan(langfuse, span),
     poll: (what, read, check, deadlineMs) =>
@@ -639,6 +664,7 @@ export async function startSuite({ stackFile, version }) {
       `http://${(await compose.exec("port", service, String(port))).trim()}`;
     const webUrl = await portOf("langfuse-web", 3000);
     const workerUrl = await portOf("langfuse-worker", 3030);
+    const relayUrl = await portOf("webhook-relay", 8080);
     const langfuse = publicApi({
       baseUrl: webUrl,
       publicKey: secrets.LANGFUSE_PUBLIC_KEY,
@@ -734,6 +760,7 @@ export async function startSuite({ stackFile, version }) {
         await createWebhooks(webUrl, user, webhookSecrets);
         return webhookSecrets;
       },
+      deliveries: () => relayDeliveries(relayUrl),
     });
   };
 
@@ -765,7 +792,10 @@ export async function startSuite({ stackFile, version }) {
  * - `LANGFUSE_SKILL_WEBHOOK_SECRET`: the signing secret of a skill webhook
  *   that the Langfuse project sends to `<site URL>/langfuse/skill-webhook`.
  *   The skill cases switch the deployment's skill cache to track every
- *   skill of the project.
+ *   skill of the project. The webhooks go from Langfuse straight to the
+ *   deployment, so the runner sees no delivery: the label move case checks
+ *   a request queued after the move in `health` instead of a receipt of
+ *   the signed delivery for its skill.
  * - `CONTRACT_PROXY_PORT`, `CONTRACT_PROXY_URL`: the local port of the
  *   recording proxy, and the public URL of a tunnel to that port. The
  *   deployment sends to Langfuse through it, as the local backend does.

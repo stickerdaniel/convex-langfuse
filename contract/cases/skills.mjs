@@ -2,8 +2,9 @@
 // through Langfuse's public API; the cache is read through the client's
 // `skills.get` and `health`, and the component's requests through the
 // recording proxy. The cases rely on the stack's skill webhook, which
-// Langfuse posts through the relay to the component's mounted route. The
-// first case calls `skills.sync()`, so the cache tracks every skill of the
+// Langfuse posts through the relay to the component's mounted route; the
+// label move case reads the relay's record of the deliveries. The first
+// case calls `skills.sync()`, so the cache tracks every skill of the
 // project from then on.
 
 /** How long a refresh may take to reach the cache, times the pace's scale. */
@@ -197,8 +198,17 @@ export default [
 
   {
     name: "skill label move via webhook",
-    oracle: "client result, recording proxy",
-    async run({ langfuse, query, proxy, poll, steps, differences, scale }) {
+    oracle: "client result, recording proxy, relay record",
+    async run({
+      langfuse,
+      query,
+      proxy,
+      deliveries,
+      poll,
+      steps,
+      differences,
+      scale,
+    }) {
       const { name, latest } = shared;
       if (!name) throw new Error("needs the skill cache case before it");
       // Deliveries of the first case's changes may still be on their way.
@@ -221,9 +231,9 @@ export default [
       const movedFrom = Date.now();
       await setLabels(langfuse, name, 2, ["production"]);
       const changedAt = Date.now();
-      // Reported only: with no name due before the move, the first pending
-      // request after it is most likely the delivery's. `oldestDueAt` is the
-      // Convex clock's time at which the route queued it.
+      // Where the run sees no delivery: with no name due before the move,
+      // the first pending request after it is most likely the delivery's.
+      // `oldestDueAt` is the Convex clock's time at which it was queued.
       let deliveredAt;
       let served;
       let readAt;
@@ -263,8 +273,8 @@ export default [
       ];
       if (problems.length > 0) throw new Error(problems.join("; "));
 
-      // The refresh must come from the webhook: no listing request may
-      // start between the PATCH and the first GET of the skill after it.
+      // No listing request may start between the PATCH and the first GET of
+      // the skill after it.
       const after = proxy.records.filter(
         (r) => r.at >= movedFrom && r.at <= readAt,
       );
@@ -295,24 +305,57 @@ export default [
         `PATCH sent to version 2 read ${gated} ms on the host clock ` +
         `(gate ${ms(PUBLISH_GATE_MS)}; PATCH round trip ${changedAt - movedFrom} ms), ` +
         `no listing before the first GET, GETs ${durations.join(", ")} ms`;
-      if (deliveredAt === undefined) {
-        return `${gate}\n  reported: no delivery observed in health`;
-      }
-      const reported = {
-        "change to delivery": deliveredAt - movedFrom,
-        "delivery to first GET": gets[0].at - deliveredAt,
-        "delivery to publication": readAt - deliveredAt,
+      const report = (clock, receivedAt) => {
+        const measured = {
+          "change to delivery": receivedAt - movedFrom,
+          "delivery to first GET": gets[0].at - receivedAt,
+          "delivery to read": readAt - receivedAt,
+        };
+        for (const [step, value] of Object.entries(measured)) {
+          steps.push({ step: `label move: ${step}`, ms: value });
+        }
+        const onTarget = measured["delivery to read"] < PUBLISH_TARGET_MS;
+        return (
+          `${clock}: change to delivery ${measured["change to delivery"]} ms, ` +
+          `delivery to first GET ${measured["delivery to first GET"]} ms, ` +
+          `delivery to read ${measured["delivery to read"]} ms (target under ` +
+          `${ms(PUBLISH_TARGET_MS)}: ${onTarget ? "yes" : "no"})`
+        );
       };
-      for (const [step, value] of Object.entries(reported)) {
-        steps.push({ step: `label move, reported: ${step}`, ms: value });
+
+      if (!deliveries) {
+        if (deliveredAt === undefined) {
+          throw new Error("health showed no request queued after the PATCH");
+        }
+        return (
+          `${gate}\n  the webhook receipt check runs in local mode only` +
+          `\n  ${report("reported, delivery time from health on the Convex clock", deliveredAt)}`
+        );
       }
-      const onTarget = reported["delivery to publication"] < PUBLISH_TARGET_MS;
+      // The relay's record proves that the signed delivery for this skill
+      // reached the route, and that the refresh started after it.
+      const seen = (await deliveries()).filter((d) => d.at >= movedFrom);
+      const receipt = seen.find(
+        (d) =>
+          d.type === "skill-version" && d.name === name && d.status === 200,
+      );
+      if (!receipt) {
+        throw new Error(
+          `no skill-version delivery for ${name} answered 200 after the PATCH; ` +
+            `the relay forwarded: ${
+              seen.map((d) => `${d.type} ${d.name} ${d.status}`).join(", ") ||
+              "nothing"
+            }`,
+        );
+      }
+      if (gets[0].at < receipt.at) {
+        throw new Error(
+          `the first GET started ${receipt.at - gets[0].at} ms before the delivery`,
+        );
+      }
       return (
-        `${gate}\n  reported, delivery time on the Convex clock: change to ` +
-        `delivery ${reported["change to delivery"]} ms, delivery to first GET ` +
-        `${reported["delivery to first GET"]} ms, delivery to publication ` +
-        `${reported["delivery to publication"]} ms (target under ` +
-        `${ms(PUBLISH_TARGET_MS)}: ${onTarget ? "yes" : "no"})`
+        `${gate}, delivery received and answered 200\n  ` +
+        report("delivery on the host clock", receipt.at)
       );
     },
   },
