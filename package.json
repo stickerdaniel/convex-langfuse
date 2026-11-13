@@ -1,5 +1,5 @@
 {
-  "name": "convex-langfuse",
+  "name": "@stickerdaniel/convex-langfuse",
   "description": "Export LLM traces and scores from a Convex app to Langfuse through a transactional outbox, with a prompt cache.",
   "repository": {
     "type": "git",
@@ -52,7 +52,10 @@
   "files": [
     "dist",
     "src",
-    "NOTICE"
+    "NOTICE",
+    "!src/**/*.test.ts",
+    "!src/**/*.test-d.ts",
+    "!src/**/*.test-util.ts"
   ],
   "exports": {
     "./package.json": "./package.json",
@@ -118,5 +121,8 @@
   "module": "./dist/client/index.js",
   "dependencies": {
     "@convex-dev/batch-worker": "^0.3.6"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -1,5 +1,5 @@
 import { v, type Infer } from "convex/values";
-import { Langfuse } from "convex-langfuse";
+import { Langfuse } from "@stickerdaniel/convex-langfuse";
 import { components } from "./_generated/api";
 import { action, mutation, query } from "./_generated/server";
 

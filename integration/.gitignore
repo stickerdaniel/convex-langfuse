@@ -1,6 +1,6 @@
 # Backend binaries downloaded by run.mjs.
 /.cache/
-# The convex-langfuse link run.mjs creates.
+# The @stickerdaniel/convex-langfuse link run.mjs creates.
 /node_modules/
 # Written and removed by the redeploy case.
 /convex/redeploy.ts

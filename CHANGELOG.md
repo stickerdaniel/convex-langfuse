@@ -6,6 +6,8 @@
 
 The component is rebuilt on a transactional outbox, with a new client API.
 
+- The package is published as `@stickerdaniel/convex-langfuse`. The package
+  `convex-langfuse` without the scope is the upstream project.
 - `new Langfuse(component, { content })` replaces the constructor options
   `publicKey`, `secretKey` and `baseUrl`. The Langfuse keys and the base URL are
   component env values, bound in `convex.config.ts`. `content` is required.

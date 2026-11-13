@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { defineScores, Langfuse } from "convex-langfuse";
+import { defineScores, Langfuse } from "@stickerdaniel/convex-langfuse";
 import { components } from "./_generated/api";
 import { action, mutation, query } from "./_generated/server";
 

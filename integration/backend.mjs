@@ -417,12 +417,13 @@ export function convexCli(dir) {
     };
   }
 
-  /** Links `convex-langfuse` to the repository, as `npm install` would. */
+  /** Links `@stickerdaniel/convex-langfuse` to the repository, as `npm install` would. */
   function linkPackage() {
-    const link = join(dir, "node_modules", "convex-langfuse");
+    const scope = join(dir, "node_modules", "@stickerdaniel");
+    const link = join(scope, "convex-langfuse");
     if (existsSync(link)) return;
-    mkdirSync(join(dir, "node_modules"), { recursive: true });
-    symlinkSync("../..", link, "dir");
+    mkdirSync(scope, { recursive: true });
+    symlinkSync("../../..", link, "dir");
   }
 
   return { convex, setEnv, streamLogs, linkPackage };

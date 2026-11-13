@@ -47,5 +47,5 @@ export declare const internal: FilterApi<
 >;
 
 export declare const components: {
-  convexLangfuse: import("convex-langfuse/_generated/component.js").ComponentApi<"convexLangfuse">;
+  convexLangfuse: import("@stickerdaniel/convex-langfuse/_generated/component.js").ComponentApi<"convexLangfuse">;
 };

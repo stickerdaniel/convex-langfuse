@@ -2,9 +2,9 @@
   "name": "convex-langfuse-integration",
   "private": true,
   "type": "module",
-  "description": "Host app for the real-backend integration run. `run.mjs` links `convex-langfuse` to the repository root.",
+  "description": "Host app for the real-backend integration run. `run.mjs` links `@stickerdaniel/convex-langfuse` to the repository root.",
   "dependencies": {
     "convex": "1.49.0",
-    "convex-langfuse": "file:.."
+    "@stickerdaniel/convex-langfuse": "file:.."
   }
 }
