@@ -1,5 +1,5 @@
 # The Langfuse stack of the contract suite: web, worker, Postgres,
-# ClickHouse, Redis and MinIO, plus a relay for the prompt webhook.
+# ClickHouse, Redis and MinIO, plus a relay for the prompt and skill webhooks.
 #
 # `contract/run.mjs` starts it with a project name of its own per run
 # (`docker compose -p`), so every run gets fresh volumes and networks, and

@@ -14,13 +14,13 @@
 // the client's result in Convex, or from the proxy's record of the
 // component's requests. Each case names that oracle.
 //
-// Every run has an id. Every trace seed, prompt name, score id, model name
-// and the environment carry it, and the stack runs as its own Compose
-// project, so two runs at the same time share nothing. Every key, password
-// and secret is generated per run. Those of the stack reach Docker and the
-// containers through the environment only. The Convex backend takes its
-// instance secret as an argument (`integration/backend.mjs`), which a local
-// process can read while the run lasts. A run prints one line per case,
+// Every run has an id. Every trace seed, prompt name, skill name, score id,
+// model name and the environment carry it, and the stack runs as its own
+// Compose project, so two runs at the same time share nothing. Every key,
+// password and secret is generated per run. Those of the stack reach Docker
+// and the containers through the environment only. The Convex backend takes
+// its instance secret as an argument (`integration/backend.mjs`), which a
+// local process can read while the run lasts. A run prints one line per case,
 // writes its logs to `contract/logs/<run id>/` after scanning them for every
 // generated secret, and removes what it started, also when it is interrupted.
 
@@ -58,6 +58,7 @@ import scores from "./cases/scores.mjs";
 import prompts from "./cases/prompts.mjs";
 import privacy from "./cases/privacy.mjs";
 import delivery from "./cases/delivery.mjs";
+import skills from "./cases/skills.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const COMPOSE_FILE = join(HERE, "stack", "compose.yml");
@@ -73,6 +74,7 @@ export const CASES = [
   ...prompts,
   ...privacy,
   ...delivery,
+  ...skills,
 ];
 
 /** The stack must answer the canary within this time after `compose up`. */
@@ -267,11 +269,12 @@ async function postSpan(langfuse, span) {
 }
 
 /**
- * Signs in as the provisioned user and creates the prompt webhook through
- * the `automations.createAutomation` procedure, which the UI uses too.
- * Returns the signing secret Langfuse generated.
+ * Signs in as the provisioned user and creates the prompt webhook and the
+ * skill webhook through the `automations.createAutomation` procedure, which
+ * the UI uses too. Each targets its route of the component through the
+ * relay. Returns the signing secret Langfuse generated for each.
  */
-async function createWebhook(webUrl, { email, password, projectId }) {
+async function createWebhooks(webUrl, { email, password, projectId }) {
   const cookies = new Map();
   const keep = (response) => {
     for (const line of response.headers.getSetCookie()) {
@@ -298,36 +301,41 @@ async function createWebhook(webUrl, { email, password, projectId }) {
   if (!cookies.has("next-auth.session-token")) {
     throw new Error(`sign-in failed: HTTP ${login.status}`);
   }
-  const created = await fetch(
-    `${webUrl}/api/trpc/automations.createAutomation`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json", cookie: cookie() },
-      body: JSON.stringify({
-        json: {
-          projectId,
-          name: "convex-langfuse prompt webhook",
-          eventSource: "prompt",
-          eventAction: ["created", "updated", "deleted"],
-          filter: [],
-          status: "ACTIVE",
-          actionType: "WEBHOOK",
-          actionConfig: {
-            type: "WEBHOOK",
-            url: "http://webhook-relay/langfuse/prompt-webhook",
-            apiVersion: { prompt: "v1" },
-            requestHeaders: {},
+  const create = async (source) => {
+    const created = await fetch(
+      `${webUrl}/api/trpc/automations.createAutomation`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie: cookie() },
+        body: JSON.stringify({
+          json: {
+            projectId,
+            name: `convex-langfuse ${source} webhook`,
+            eventSource: source,
+            eventAction: ["created", "updated", "deleted"],
+            filter: [],
+            status: "ACTIVE",
+            actionType: "WEBHOOK",
+            actionConfig: {
+              type: "WEBHOOK",
+              url: `http://webhook-relay/langfuse/${source}-webhook`,
+              apiVersion: { [source]: "v1" },
+              requestHeaders: {},
+            },
           },
-        },
-      }),
-    },
-  );
-  const body = await created.json();
-  const secret = body?.result?.data?.json?.webhookSecret;
-  if (!created.ok || typeof secret !== "string") {
-    throw new Error(`webhook creation failed: HTTP ${created.status}`);
-  }
-  return secret;
+        }),
+      },
+    );
+    const body = await created.json();
+    const secret = body?.result?.data?.json?.webhookSecret;
+    if (!created.ok || typeof secret !== "string") {
+      throw new Error(
+        `${source} webhook creation failed: HTTP ${created.status}`,
+      );
+    }
+    return secret;
+  };
+  return { prompt: await create("prompt"), skill: await create("skill") };
 }
 
 /**
@@ -350,8 +358,9 @@ const CLOUD_PACE = { scale: 4, pauseMs: 3_000, awaitRemoval: false };
  * returns the context every case gets, with `deploy` to deploy again and the
  * Convex CLI's `convex`. `backend` has `url` and either `adminKey` or, for a
  * Convex Cloud deployment, `deployKey`. `baseUrl` is where the component
- * reaches the proxy. `webhook` returns the signing secret of the prompt
- * webhook and runs once the host app is deployed.
+ * reaches the proxy. `webhooks` returns the signing secrets of the prompt
+ * webhook and the skill webhook as `{ prompt, skill }` and runs once the
+ * host app is deployed.
  */
 async function prepareCases({
   runId,
@@ -360,7 +369,7 @@ async function prepareCases({
   proxy,
   baseUrl,
   keys,
-  webhook,
+  webhooks,
   pace = DEFAULT_PACE,
 }) {
   const { convex, setEnv, linkPackage } = convexCli(HERE);
@@ -369,12 +378,14 @@ async function prepareCases({
     convex(backend, ["deploy", "--yes", "--codegen", "disable"]);
   await deploy();
   const environment = `contract-${runId}`;
+  const secrets = await webhooks();
   const settings = {
     LANGFUSE_PUBLIC_KEY: keys.publicKey,
     LANGFUSE_SECRET_KEY: keys.secretKey,
     LANGFUSE_BASE_URL: baseUrl,
     LANGFUSE_TRACING_ENVIRONMENT: environment,
-    LANGFUSE_WEBHOOK_SECRET: await webhook(),
+    LANGFUSE_WEBHOOK_SECRET: secrets.prompt,
+    LANGFUSE_SKILL_WEBHOOK_SECRET: secrets.skill,
   };
   for (const [name, value] of Object.entries(settings)) {
     await setEnv(backend, name, value);
@@ -409,6 +420,8 @@ async function prepareCases({
     awaitRemoval: pace.awaitRemoval,
     /** The pause between two reads of a loop that runs outside `poll`. */
     readPauseMs: Math.max(1_000, pace.pauseMs),
+    /** The factor of every case deadline, for a wait that runs outside `poll`. */
+    scale: pace.scale,
     steps: [],
     postSpan: (span) => postSpan(langfuse, span),
     poll: (what, read, check, deadlineMs) =>
@@ -554,7 +567,7 @@ export async function startSuite({ stackFile, version }) {
   const measures = { peakMemoryMib: 0 };
   const steps = [];
   let proxy;
-  let webhookSecret;
+  let webhookSecrets;
   let stopped = false;
   process.on("exit", () => {
     if (stopped) return;
@@ -591,7 +604,8 @@ export async function startSuite({ stackFile, version }) {
         ).toString("base64"),
         "the backend's instance secret": backend.secret,
         "the backend's admin key": backend.adminKey,
-        "the webhook secret": webhookSecret,
+        "the webhook secret": webhookSecrets?.prompt,
+        "the skill webhook secret": webhookSecrets?.skill,
       },
     });
     await proxy?.stop();
@@ -708,7 +722,8 @@ export async function startSuite({ stackFile, version }) {
         publicKey: secrets.LANGFUSE_PUBLIC_KEY,
         secretKey: secrets.LANGFUSE_SECRET_KEY,
       },
-      webhook: async () => (webhookSecret = await createWebhook(webUrl, user)),
+      webhooks: async () =>
+        (webhookSecrets = await createWebhooks(webUrl, user)),
     });
   };
 
@@ -737,12 +752,16 @@ export async function startSuite({ stackFile, version }) {
  *   deployed to. Use one for tests: its functions are public.
  * - `LANGFUSE_WEBHOOK_SECRET`: the signing secret of a prompt webhook that
  *   the Langfuse project sends to `<site URL>/langfuse/prompt-webhook`.
+ * - `LANGFUSE_SKILL_WEBHOOK_SECRET`: the signing secret of a skill webhook
+ *   that the Langfuse project sends to `<site URL>/langfuse/skill-webhook`.
+ *   The skill cases switch the deployment's skill cache to track every
+ *   skill of the project.
  * - `CONTRACT_PROXY_PORT`, `CONTRACT_PROXY_URL`: the local port of the
  *   recording proxy, and the public URL of a tunnel to that port. The
  *   deployment sends to Langfuse through it, as the local backend does.
  *
  * `stop` unbinds the component's base URL, which disables the export, and
- * deletes the prompts of the run.
+ * deletes the prompts and skills of the run.
  */
 export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const need = (name) => {
@@ -761,6 +780,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     deployKey: need("CONVEX_DEPLOY_KEY"),
   };
   const webhookSecret = need("LANGFUSE_WEBHOOK_SECRET");
+  const skillWebhookSecret = need("LANGFUSE_SKILL_WEBHOOK_SECRET");
   const proxyUrl = need("CONTRACT_PROXY_URL").replace(/\/+$/, "");
   const proxyPort = Number(need("CONTRACT_PROXY_PORT"));
 
@@ -796,6 +816,10 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     await deletePrompts(langfuse, `contract-${runId}-`).catch((error) =>
       failures.push(`prompts of the run left in Langfuse: ${error.message}`),
     );
+    await deleteSkills(langfuse, `contract-${runId}-`, pace.pauseMs).catch(
+      (error) =>
+        failures.push(`skills of the run left in Langfuse: ${error.message}`),
+    );
     for (const failure of failures) print(`cleanup failed: ${failure}`);
     const logs = await collectLogs({
       runId,
@@ -810,6 +834,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
         ).toString("base64"),
         "the deploy key": backend.deployKey,
         "the webhook secret": webhookSecret,
+        "the skill webhook secret": skillWebhookSecret,
       },
     });
     await proxy.stop();
@@ -883,7 +908,10 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
       proxy,
       baseUrl: proxyUrl,
       keys,
-      webhook: async () => webhookSecret,
+      webhooks: async () => ({
+        prompt: webhookSecret,
+        skill: skillWebhookSecret,
+      }),
       pace,
     });
     measures.bootMs = Date.now() - bootStart;
@@ -929,6 +957,36 @@ async function deletePrompts(langfuse, prefix) {
       `/api/public/v2/prompts/${encodeURIComponent(name)}`,
     );
     if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+  }
+}
+
+/**
+ * Deletes every version of every skill of the project whose name starts
+ * with `prefix`, `pauseMs` apart. The public API deletes one version at a
+ * time, so it tries each number from the latest down to 1; a 404 is a
+ * version deleted earlier.
+ */
+async function deleteSkills(langfuse, prefix, pauseMs) {
+  const skills = [];
+  for (let page = 1; ; page++) {
+    const { data, meta } = await langfuse.get(
+      `/api/public/skills?page=${page}&limit=100`,
+    );
+    skills.push(...data);
+    if (!meta.hasNextPage) break;
+  }
+  for (const { name, latestVersion } of skills) {
+    if (!name.startsWith(prefix)) continue;
+    for (let version = latestVersion; version >= 1; version--) {
+      await sleep(pauseMs);
+      const response = await langfuse.send(
+        "DELETE",
+        `/api/public/skills/${encodeURIComponent(name)}/versions/${version}`,
+      );
+      if (!response.ok && response.status !== 404) {
+        throw new Error(`${name} version ${version}: HTTP ${response.status}`);
+      }
+    }
   }
 }
 

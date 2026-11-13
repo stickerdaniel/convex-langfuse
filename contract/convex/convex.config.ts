@@ -4,7 +4,8 @@ import convexLangfuse from "@stickerdaniel/convex-langfuse/convex.config.js";
 
 // The app declares the Langfuse settings and binds them to the component by
 // reference; the contract runner sets them with `npx convex env set`. The
-// prompt webhook is served at `<site url>/langfuse/prompt-webhook`.
+// prompt webhook is served at `<site url>/langfuse/prompt-webhook`, the
+// skill webhook at `<site url>/langfuse/skill-webhook`.
 const app = defineApp({
   env: {
     LANGFUSE_PUBLIC_KEY: v.optional(v.string()),
@@ -12,6 +13,7 @@ const app = defineApp({
     LANGFUSE_BASE_URL: v.optional(v.string()),
     LANGFUSE_TRACING_ENVIRONMENT: v.optional(v.string()),
     LANGFUSE_WEBHOOK_SECRET: v.optional(v.string()),
+    LANGFUSE_SKILL_WEBHOOK_SECRET: v.optional(v.string()),
   },
 });
 app.use(convexLangfuse, {
@@ -22,6 +24,7 @@ app.use(convexLangfuse, {
     LANGFUSE_BASE_URL: app.env.LANGFUSE_BASE_URL,
     LANGFUSE_TRACING_ENVIRONMENT: app.env.LANGFUSE_TRACING_ENVIRONMENT,
     LANGFUSE_WEBHOOK_SECRET: app.env.LANGFUSE_WEBHOOK_SECRET,
+    LANGFUSE_SKILL_WEBHOOK_SECRET: app.env.LANGFUSE_SKILL_WEBHOOK_SECRET,
   },
 });
 

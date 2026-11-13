@@ -47,19 +47,24 @@ npm run test:contract:faults
 
 With `--cloud`, the same cases run against Langfuse Cloud and a Convex Cloud
 deployment, in 6 to 12 minutes. The suite deploys its host app there, so use a
-deployment that holds nothing else. Two things need a one-time setup:
+deployment that holds nothing else. The skill cases switch its skill cache to
+track every skill of the Langfuse project. Three things need a one-time setup:
 
 - a public URL that forwards to the suite's recording proxy on your machine, for
   example a tunnel to port 8787. The component in Convex Cloud sends its
   requests there.
 - a prompt webhook in the Langfuse project with the URL
   `https://<deployment>.convex.site/langfuse/prompt-webhook`.
+- a skill webhook in the Langfuse project with the URL
+  `https://<deployment>.convex.site/langfuse/skill-webhook`. It has a signing
+  secret of its own.
 
 ```sh
 export LANGFUSE_BASE_URL=https://cloud.langfuse.com
 export LANGFUSE_PUBLIC_KEY=pk-lf-...
 export LANGFUSE_SECRET_KEY=sk-lf-...
 export LANGFUSE_WEBHOOK_SECRET=lf-whsec_...
+export LANGFUSE_SKILL_WEBHOOK_SECRET=lf-whsec_...
 export CONVEX_URL=https://<deployment>.convex.cloud
 export CONVEX_DEPLOY_KEY=prod:...
 export CONTRACT_PROXY_PORT=8787
@@ -68,11 +73,11 @@ node contract/run.mjs --cloud
 ```
 
 At the end, and on SIGINT or SIGTERM, the suite removes `LANGFUSE_BASE_URL` from
-the deployment, which stops its export, and deletes its prompts. A run whose
-cleanup fails exits with 1 and names what is left. A run killed with SIGKILL
-skips the cleanup; then run `npx convex env remove LANGFUSE_BASE_URL` with the
-deploy key. The other settings, the host app, the score configs, the prompt
-webhook and the run's traces and scores stay. The traces carry the environment
+the deployment, which stops its export, and deletes its prompts and skills. A
+run whose cleanup fails exits with 1 and names what is left. A run killed with
+SIGKILL skips the cleanup; then run `npx convex env remove LANGFUSE_BASE_URL`
+with the deploy key. The other settings, the host app, the score configs, the
+webhooks and the run's traces and scores stay. The traces carry the environment
 `contract-<run id>`, except the canary trace the suite sends before its cases.
 
 Langfuse Cloud differs from the local stack in three ways, and the cloud run
