@@ -272,9 +272,11 @@ async function postSpan(langfuse, span) {
  * Signs in as the provisioned user and creates the prompt webhook and the
  * skill webhook through the `automations.createAutomation` procedure, which
  * the UI uses too. Each targets its route of the component through the
- * relay. Returns the signing secret Langfuse generated for each.
+ * relay. Stores the signing secret Langfuse generated for each in
+ * `secrets.prompt` and `secrets.skill` as soon as it is created, so the log
+ * scan covers a secret also when a later step fails.
  */
-async function createWebhooks(webUrl, { email, password, projectId }) {
+async function createWebhooks(webUrl, { email, password, projectId }, secrets) {
   const cookies = new Map();
   const keep = (response) => {
     for (const line of response.headers.getSetCookie()) {
@@ -333,9 +335,10 @@ async function createWebhooks(webUrl, { email, password, projectId }) {
         `${source} webhook creation failed: HTTP ${created.status}`,
       );
     }
-    return secret;
+    secrets[source] = secret;
   };
-  return { prompt: await create("prompt"), skill: await create("skill") };
+  await create("prompt");
+  await create("skill");
 }
 
 /**
@@ -360,7 +363,8 @@ const CLOUD_PACE = { scale: 4, pauseMs: 3_000, awaitRemoval: false };
  * Convex Cloud deployment, `deployKey`. `baseUrl` is where the component
  * reaches the proxy. `webhooks` returns the signing secrets of the prompt
  * webhook and the skill webhook as `{ prompt, skill }` and runs once the
- * host app is deployed.
+ * host app is deployed. The cases add the name of every skill they create
+ * to `ownSkills`.
  */
 async function prepareCases({
   runId,
@@ -370,6 +374,7 @@ async function prepareCases({
   baseUrl,
   keys,
   webhooks,
+  ownSkills = new Set(),
   pace = DEFAULT_PACE,
 }) {
   const { convex, setEnv, linkPackage } = convexCli(HERE);
@@ -422,6 +427,8 @@ async function prepareCases({
     readPauseMs: Math.max(1_000, pace.pauseMs),
     /** The factor of every case deadline, for a wait that runs outside `poll`. */
     scale: pace.scale,
+    /** Names of the skills the cases create, added before the creation. */
+    ownSkills,
     steps: [],
     postSpan: (span) => postSpan(langfuse, span),
     poll: (what, read, check, deadlineMs) =>
@@ -567,7 +574,8 @@ export async function startSuite({ stackFile, version }) {
   const measures = { peakMemoryMib: 0 };
   const steps = [];
   let proxy;
-  let webhookSecrets;
+  /** Filled by `createWebhooks` as each automation is created. */
+  const webhookSecrets = {};
   let stopped = false;
   process.on("exit", () => {
     if (stopped) return;
@@ -604,8 +612,8 @@ export async function startSuite({ stackFile, version }) {
         ).toString("base64"),
         "the backend's instance secret": backend.secret,
         "the backend's admin key": backend.adminKey,
-        "the webhook secret": webhookSecrets?.prompt,
-        "the skill webhook secret": webhookSecrets?.skill,
+        "the webhook secret": webhookSecrets.prompt,
+        "the skill webhook secret": webhookSecrets.skill,
       },
     });
     await proxy?.stop();
@@ -722,8 +730,10 @@ export async function startSuite({ stackFile, version }) {
         publicKey: secrets.LANGFUSE_PUBLIC_KEY,
         secretKey: secrets.LANGFUSE_SECRET_KEY,
       },
-      webhooks: async () =>
-        (webhookSecrets = await createWebhooks(webUrl, user)),
+      webhooks: async () => {
+        await createWebhooks(webUrl, user, webhookSecrets);
+        return webhookSecrets;
+      },
     });
   };
 
@@ -794,6 +804,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const langfuse = publicApi({ baseUrl: langfuseUrl, ...keys });
   const proxy = await startProxy(langfuseUrl, proxyPort);
   const { convex } = convexCli(HERE);
+  const ownSkills = new Set();
 
   // Runs once, also from a signal. A failed unbinding fails the run, because
   // the deployment would go on exporting through the tunnel. It waits for
@@ -816,9 +827,8 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     await deletePrompts(langfuse, `contract-${runId}-`).catch((error) =>
       failures.push(`prompts of the run left in Langfuse: ${error.message}`),
     );
-    await deleteSkills(langfuse, `contract-${runId}-`, pace.pauseMs).catch(
-      (error) =>
-        failures.push(`skills of the run left in Langfuse: ${error.message}`),
+    await deleteSkills(langfuse, ownSkills, pace.pauseMs).catch((error) =>
+      failures.push(`skills of the run left in Langfuse: ${error.message}`),
     );
     for (const failure of failures) print(`cleanup failed: ${failure}`);
     const logs = await collectLogs({
@@ -912,6 +922,7 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
         prompt: webhookSecret,
         skill: skillWebhookSecret,
       }),
+      ownSkills,
       pace,
     });
     measures.bootMs = Date.now() - bootStart;
@@ -961,33 +972,99 @@ async function deletePrompts(langfuse, prefix) {
 }
 
 /**
- * Deletes every version of every skill of the project whose name starts
- * with `prefix`, `pauseMs` apart. The public API deletes one version at a
- * time, so it tries each number from the latest down to 1; a 404 is a
- * version deleted earlier.
+ * Tries per cleanup request: a 429, a 5xx or a network error is tried
+ * again until this many tries are used.
  */
-async function deleteSkills(langfuse, prefix, pauseMs) {
-  const skills = [];
-  for (let page = 1; ; page++) {
-    const { data, meta } = await langfuse.get(
-      `/api/public/skills?page=${page}&limit=100`,
-    );
-    skills.push(...data);
-    if (!meta.hasNextPage) break;
+const CLEANUP_TRIES = 3;
+/** Wait after a 429 without a `Retry-After` the cleanup can read. */
+const CLEANUP_RETRY_AFTER_MS = 60_000;
+/** A 429 that asks for a longer wait ends the tries. */
+const CLEANUP_MAX_WAIT_MS = 5 * 60_000;
+/** Wait after a 5xx or a network error. */
+const CLEANUP_BACKOFF_MS = 5_000;
+
+/** A `Retry-After` value, in seconds or as an HTTP date, in milliseconds. */
+function retryAfterMs(value, now) {
+  if (value === null) return undefined;
+  if (/^\d+$/.test(value.trim())) return Number(value) * 1_000;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+/**
+ * `langfuse.send` for the cleanup. A 429 is sent again after its
+ * `Retry-After`, 60 s without one; a 5xx or a network error after 5 s.
+ * Returns the last response, or throws the last network error, once
+ * `CLEANUP_TRIES` tries are used.
+ */
+async function sendRetrying(langfuse, method, path) {
+  for (let attempt = 1; ; attempt++) {
+    let response;
+    let wait = CLEANUP_BACKOFF_MS;
+    try {
+      response = await langfuse.send(method, path);
+    } catch (error) {
+      if (attempt >= CLEANUP_TRIES) throw error;
+    }
+    if (response && response.status !== 429 && response.status < 500) {
+      return response;
+    }
+    if (response?.status === 429) {
+      wait =
+        retryAfterMs(response.headers.get("retry-after"), Date.now()) ??
+        CLEANUP_RETRY_AFTER_MS;
+    }
+    if (response && (attempt >= CLEANUP_TRIES || wait > CLEANUP_MAX_WAIT_MS)) {
+      return response;
+    }
+    await response?.body?.cancel();
+    await sleep(wait);
   }
-  for (const { name, latestVersion } of skills) {
-    if (!name.startsWith(prefix)) continue;
-    for (let version = latestVersion; version >= 1; version--) {
-      await sleep(pauseMs);
-      const response = await langfuse.send(
-        "DELETE",
-        `/api/public/skills/${encodeURIComponent(name)}/versions/${version}`,
-      );
-      if (!response.ok && response.status !== 404) {
-        throw new Error(`${name} version ${version}: HTTP ${response.status}`);
+}
+
+/**
+ * Deletes every version of each skill in `names`, `pauseMs` between two
+ * requests. The public API deletes one version at a time and moves
+ * `latest` to the highest version left, so the cleanup deletes the version
+ * `latest` holds until the label answers 404, which shows that no version
+ * is left. A failed name does not stop the others; the error names every
+ * skill left.
+ */
+async function deleteSkills(langfuse, names, pauseMs) {
+  const left = [];
+  for (const name of names) {
+    const path = `/api/public/skills/${encodeURIComponent(name)}`;
+    try {
+      let deleted;
+      for (;;) {
+        await sleep(pauseMs);
+        const latest = await sendRetrying(
+          langfuse,
+          "GET",
+          `${path}?label=latest`,
+        );
+        if (latest.status === 404) break;
+        if (!latest.ok) throw new Error(`latest: HTTP ${latest.status}`);
+        const { version } = await latest.json();
+        if (version === deleted) {
+          throw new Error(`version ${version} still latest after its deletion`);
+        }
+        await sleep(pauseMs);
+        const response = await sendRetrying(
+          langfuse,
+          "DELETE",
+          `${path}/versions/${version}`,
+        );
+        if (!response.ok && response.status !== 404) {
+          throw new Error(`version ${version}: HTTP ${response.status}`);
+        }
+        deleted = version;
       }
+    } catch (error) {
+      left.push(`${name} (${error.message})`);
     }
   }
+  if (left.length > 0) throw new Error(left.join(", "));
 }
 
 /**

@@ -8,7 +8,10 @@
 
 /** How long a refresh may take to reach the cache, times the pace's scale. */
 const REFRESH_MS = 60_000;
-/** Hard gate: a label move is served this long after its delivery at most. */
+/**
+ * Hard gate on the host clock: from sending a label move's PATCH to the end
+ * of the first read that returns the new version.
+ */
 const PUBLISH_GATE_MS = 60_000;
 /** Target for delivery to publication with an idle loop; reported only. */
 const PUBLISH_TARGET_MS = 10_000;
@@ -126,8 +129,17 @@ export default [
   {
     name: "skill cache: sync, both labels byte for byte",
     oracle: "client result, Langfuse API",
-    async run({ runId, langfuse, mutation, query, poll, differences }) {
+    async run({
+      runId,
+      langfuse,
+      mutation,
+      query,
+      poll,
+      differences,
+      ownSkills,
+    }) {
       const name = `contract-${runId}-weather`;
+      ownSkills.add(name);
       // Version 1 holds `production`, version 2 `latest`.
       await createSkill(langfuse, versionOneFiles(name));
       await createSkill(langfuse, versionTwoFiles(name));
@@ -201,45 +213,49 @@ export default [
       await idle();
       await sleep(QUIET_MS * scale);
       await idle();
+
+      // The gate runs on the host clock, from sending the PATCH to the end
+      // of the first read that returns version 2. It includes Langfuse's
+      // delivery latency. Langfuse changes the labels while it answers the
+      // PATCH and can deliver before the answer arrives.
       const movedFrom = Date.now();
       await setLabels(langfuse, name, 2, ["production"]);
       const changedAt = Date.now();
-
-      // With no name due before the move, the first pending request after
-      // it is the delivery's: `oldestDueAt` is the time the route queued it.
+      // Reported only: with no name due before the move, the first pending
+      // request after it is most likely the delivery's. `oldestDueAt` is the
+      // Convex clock's time at which the route queued it.
       let deliveredAt;
-      let publishedAt;
       let served;
+      let readAt;
       for (;;) {
         const [health, skill] = await Promise.all([
           query("health", {}),
           query("getSkill", { name }),
         ]);
-        const now = Date.now();
+        readAt = Date.now();
         const queuedAt = health.skills.oldestDueAt;
         if (deliveredAt === undefined && queuedAt >= movedFrom) {
           deliveredAt = queuedAt;
         }
+        const elapsed = readAt - movedFrom;
         if (skill?.version === 2) {
-          publishedAt = now;
+          // A read that returns late fails, also when it succeeds.
+          if (elapsed > PUBLISH_GATE_MS) {
+            throw new Error(
+              `version 2 first read ${ms(elapsed)} after the PATCH, ` +
+                `over the ${ms(PUBLISH_GATE_MS)} gate`,
+            );
+          }
           served = skill;
           break;
         }
-        if (deliveredAt === undefined && now - changedAt > REFRESH_MS * scale) {
+        if (elapsed > PUBLISH_GATE_MS) {
           throw new Error(
-            `no signed delivery reached the route within ${ms(REFRESH_MS * scale)}`,
-          );
-        }
-        if (deliveredAt !== undefined && now - deliveredAt > PUBLISH_GATE_MS) {
-          throw new Error(
-            `version 2 not served ${ms(PUBLISH_GATE_MS)} after the delivery; ` +
+            `version 2 not read within ${ms(PUBLISH_GATE_MS)} of the PATCH; ` +
               `get returned ${JSON.stringify(skill?.version ?? null)}`,
           );
         }
         await sleep(WATCH_PAUSE_MS);
-      }
-      if (deliveredAt === undefined) {
-        throw new Error("version 2 served without an observed delivery");
       }
       const problems = [
         ...differences(served, { name, version: 2 }),
@@ -247,35 +263,56 @@ export default [
       ];
       if (problems.length > 0) throw new Error(problems.join("; "));
 
-      const gets = proxy.records.filter(
-        (r) =>
-          r.path.startsWith(`${SKILLS_PATH}/${name}?`) &&
-          r.at >= deliveredAt &&
-          r.at <= publishedAt,
+      // The refresh must come from the webhook: no listing request may
+      // start between the PATCH and the first GET of the skill after it.
+      const after = proxy.records.filter(
+        (r) => r.at >= movedFrom && r.at <= readAt,
+      );
+      const gets = after.filter((r) =>
+        r.path.startsWith(`${SKILLS_PATH}/${name}?`),
       );
       if (gets.length === 0) {
-        throw new Error("no GET for the skill after the delivery");
+        throw new Error("version 2 read without a GET of the skill");
       }
-      // Langfuse changes the labels while it answers the PATCH, and can
-      // deliver before the answer arrives, so the change counts from the send.
-      const measured = {
-        "change to delivery": deliveredAt - movedFrom,
-        "delivery to first GET": gets[0].at - deliveredAt,
-        "delivery to publication": publishedAt - deliveredAt,
-      };
-      for (const [step, value] of Object.entries(measured)) {
-        steps.push({ step: `label move: ${step}`, ms: value });
+      const listings = after.filter(
+        (r) => r.path.startsWith(`${SKILLS_PATH}?`) && r.at <= gets[0].at,
+      );
+      if (listings.length > 0) {
+        throw new Error(
+          `${listings.length} listing requests before the first GET of the skill`,
+        );
       }
+
+      const gated = readAt - movedFrom;
+      steps.push({
+        step: "label move: PATCH sent to version 2 read",
+        ms: gated,
+        deadlineMs: PUBLISH_GATE_MS,
+      });
       const durations = gets.map((r) => r.answeredAt - r.at);
       steps.push({ step: "label move: GET durations", ms: durations });
-      const onTarget = measured["delivery to publication"] < PUBLISH_TARGET_MS;
+      const gate =
+        `PATCH sent to version 2 read ${gated} ms on the host clock ` +
+        `(gate ${ms(PUBLISH_GATE_MS)}; PATCH round trip ${changedAt - movedFrom} ms), ` +
+        `no listing before the first GET, GETs ${durations.join(", ")} ms`;
+      if (deliveredAt === undefined) {
+        return `${gate}\n  reported: no delivery observed in health`;
+      }
+      const reported = {
+        "change to delivery": deliveredAt - movedFrom,
+        "delivery to first GET": gets[0].at - deliveredAt,
+        "delivery to publication": readAt - deliveredAt,
+      };
+      for (const [step, value] of Object.entries(reported)) {
+        steps.push({ step: `label move, reported: ${step}`, ms: value });
+      }
+      const onTarget = reported["delivery to publication"] < PUBLISH_TARGET_MS;
       return (
-        `change to delivery ${measured["change to delivery"]} ms (PATCH ` +
-        `round trip ${changedAt - movedFrom} ms, not gated), delivery to first ` +
-        `GET ${measured["delivery to first GET"]} ms, GETs ` +
-        `${durations.join(", ")} ms, delivery to publication ` +
-        `${measured["delivery to publication"]} ms (gate ${ms(PUBLISH_GATE_MS)}; ` +
-        `target under ${ms(PUBLISH_TARGET_MS)}: ${onTarget ? "yes" : "no"})`
+        `${gate}\n  reported, delivery time on the Convex clock: change to ` +
+        `delivery ${reported["change to delivery"]} ms, delivery to first GET ` +
+        `${reported["delivery to first GET"]} ms, delivery to publication ` +
+        `${reported["delivery to publication"]} ms (target under ` +
+        `${ms(PUBLISH_TARGET_MS)}: ${onTarget ? "yes" : "no"})`
       );
     },
   },
@@ -283,8 +320,17 @@ export default [
   {
     name: "deleted skill served as null",
     oracle: "client result",
-    async run({ runId, langfuse, mutation, query, poll, differences }) {
+    async run({
+      runId,
+      langfuse,
+      mutation,
+      query,
+      poll,
+      differences,
+      ownSkills,
+    }) {
       const name = `contract-${runId}-deleted`;
+      ownSkills.add(name);
       await mutation("syncSkills", {});
       await createSkill(langfuse, versionOneFiles(name));
       await setLabels(langfuse, name, 1, ["production"]);
