@@ -69,12 +69,11 @@ node contract/run.mjs --cloud
 
 At the end, and on SIGINT or SIGTERM, the suite removes `LANGFUSE_BASE_URL` from
 the deployment, which stops its export, and deletes its prompts. A run whose
-cleanup fails exits with 1 and names what is left. A wrapper that ends the
-process at once, such as a secret runner on Ctrl-C, skips the cleanup; then run
-`npx convex env remove LANGFUSE_BASE_URL` with the deploy key. The other
-settings, the host app, the score configs, the prompt webhook and the run's
-traces and scores stay. The traces carry the environment `contract-<run id>`,
-except the canary trace the suite sends before its cases.
+cleanup fails exits with 1 and names what is left. A run killed with SIGKILL
+skips the cleanup; then run `npx convex env remove LANGFUSE_BASE_URL` with the
+deploy key. The other settings, the host app, the score configs, the prompt
+webhook and the run's traces and scores stay. The traces carry the environment
+`contract-<run id>`, except the canary trace the suite sends before its cases.
 
 Langfuse Cloud differs from the local stack in three ways, and the cloud run
 allows for each:
