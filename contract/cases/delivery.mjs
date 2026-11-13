@@ -48,6 +48,7 @@ export default [
       differences,
       rowDifferences,
       expectNone,
+      awaitRemoval,
     }) {
       const seed = `contract:${runId}:deleted`;
       const traceId = traceIdFromSeed(seed);
@@ -117,6 +118,9 @@ export default [
         "deletion request body",
         differences(JSON.parse(request.body), { traceIds: [traceId] }),
       );
+      // Langfuse Cloud applies deletions in batches; there the suite checks
+      // only the 200 above.
+      if (!awaitRemoval) return "deletion request answered 200";
       await poll(
         "the observations gone",
         () => observations(traceId, "core"),
@@ -145,6 +149,7 @@ export default [
       observationIdFromKey,
       differences,
       scopeMetadata,
+      readPauseMs,
     }) {
       const seed = `contract:${runId}:resend`;
       const traceId = traceIdFromSeed(seed);
@@ -228,7 +233,7 @@ export default [
           mostCopies,
           rows.filter((row) => row.id === spanId).length,
         );
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        await new Promise((resolve) => setTimeout(resolve, readPauseMs));
       }
       return (
         `${sent.length} requests with identical span bytes; Langfuse returned ` +

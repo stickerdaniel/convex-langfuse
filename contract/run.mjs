@@ -216,9 +216,10 @@ async function stackMemoryMib(project) {
  * `deadlineMs` passes. Returns the last result. On a timeout it throws with
  * the differences and the last response read; a read that throws keeps the
  * response before it. A result that matches after the deadline is a timeout
- * too. Records the time it needed in `steps`.
+ * too. Records the time it needed in `steps`. `pauseMs` lies between two
+ * reads.
  */
-async function poll(steps, what, read, check, deadlineMs) {
+async function poll(steps, what, read, check, deadlineMs, pauseMs = 500) {
   const startedAt = Date.now();
   let last;
   let problems;
@@ -244,7 +245,7 @@ async function poll(steps, what, read, check, deadlineMs) {
       steps.push({ step: what, ms, deadlineMs });
       return last;
     }
-    await sleep(500);
+    await sleep(pauseMs);
   }
 }
 
@@ -327,6 +328,187 @@ async function createWebhook(webUrl, { email, password, projectId }) {
     throw new Error(`webhook creation failed: HTTP ${created.status}`);
   }
   return secret;
+}
+
+/**
+ * How a suite waits: every deadline of a case times `scale`, `pauseMs`
+ * between two reads, and whether a deleted trace or score must be gone from
+ * Langfuse.
+ */
+const DEFAULT_PACE = { scale: 1, pauseMs: 500, awaitRemoval: true };
+/**
+ * The pace for Langfuse Cloud. Its Hobby plan allows 30 requests per minute
+ * on the read API, for the whole organization. It applies deletions in
+ * batches: traces 4 to 19 minutes and scores 34 to 49 minutes after the
+ * request, measured on 2026-11-13. So the suite checks only that Langfuse
+ * accepted the deletion request with 2xx.
+ */
+const CLOUD_PACE = { scale: 4, pauseMs: 3_000, awaitRemoval: false };
+
+/**
+ * Deploys the host app to `backend`, binds the component's settings and
+ * returns the context every case gets, with `deploy` to deploy again and the
+ * Convex CLI's `convex`. `backend` has `url` and either `adminKey` or, for a
+ * Convex Cloud deployment, `deployKey`. `baseUrl` is where the component
+ * reaches the proxy. `webhook` returns the signing secret of the prompt
+ * webhook and runs once the host app is deployed.
+ */
+async function prepareCases({
+  runId,
+  backend,
+  langfuse,
+  proxy,
+  baseUrl,
+  keys,
+  webhook,
+  pace = DEFAULT_PACE,
+}) {
+  const { convex, setEnv, linkPackage } = convexCli(HERE);
+  linkPackage();
+  const deploy = () =>
+    convex(backend, ["deploy", "--yes", "--codegen", "disable"]);
+  await deploy();
+  const environment = `contract-${runId}`;
+  const settings = {
+    LANGFUSE_PUBLIC_KEY: keys.publicKey,
+    LANGFUSE_SECRET_KEY: keys.secretKey,
+    LANGFUSE_BASE_URL: baseUrl,
+    LANGFUSE_TRACING_ENVIRONMENT: environment,
+    LANGFUSE_WEBHOOK_SECRET: await webhook(),
+  };
+  for (const [name, value] of Object.entries(settings)) {
+    await setEnv(backend, name, value);
+  }
+  const client = new ConvexHttpClient(backend.url);
+  const api = anyApi.contract;
+  const context = {
+    runId,
+    environment,
+    langfuse,
+    proxy,
+    traceIdFromSeed,
+    observationIdFromKey,
+    differences,
+    rowDifferences,
+    /**
+     * The metadata Langfuse shows on every observation of the component
+     * besides the caller's: its instrumentation scope and service name.
+     */
+    scopeMetadata: {
+      "scope.name": "langfuse-sdk-convex",
+      "scope.version": PACKAGE_VERSION,
+      "resourceAttributes.service.name": "convex-langfuse",
+    },
+    /** Throws when `problems`, a result of `differences`, is not empty. */
+    expectNone: (what, problems) => {
+      if (problems.length > 0) {
+        throw new Error(`${what}: ${problems.join("; ")}`);
+      }
+    },
+    /** Whether a deleted trace or score must be gone from Langfuse. */
+    awaitRemoval: pace.awaitRemoval,
+    /** The pause between two reads of a loop that runs outside `poll`. */
+    readPauseMs: Math.max(1_000, pace.pauseMs),
+    steps: [],
+    postSpan: (span) => postSpan(langfuse, span),
+    poll: (what, read, check, deadlineMs) =>
+      poll(
+        context.steps,
+        what,
+        read,
+        check,
+        deadlineMs * pace.scale,
+        pace.pauseMs,
+      ),
+    mutation: (name, args) => client.mutation(api[name], args),
+    query: (name, args) => client.query(api[name], args),
+    action: (name, args) => client.action(api[name], args),
+    /** Observations of a trace from `GET /api/public/v2/observations`. */
+    observations: async (traceId, fields) =>
+      (
+        await langfuse.get(
+          `/api/public/v2/observations?traceId=${traceId}&fields=${fields}&limit=100`,
+        )
+      ).data,
+    /** Scores with this id from `GET /api/public/v3/scores`. */
+    scores: async (id) =>
+      (
+        await langfuse.get(
+          `/api/public/v3/scores?id=${encodeURIComponent(id)}` +
+            "&fields=core,details,subject,annotation",
+        )
+      ).data,
+    /**
+     * Waits until the deletion of score `id` has its proof: Langfuse shows
+     * no score with that id, or, where the pace does not wait for the
+     * removal, Langfuse answered the component's deletion request with 2xx.
+     */
+    scoreDeleted: (what, id, deadlineMs) => {
+      if (pace.awaitRemoval) {
+        return context.poll(
+          what,
+          () => context.scores(id),
+          (rows) => (rows.length === 0 ? [] : [`${rows.length} scores`]),
+          deadlineMs,
+        );
+      }
+      const path = `/api/public/scores/${encodeURIComponent(id)}`;
+      return context.poll(
+        `${what}: request accepted`,
+        async () =>
+          proxy.records
+            .filter((r) => r.method === "DELETE" && r.path === path)
+            .map((r) => r.status),
+        (statuses) =>
+          statuses.some((status) => status >= 200 && status < 300)
+            ? []
+            : [`deletion requests answered: ${statuses.join(", ") || "none"}`],
+        deadlineMs,
+      );
+    },
+  };
+  return { context, deploy, convex };
+}
+
+/**
+ * Returns `runCases(names)`: it runs the cases named in `names`, or all,
+ * prints one line per case with its oracle and time, and returns the
+ * results. `detail` of a failed case is its error message. The steps of
+ * every case are added to `steps`.
+ */
+function caseRunner({ context, steps, print }) {
+  return async (names) => {
+    const results = [];
+    for (const item of CASES) {
+      if (names && !names.includes(item.name)) continue;
+      const startedAt = Date.now();
+      context.steps = [];
+      let ok = true;
+      let detail;
+      try {
+        detail = await item.run(context);
+      } catch (error) {
+        ok = false;
+        detail = String(error?.message ?? error);
+      }
+      const seconds = ((Date.now() - startedAt) / 1_000).toFixed(1);
+      steps.push(
+        ...context.steps.map((step) => ({ case: item.name, ...step })),
+      );
+      results.push({
+        name: item.name,
+        oracle: item.oracle,
+        ok,
+        seconds,
+        detail,
+      });
+      print(
+        `${ok ? "pass" : "FAIL"}  ${item.name}  [${item.oracle}]  ${seconds} s` +
+          (detail ? `  ${detail}` : ""),
+      );
+    }
+    return results;
+  };
 }
 
 /**
@@ -516,73 +698,18 @@ export async function startSuite({ stackFile, version }) {
 
     proxy = await startProxy(webUrl);
     await backend.start();
-    const { convex, setEnv, linkPackage } = convexCli(HERE);
-    linkPackage();
-    const deploy = () =>
-      convex(backend, ["deploy", "--yes", "--codegen", "disable"]);
-    await deploy();
-    webhookSecret = await createWebhook(webUrl, user);
-    const environment = `contract-${runId}`;
-    const settings = {
-      LANGFUSE_PUBLIC_KEY: secrets.LANGFUSE_PUBLIC_KEY,
-      LANGFUSE_SECRET_KEY: secrets.LANGFUSE_SECRET_KEY,
-      LANGFUSE_BASE_URL: proxy.url,
-      LANGFUSE_TRACING_ENVIRONMENT: environment,
-      LANGFUSE_WEBHOOK_SECRET: webhookSecret,
-    };
-    for (const [name, value] of Object.entries(settings)) {
-      await setEnv(backend, name, value);
-    }
-    const client = new ConvexHttpClient(backend.url);
-    const api = anyApi.contract;
-    const context = {
+    return await prepareCases({
       runId,
-      environment,
+      backend,
       langfuse,
       proxy,
-      traceIdFromSeed,
-      observationIdFromKey,
-      differences,
-      rowDifferences,
-      /**
-       * The metadata Langfuse shows on every observation of the component
-       * besides the caller's: its instrumentation scope and service name.
-       */
-      scopeMetadata: {
-        "scope.name": "langfuse-sdk-convex",
-        "scope.version": PACKAGE_VERSION,
-        "resourceAttributes.service.name": "convex-langfuse",
+      baseUrl: proxy.url,
+      keys: {
+        publicKey: secrets.LANGFUSE_PUBLIC_KEY,
+        secretKey: secrets.LANGFUSE_SECRET_KEY,
       },
-      /** Throws when `problems`, a result of `differences`, is not empty. */
-      expectNone: (what, problems) => {
-        if (problems.length > 0) {
-          throw new Error(`${what}: ${problems.join("; ")}`);
-        }
-      },
-      steps: [],
-      postSpan: (span) => postSpan(langfuse, span),
-      poll: (what, read, check, deadlineMs) =>
-        poll(context.steps, what, read, check, deadlineMs),
-      mutation: (name, args) => client.mutation(api[name], args),
-      query: (name, args) => client.query(api[name], args),
-      action: (name, args) => client.action(api[name], args),
-      /** Observations of a trace from `GET /api/public/v2/observations`. */
-      observations: async (traceId, fields) =>
-        (
-          await langfuse.get(
-            `/api/public/v2/observations?traceId=${traceId}&fields=${fields}&limit=100`,
-          )
-        ).data,
-      /** Scores with this id from `GET /api/public/v3/scores`. */
-      scores: async (id) =>
-        (
-          await langfuse.get(
-            `/api/public/v3/scores?id=${encodeURIComponent(id)}` +
-              "&fields=core,details,subject,annotation",
-          )
-        ).data,
-    };
-    return { context, deploy };
+      webhook: async () => (webhookSecret = await createWebhook(webUrl, user)),
+    });
   };
 
   let started;
@@ -594,52 +721,222 @@ export async function startSuite({ stackFile, version }) {
   }
   const { context, deploy } = started;
 
-  /**
-   * Runs the cases named in `names`, or all, prints one line per case with
-   * its oracle and time, and returns the results. `detail` of a failed case
-   * is its error message.
-   */
-  const runCases = async (names) => {
-    const results = [];
-    for (const item of CASES) {
-      if (names && !names.includes(item.name)) continue;
-      const startedAt = Date.now();
-      context.steps = [];
-      let ok = true;
-      let detail;
-      try {
-        detail = await item.run(context);
-      } catch (error) {
-        ok = false;
-        detail = String(error?.message ?? error);
-      }
-      const seconds = ((Date.now() - startedAt) / 1_000).toFixed(1);
-      steps.push(
-        ...context.steps.map((step) => ({ case: item.name, ...step })),
-      );
-      results.push({
-        name: item.name,
-        oracle: item.oracle,
-        ok,
-        seconds,
-        detail,
-      });
-      print(
-        `${ok ? "pass" : "FAIL"}  ${item.name}  [${item.oracle}]  ${seconds} s` +
-          (detail ? `  ${detail}` : ""),
-      );
-    }
-    return results;
-  };
-
+  const runCases = caseRunner({ context, steps, print });
   return { runId, measures, print, runCases, redeploy: deploy, stop };
 }
 
 /**
- * Writes the run's output, step timings, proxy record, backend log and the
- * stack's container logs to a staging folder, scans every file for every
- * generated secret, and only then moves the folder to `contract/logs/<run
- * id>/`. When a secret is found, the folder is deleted and the run fails;
+ * The suite against a Langfuse instance and a Convex Cloud deployment that
+ * exist already, such as Langfuse Cloud. It starts no stack and no backend.
+ * CI does not run it, because it needs credentials. From the environment:
+ *
+ * - `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`: the
+ *   Langfuse project. Use one for tests: the cases leave traces, scores and
+ *   score configs in it.
+ * - `CONVEX_URL`, `CONVEX_DEPLOY_KEY`: the deployment the host app is
+ *   deployed to. Use one for tests: its functions are public.
+ * - `LANGFUSE_WEBHOOK_SECRET`: the signing secret of a prompt webhook that
+ *   the Langfuse project sends to `<site URL>/langfuse/prompt-webhook`.
+ * - `CONTRACT_PROXY_PORT`, `CONTRACT_PROXY_URL`: the local port of the
+ *   recording proxy, and the public URL of a tunnel to that port. The
+ *   deployment sends to Langfuse through it, as the local backend does.
+ *
+ * `stop` unbinds the component's base URL, which disables the export, and
+ * deletes the prompts of the run.
+ */
+export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
+  const need = (name) => {
+    const value = process.env[name];
+    if (!value) throw new Error(`set ${name}`);
+    return value;
+  };
+  const runId = randomBytes(4).toString("hex");
+  const langfuseUrl = need("LANGFUSE_BASE_URL").replace(/\/+$/, "");
+  const keys = {
+    publicKey: need("LANGFUSE_PUBLIC_KEY"),
+    secretKey: need("LANGFUSE_SECRET_KEY"),
+  };
+  const backend = {
+    url: need("CONVEX_URL").replace(/\/+$/, ""),
+    deployKey: need("CONVEX_DEPLOY_KEY"),
+  };
+  const webhookSecret = need("LANGFUSE_WEBHOOK_SECRET");
+  const proxyUrl = need("CONTRACT_PROXY_URL").replace(/\/+$/, "");
+  const proxyPort = Number(need("CONTRACT_PROXY_PORT"));
+
+  const lines = [];
+  const print = (line) => {
+    lines.push(line);
+    console.log(line);
+  };
+  const measures = { pace };
+  const steps = [];
+  const langfuse = publicApi({ baseUrl: langfuseUrl, ...keys });
+  const proxy = await startProxy(langfuseUrl, proxyPort);
+  const { convex } = convexCli(HERE);
+
+  // Runs once, also from a signal. A failed unbinding fails the run, because
+  // the deployment would go on exporting through the tunnel. It waits for
+  // the boot, so no setting of the boot lands after the unbinding.
+  let stopping;
+  let booted = Promise.resolve();
+  const stop = () => (stopping ??= stopOnce());
+  const stopOnce = async () => {
+    await booted;
+    const failures = [];
+    // Without a base URL the component is disabled and exports nothing.
+    await convex(backend, ["env", "remove", "LANGFUSE_BASE_URL"]).catch(
+      (error) =>
+        failures.push(
+          `LANGFUSE_BASE_URL is still set on ${backend.url}; remove it with ` +
+            `\`npx convex env remove LANGFUSE_BASE_URL\`: ` +
+            String(error.message).split("\n")[0],
+        ),
+    );
+    await deletePrompts(langfuse, `contract-${runId}-`).catch((error) =>
+      failures.push(`prompts of the run left in Langfuse: ${error.message}`),
+    );
+    for (const failure of failures) print(`cleanup failed: ${failure}`);
+    const logs = await collectLogs({
+      runId,
+      lines,
+      steps,
+      measures,
+      proxy,
+      secrets: {
+        "the Langfuse secret key": keys.secretKey,
+        "the Basic authorization of the key pair": Buffer.from(
+          `${keys.publicKey}:${keys.secretKey}`,
+        ).toString("base64"),
+        "the deploy key": backend.deployKey,
+        "the webhook secret": webhookSecret,
+      },
+    });
+    await proxy.stop();
+    if (failures.length > 0) {
+      throw Object.assign(new Error(`cleanup failed: ${failures.join("; ")}`), {
+        logs,
+      });
+    }
+    return logs;
+  };
+  // `integration/backend.mjs` exits at once on a signal, for local backends.
+  // This run starts none, and its cleanup must finish first; a repeated
+  // signal waits for the same cleanup.
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.removeAllListeners(signal);
+    process.on(signal, () => {
+      if (stopping === undefined) print(`${signal}: cleaning up`);
+      stop()
+        .catch((error) => console.error(error.message))
+        .finally(() => process.exit(1));
+    });
+  }
+
+  const boot = async () => {
+    const bootStart = Date.now();
+    const health = await (
+      await fetch(`${langfuseUrl}/api/public/health`, {
+        signal: AbortSignal.timeout(30_000),
+      })
+    ).json();
+    print(
+      `run ${runId}: Langfuse ${health.version} at ${langfuseUrl}, ` +
+        `Convex deployment ${backend.url}`,
+    );
+    // The tunnel must lead to this run's proxy, and the proxy to Langfuse.
+    const probe = `/api/public/health?run=${runId}`;
+    const answer = await fetch(`${proxyUrl}${probe}`, {
+      signal: AbortSignal.timeout(15_000),
+    }).catch((error) => error);
+    const probed = proxy.records.find((record) => record.path === probe);
+    if (answer?.status !== 200 || probed?.status !== 200) {
+      throw new Error(
+        `${proxyUrl} does not lead through the proxy on port ${proxyPort} ` +
+          `to Langfuse: tunnel ${answer?.status ?? answer?.message}, ` +
+          `proxy ${probed ? `HTTP ${probed.status}` : "no request"}`,
+      );
+    }
+    const canary = randomBytes(16).toString("hex");
+    const canaryAt = `${Date.now()}000000`;
+    await postSpan(langfuse, {
+      traceId: canary,
+      spanId: randomBytes(8).toString("hex"),
+      name: "canary",
+      kind: 1,
+      startTimeUnixNano: canaryAt,
+      endTimeUnixNano: canaryAt,
+      attributes: [],
+    });
+    await poll(
+      steps,
+      "boot: canary span read back",
+      () => langfuse.get(`/api/public/v2/observations?traceId=${canary}`),
+      ({ data }) => (data.length === 1 ? [] : [`${data.length} observations`]),
+      60_000 * pace.scale,
+      pace.pauseMs,
+    );
+    const prepared = await prepareCases({
+      runId,
+      backend,
+      langfuse,
+      proxy,
+      baseUrl: proxyUrl,
+      keys,
+      webhook: async () => webhookSecret,
+      pace,
+    });
+    measures.bootMs = Date.now() - bootStart;
+    return prepared;
+  };
+
+  let started;
+  try {
+    const booting = boot();
+    booted = booting.then(
+      () => undefined,
+      () => undefined,
+    );
+    started = await booting;
+    // A signal during the boot started the cleanup; no case may start now.
+    // The signal handler exits once the cleanup ends.
+    if (stopping !== undefined) await new Promise(() => {});
+  } catch (error) {
+    error.logs = await stop().catch((cleanup) => {
+      console.error(cleanup.message);
+      return cleanup.logs;
+    });
+    throw error;
+  }
+  const { context, deploy } = started;
+  const runCases = caseRunner({ context, steps, print });
+  return { runId, measures, print, runCases, redeploy: deploy, stop };
+}
+
+/** Deletes every prompt of the project whose name starts with `prefix`. */
+async function deletePrompts(langfuse, prefix) {
+  const names = [];
+  for (let page = 1; ; page++) {
+    const { data, meta } = await langfuse.get(
+      `/api/public/v2/prompts?page=${page}&limit=100`,
+    );
+    names.push(...data.map((prompt) => prompt.name));
+    if (page >= meta.totalPages) break;
+  }
+  for (const name of names.filter((name) => name.startsWith(prefix))) {
+    const response = await langfuse.send(
+      "DELETE",
+      `/api/public/v2/prompts/${encodeURIComponent(name)}`,
+    );
+    if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+  }
+}
+
+/**
+ * Writes the run's output, step timings, proxy record and, where the run
+ * started them, the backend log and the stack's container logs to a staging
+ * folder, scans every file for every secret of the run, and only then moves
+ * the folder to `contract/logs/<run id>/`. When a secret is found, the folder is deleted and the run fails;
  * the result names the secret and the file, never the value.
  *
  * Langfuse logs the public key of API requests in full by design
@@ -671,16 +968,18 @@ async function collectLogs({
       `${JSON.stringify(proxy.records, null, 2)}\n`,
     );
   }
-  if (existsSync(backend.logPath)) {
+  if (backend?.logPath && existsSync(backend.logPath)) {
     copyFileSync(backend.logPath, join(staging, "backend.log"));
   }
-  const containers = await compose
-    .exec("logs", "--no-color", "--timestamps")
-    .catch((error) => `docker compose logs failed: ${error.message}`);
-  writeFileSync(
-    join(staging, "stack.log"),
-    containers.replaceAll(publicKey, "pk-lf-[masked]"),
-  );
+  if (compose) {
+    const containers = await compose
+      .exec("logs", "--no-color", "--timestamps")
+      .catch((error) => `docker compose logs failed: ${error.message}`);
+    writeFileSync(
+      join(staging, "stack.log"),
+      containers.replaceAll(publicKey, "pk-lf-[masked]"),
+    );
+  }
 
   const leaks = readdirSync(staging).flatMap((file) => {
     const text = readFileSync(join(staging, file), "utf8");
@@ -715,29 +1014,32 @@ async function main() {
     options: {
       stack: { type: "string", default: join(HERE, "supported.json") },
       langfuse: { type: "string" },
+      cloud: { type: "boolean", default: false },
     },
   });
   const startedAt = Date.now();
   let failed = true;
   let logs;
   try {
-    const suite = await startSuite({
-      stackFile: values.stack,
-      version: values.langfuse,
-    });
+    const suite = values.cloud
+      ? await startCloudSuite()
+      : await startSuite({ stackFile: values.stack, version: values.langfuse });
     try {
       const results = await suite.runCases();
       failed = results.some((result) => !result.ok);
       suite.print(
         `${results.filter((r) => r.ok).length} of ${results.length} cases passed; ` +
           `suite ${((Date.now() - startedAt) / 1_000).toFixed(1)} s, ` +
-          `stack ready after ${(suite.measures.bootMs / 1_000).toFixed(1)} s, ` +
-          `peak stack memory ${(suite.measures.peakMemoryMib / 1024).toFixed(2)} GiB`,
+          (values.cloud
+            ? `ready after ${(suite.measures.bootMs / 1_000).toFixed(1)} s`
+            : `stack ready after ${(suite.measures.bootMs / 1_000).toFixed(1)} s, ` +
+              `peak stack memory ${(suite.measures.peakMemoryMib / 1024).toFixed(2)} GiB`),
       );
     } finally {
       logs = await suite.stop();
     }
   } catch (error) {
+    failed = true;
     console.error(`contract run failed: ${error?.message ?? error}`);
     logs ??= error?.logs;
   }

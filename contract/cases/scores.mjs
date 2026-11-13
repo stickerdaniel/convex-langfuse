@@ -2,7 +2,8 @@
 // read back with `GET /api/public/v3/scores?id=<id>`, step by step: the
 // first value, the same id and timestamp with a new value, then the
 // deletion. The component sends operations of one id at least 30 s apart,
-// so each step waits for the one before.
+// so each step waits for the one before. `scoreDeleted` waits until the
+// score is gone, or on Langfuse Cloud until it accepted the deletion.
 
 /** How long Langfuse may take to show, change or remove a score. */
 const SCORE_MS = 90_000;
@@ -18,6 +19,7 @@ export default [
       action,
       langfuse,
       scores,
+      scoreDeleted,
       poll,
       traceIdFromSeed,
       observationIdFromKey,
@@ -129,12 +131,7 @@ export default [
         await mutation("deleteScore", { id: fixture.id });
       }
       for (const fixture of fixtures) {
-        await poll(
-          `${fixture.name} deleted`,
-          () => scores(fixture.id),
-          (rows) => (rows.length === 0 ? [] : [`${rows.length} scores`]),
-          SCORE_MS,
-        );
+        await scoreDeleted(`${fixture.name} deleted`, fixture.id, SCORE_MS);
       }
       return "numeric, boolean and categorical on a trace and an observation";
     },

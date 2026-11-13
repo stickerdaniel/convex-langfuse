@@ -605,8 +605,11 @@ with the values it recorded. It covers:
 - `content: "none"`, a `redact` hook, and a record the hook drops,
 - trace deletion, and a resend after a lost response.
 
-A weekly run repeats the suite on the latest stable Langfuse release. Langfuse
-Cloud is not part of the suite.
+A weekly run repeats the suite on the latest stable Langfuse release. With
+`--cloud` the suite runs against Langfuse Cloud and a Convex Cloud deployment
+(see `CONTRIBUTING.md`). It passed all 18 cases on Langfuse Cloud 4.79.0 on
+2026-11-13. Langfuse Cloud applies deletions minutes later than the local stack,
+so there the suite checks that Langfuse accepted each deletion request.
 
 Observed on Langfuse 4.78.0:
 
