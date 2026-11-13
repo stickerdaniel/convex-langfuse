@@ -316,7 +316,8 @@ describe("refresh", () => {
         ...fields,
         remoteId: "recreated-id",
         description: "Recreated",
-        publishedAt: old.publishedAt! + 1,
+        // One `publish` stamps both versions with the same time.
+        publishedAt: old.publishedAt!,
       });
       const files = await ctx.db
         .query("skillFiles")
@@ -1112,12 +1113,13 @@ describe("bound", () => {
 
     expect(await health()).toMatchObject({
       tracked: MAX_SKILL_NAMES,
-      listError: "too_many_skills",
+      overflow: true,
     });
+    expect((await health()).listError).toBeUndefined();
     expect((await sync()).status).toBe("incomplete");
   });
 
-  test("in mode all, an overflow outlasts a later page's error", async () => {
+  test("in mode all, an overflow and a later page's error are both reported", async () => {
     for (const name of skillNames("skill", MAX_SKILL_NAMES + 200)) {
       skills.add(name);
     }
@@ -1129,7 +1131,10 @@ describe("bound", () => {
     await sync();
     await firstWalk();
 
-    expect((await health()).listError).toBe("too_many_skills");
+    expect(await health()).toMatchObject({
+      listError: "http_500",
+      overflow: true,
+    });
     expect((await sync()).status).toBe("incomplete");
   });
 

@@ -59,6 +59,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             lastListAt?: number;
             listError?: string;
             oldestDueAt?: number;
+            overflow: boolean;
             tracked: number;
           };
         },

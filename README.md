@@ -479,8 +479,8 @@ export const syncSkills = internalMutation({
 - Both return `{ status, tracked }` and refresh in the background, so content
   appears shortly after. `status` is `incomplete` when a name was not tracked
   because the cache tracks 500 names. In mode `all`, the listing finds names
-  over the bound: the walk then ends with `listError: "too_many_skills"`, and
-  later `sync()` calls return `incomplete`.
+  over the bound: `health.skills.overflow` is then `true`, and later `sync()`
+  calls return `incomplete`, until a complete listing finds every name tracked.
 
 To set up the webhook:
 
@@ -695,7 +695,7 @@ export const langfuseHealth = query({
 | `exporter.lastAcceptedAt`, `exporter.accepted`, `exporter.deadLettered`, `exporter.expired`                   | Progress counters                                                  |
 | `prompts.tracked`, `prompts.errors`, `prompts.lastListAt`, `prompts.lastWebhookAt`, `prompts.oldestAttemptAt` | State of the prompt cache                                          |
 | `skills.tracked`, `skills.errors`, `skills.due`, `skills.oldestDueAt`, `skills.cooldownUntil`                 | State of the skill cache                                           |
-| `skills.lastListAt`, `skills.listError`                                                                       | The last skill listing, and why it ended early                     |
+| `skills.lastListAt`, `skills.listError`, `skills.overflow`                                                    | The last skill listing, why it ended early, names over the bound   |
 
 Two internal functions help after an incident. Run them from the dashboard or
 the CLI:

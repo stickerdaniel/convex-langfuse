@@ -417,6 +417,11 @@ export default defineSchema({
     lastListAt: v.optional(v.number()),
     /** Fixed code of the last walk that ended early. */
     listError: v.optional(v.string()),
+    /**
+     * Set when a walk in mode `all` listed a name over the bound. Kept by a
+     * walk that ended early; cleared by a complete walk that found none.
+     */
+    overflow: v.optional(v.boolean()),
     /** The last background request, for the background share. */
     lastBackgroundAt: v.optional(v.number()),
     /** What the last background request fetched; the next one alternates. */

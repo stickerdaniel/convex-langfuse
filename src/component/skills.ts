@@ -156,7 +156,9 @@ async function windowedVersion(
     if (pointer?.version !== version) continue;
     const row = await ctx.db.get("skillVersions", pointer.versionId);
     if (!row || row.deleting) continue;
-    if (!held || (row.publishedAt ?? 0) > (held.publishedAt ?? 0)) held = row;
+    // One `publish` stamps both versions with the same time; `latest`,
+    // fetched second, wins the tie.
+    if (!held || (row.publishedAt ?? 0) >= (held.publishedAt ?? 0)) held = row;
   }
   if (held) return held;
   const rows = await ctx.db
@@ -377,10 +379,7 @@ export const sync = mutation({
     }
     await pingSkills(ctx);
     // In mode `all`, the last listing walk shows whether every name fit.
-    if (
-      mode === "all" &&
-      (await getFetcher(ctx))?.listError === "too_many_skills"
-    ) {
+    if (mode === "all" && (await getFetcher(ctx))?.overflow) {
       incomplete = true;
     }
     return {
@@ -644,7 +643,12 @@ async function dueName(
 type FetcherPatch = Partial<
   Pick<
     Doc<"skillFetcher">,
-    "nextRequestAt" | "cooldownUntil" | "list" | "lastListAt" | "listError"
+    | "nextRequestAt"
+    | "cooldownUntil"
+    | "list"
+    | "lastListAt"
+    | "listError"
+    | "overflow"
   >
 >;
 
@@ -690,19 +694,24 @@ async function choose(
  */
 async function applyPage(
   ctx: MutationCtx,
+  fetcher: Doc<"skillFetcher">,
   walk: NonNullable<Doc<"skillFetcher">["list"]>,
   sync: Doc<"skillSync"> | null,
   page: Page,
   now: number,
 ): Promise<FetcherPatch> {
   let overflow = walk.overflow ?? false;
+  // A walk that ends early cannot show that every name fits.
   const end = async (listError: string | undefined) => {
     await scheduleWake(ctx, now + SKILL_LIST_INTERVAL_MS);
     return {
       list: undefined,
       lastListAt: now,
-      // An overflow seen on an earlier page outranks a later page's error.
-      listError: overflow ? "too_many_skills" : listError,
+      listError,
+      overflow:
+        overflow || (listError !== undefined && fetcher.overflow === true)
+          ? true
+          : undefined,
     };
   };
   if (!page.ok) return await end(page.error);
@@ -814,7 +823,7 @@ export const advance = internalMutation({
       if (report.page && fetcher.list) {
         Object.assign(
           patch,
-          await applyPage(ctx, fetcher.list, sync, report.page, now),
+          await applyPage(ctx, fetcher, fetcher.list, sync, report.page, now),
         );
       }
     }
@@ -1526,6 +1535,8 @@ export const vSkillHealth = v.object({
   lastListAt: v.optional(v.number()),
   /** Fixed code of the last listing walk that ended early. */
   listError: v.optional(v.string()),
+  /** In mode `all`, the last listing found names over the 500-name bound. */
+  overflow: v.boolean(),
 });
 
 /** The skill part of `outbox.health`. */
@@ -1557,5 +1568,6 @@ export async function skillHealth(
         : undefined,
     lastListAt: fetcher?.lastListAt,
     listError: fetcher?.listError,
+    overflow: fetcher?.overflow ?? false,
   };
 }
