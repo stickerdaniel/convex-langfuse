@@ -4,10 +4,10 @@
 
 ### Fixed
 
-- A score or deletion request that Langfuse answers with 429 delays only that
-  request, for the `Retry-After` time or 1 minute. Before, it stopped the export
-  of observations until the rate limit ended. Langfuse Cloud counts deletion
-  requests per day.
+- A score or trace deletion request that Langfuse answers with 429 delays only
+  that request, for the `Retry-After` time or 1 minute. Before, it stopped the
+  export of observations until the rate limit ended, up to a day on Langfuse
+  Cloud, which counts deletions per day.
 
 ## 0.1.0
 

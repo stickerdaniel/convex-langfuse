@@ -504,20 +504,23 @@ throws an `Error` whose message is the code, which rolls back a mutation.
   observation by its ids and timestamps, not by its arrival.
 - **Backoff.** Network errors, timeouts, 408, 425 and 5xx back off exponentially
   up to 5 minutes, or for the `Retry-After` time, and so does a 429 for
-  observations. A request with observations times out after 20 s, a score or
-  deletion request after 10 s. 401 and 403 count as a configuration problem and
-  back off up to 30 minutes, and so do 404, 405 and redirects for observations.
+  observations or a score. A request with observations times out after 20 s, a
+  score or deletion request after 10 s. 401 and 403 count as a configuration
+  problem and back off up to 30 minutes, and so do 404, 405 and redirects for
+  observations.
 - **Rejections.** A 4xx for a batch makes the exporter send its rows one by one.
   A row rejected alone becomes a dead letter. After 20 consecutive dead letters
   the exporter treats the rejection as a configuration problem and stops
   discarding.
 - **Scores and deletion requests.** Each one is a request of its own. A 404, a
   405 or a redirect from its endpoint delays only that request by 30 minutes. A
-  429 delays only that request for the `Retry-After` time, at least 1 second and
-  at most 1 day, or 1 minute without one. Observations behind it are still sent.
-  Langfuse Cloud counts deletion requests per day and plan
-  ([API limits](https://langfuse.com/faq/all/api-limits)); a deletion past the
-  limit waits for the next day's window.
+  429 for a deletion request delays only that request for the `Retry-After`
+  time, at least 1 second and at most 1 day, or 1 minute without one.
+  Observations behind it are still sent. Langfuse Cloud counts score and trace
+  deletions per day and plan, each in a limit of its own
+  ([API limits](https://langfuse.com/faq/all/api-limits)). Observations and
+  scores share the ingestion limit, so a 429 for a score backs off like one for
+  observations.
 - **Backlog.** Above 25,000 pending observations and score operations or 256 MiB
   of pending payload the component stops accepting. Recording and score calls
   then log `backlog` and drop the record. It accepts again below half of both.

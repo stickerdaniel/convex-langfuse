@@ -76,8 +76,8 @@ const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
 
 export const vReport = v.object({
   /**
-   * `deferred` is a route error or a rate limit of an API op, which waits
-   * `retryAfterMs` when set; spans never get it.
+   * `deferred` is a route error of an API op or a rate limit of a
+   * deletion, which waits `retryAfterMs` when set; spans never get it.
    */
   outcome: v.union(
     v.literal("accepted"),
@@ -543,20 +543,26 @@ export function parseRetryAfter(
 }
 
 /**
+ * Where a request goes, as far as its outcome classes differ: the OTLP
+ * endpoint, a score write, or a score or trace deletion.
+ */
+type Target = "otlp" | "api" | "deletion";
+
+/**
  * Maps an HTTP status to the exporter's outcome classes. A route error (404,
  * 405, any 3xx) is `config` for the OTLP request and `deferred` for an API
- * op, so one wrong API route does not stop the spans. A 429 is `transient`
- * for the OTLP request and `deferred` for an API op, for the `Retry-After`
- * time or `RATE_LIMITED_MS`, within `BACKOFF_BASE_MS` and
- * `RATE_LIMITED_CAP_MS`: Langfuse Cloud limits each endpoint group on its
- * own, deletions per day, so a rate limit of one API op says nothing about
- * the spans.
+ * op, so one wrong API route does not stop the spans. A 429 is `deferred`
+ * for a deletion, for the `Retry-After` time or `RATE_LIMITED_MS`, within
+ * `BACKOFF_BASE_MS` and `RATE_LIMITED_CAP_MS`: Langfuse Cloud counts score
+ * and trace deletions per day, each in a limit of its own. A 429 for spans
+ * or a score write is `transient`, because both share Langfuse's ingestion
+ * limit.
  */
 export function classify(
   status: number,
   retryAfter: string | null,
   now: number,
-  target: "otlp" | "api" = "otlp",
+  target: Target = "otlp",
 ): Report {
   if (status >= 200 && status < 300) return { outcome: "accepted", status };
   const retryAfterMs = parseRetryAfter(retryAfter, now);
@@ -571,11 +577,11 @@ export function classify(
     status === 404 ||
     status === 405
   ) {
-    return target === "api"
-      ? { outcome: "deferred", status }
-      : { outcome: "config", status, ...timing };
+    return target === "otlp"
+      ? { outcome: "config", status, ...timing }
+      : { outcome: "deferred", status };
   }
-  if (status === 429 && target === "api") {
+  if (status === 429 && target === "deletion") {
     return {
       outcome: "deferred",
       status,
@@ -605,7 +611,7 @@ async function request(
     body?: string;
     headers?: Record<string, string>;
     timeoutMs: number;
-    target: "otlp" | "api";
+    target: Target;
   },
 ): Promise<Report> {
   const controller = new AbortController();
@@ -652,27 +658,30 @@ export async function send(
 
 /** Sends one API op, with an `API_TIMEOUT_MS` timeout. */
 export async function sendOp(config: ExportConfig, op: Op): Promise<Report> {
-  const api = { timeoutMs: API_TIMEOUT_MS, target: "api" as const };
+  const timeoutMs = API_TIMEOUT_MS;
   switch (op.kind) {
     case "scoreCreate":
       return await request(config, {
         method: "POST",
         path: "/api/public/scores",
         body: op.body,
-        ...api,
+        timeoutMs,
+        target: "api",
       });
     case "scoreDelete":
       return await request(config, {
         method: "DELETE",
         path: `/api/public/scores/${encodeURIComponent(op.ref)}`,
-        ...api,
+        timeoutMs,
+        target: "deletion",
       });
     case "traceDelete":
       return await request(config, {
         method: "DELETE",
         path: "/api/public/traces",
         body: op.body,
-        ...api,
+        timeoutMs,
+        target: "deletion",
       });
   }
 }
