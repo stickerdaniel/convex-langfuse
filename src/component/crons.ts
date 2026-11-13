@@ -11,5 +11,7 @@ crons.interval(
   {},
 );
 crons.interval("prompt refresh", { minutes: 5 }, internal.prompts.tick, {});
+crons.interval("skill refresh", { minutes: 5 }, internal.skills.tick, {});
+crons.interval("skill sweep", { hours: 1 }, internal.skills.sweep, {});
 
 export default crons;

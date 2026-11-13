@@ -61,6 +61,7 @@ Your functions never wait for Langfuse and never fail because Langfuse is down.
 - [Scores](#scores)
 - [Deleting traces](#deleting-traces)
 - [Prompts](#prompts)
+- [Skills](#skills)
 - [Content and privacy](#content-and-privacy)
 - [Errors](#errors)
 - [Delivery](#delivery)
@@ -129,6 +130,7 @@ npx convex env set LANGFUSE_BASE_URL https://cloud.langfuse.com
 | `LANGFUSE_TRACING_ENVIRONMENT`               | Environment for traces that set none: 1 to 40 lowercase letters, digits, `-` or `_`, not starting with `langfuse`. |
 | `LANGFUSE_RELEASE`                           | Release for traces that set none.                                                                                  |
 | `LANGFUSE_WEBHOOK_SECRET`                    | Signing secret of the Langfuse prompt webhook. See [Prompts](#prompts).                                            |
+| `LANGFUSE_SKILL_WEBHOOK_SECRET`              | Signing secret of the Langfuse skill automation. See [Skills](#skills).                                            |
 
 The component exports only when both keys and the base URL are set. Without them
 a recording call writes nothing and returns, so a preview or test deployment
@@ -432,6 +434,123 @@ rolling refresh covers the rest. To set up the webhook:
 The route verifies the signature and refuses a delivery older than 5 minutes.
 Without the secret it answers 404.
 
+## Skills
+
+The component keeps a cache of your Langfuse skills in Convex: the `production`
+and the `latest` version of each tracked skill, with the content of every file.
+A read never calls Langfuse.
+
+```ts
+export const weatherSkill = query({
+  args: {},
+  handler: async (ctx) =>
+    await langfuse.skills.get(ctx, { name: "weather-report" }),
+});
+// { name, version, description, frontmatter, files: [{ path, content }], snapshotId }
+```
+
+- `get` takes a `label`, `production` by default or `latest`, or a `version`. It
+  returns `null` on a miss. Called from a query it is reactive: the query reruns
+  when a refresh moves the label.
+- `files` is sorted by path. `frontmatter` is the parsed frontmatter object.
+- Equal `snapshotId` values mean equal file sets: the same paths with the same
+  content hashes.
+- `get({ version })` serves a version that a label holds or held within the last
+  7 days, as last fetched. The window is no pin: it can serve a version that
+  Langfuse deleted within it.
+- The component does not run or compile skill files.
+- A name outside `^[a-z0-9]+(?:-[a-z0-9]+)*$` or longer than 64 characters
+  throws `invalid_skill_name`. A label and a version together throw
+  `invalid_skill_selector`.
+
+Turn the cache on from a mutation or an action:
+
+```ts
+export const syncSkills = internalMutation({
+  args: {},
+  handler: async (ctx) => await langfuse.skills.sync(ctx),
+});
+```
+
+- `sync()` tracks every skill of the project from then on. New skills join
+  through the webhook and the listing.
+- `sync({ names })` adds these names. It never removes a name, and a name given
+  here stays tracked while Langfuse has no such skill.
+- Both return `{ status, tracked }` and refresh in the background, so content
+  appears shortly after. `status` is `incomplete` when a name was not tracked
+  because the cache tracks 500 names.
+
+To set up the webhook:
+
+1. Mount the component with an HTTP prefix and bind the skill secret:
+
+   ```ts
+   app.use(convexLangfuse, {
+     httpPrefix: "/langfuse/",
+     env: {
+       // ...the settings from Setup
+       LANGFUSE_SKILL_WEBHOOK_SECRET: app.env.LANGFUSE_SKILL_WEBHOOK_SECRET,
+     },
+   });
+   ```
+
+2. In Langfuse, add an automation for skill version events with a webhook action
+   and the URL `https://<deployment>.convex.site/langfuse/skill-webhook`.
+3. Store the signing secret of that automation:
+   `npx convex env set LANGFUSE_SKILL_WEBHOOK_SECRET lf-whsec_...`. Every
+   automation has a secret of its own, so the skill webhook and the prompt
+   webhook use different secrets.
+
+The route verifies the signature and refuses a delivery older than 5 minutes.
+Without the secret it answers 404. A delivery only names the skill that changed;
+the component fetches the skill itself.
+
+### Freshness
+
+- The component sends one skill request at a time, at least 2.5 s after the end
+  of the previous one. Every skill endpoint counts toward the organization's
+  `public-api` rate limit. Langfuse Cloud Hobby allows 30 requests per minute
+  for the whole organization, Core and Pro 1,000.
+- A refresh takes one or two GETs: `production`, then `latest` unless the same
+  version holds both.
+- With no backlog and no rate limit, a signed delivery is cached 2 s after it
+  arrives plus one 2.5 s pause plus the two GETs, under 10 s for GETs under 1 s.
+  Every request ahead of it adds 2.5 s.
+- A 429 pauses every skill request for `Retry-After`, at least 5 s and at most
+  15 minutes, 60 s without the header. A failed refresh runs again after 5 s, 30
+  s, 2 minutes, then every 10 minutes.
+- `health.skills` reports the backlog in `due` and `oldestDueAt`, a pause in
+  `cooldownUntil`, failed refreshes in `errors`, and the listing in `lastListAt`
+  and `listError`.
+
+### Missed deliveries
+
+- Every 15 minutes the component lists the project's skills, 100 per page, up to
+  10 pages. A skill whose `production` or `latest` number differs from the cache
+  is refreshed. In mode `all` a new skill is tracked. Only a listing that
+  reached its last page refreshes the tracked skills it did not show; their 404s
+  remove them from the cache, and in mode `all` they stop being tracked.
+- Every tracked skill gets a refresh once a day. It catches a label move the
+  listing cannot see, a version recreated under the same number, and changed
+  content.
+- Nothing catches the deletion of an old version without a label after a missed
+  delivery: `get({ version })` serves it until its 7 days end.
+
+### The cached subset
+
+The cache stores a version that holds:
+
+- 1 to 200 files with unique normalized relative paths of at most 512
+  characters, one of them a root `SKILL.md`,
+- at most 1,000,000 UTF-8 bytes of content in all, text without NUL, each file
+  matching its `sha256Hash`,
+- a frontmatter object of at most 64 KiB as JSON and at most 15 levels deep, and
+  a description of at most 1,024 characters.
+
+Langfuse lets a deployment raise its own file and byte limits. A version outside
+this subset is refused: the cache keeps the version it had, and
+`health.skills.errors` counts the skill.
+
 ## Content and privacy
 
 ```ts
@@ -547,6 +666,10 @@ throws an `Error` whose message is the code, which rolls back a mutation.
 | Prompt name, pin scope                            | 256 bytes each                         |
 | Labels per prompt name                            | 50                                     |
 | Prompt snapshot                                   | 900 KiB                                |
+| Cached skill names                                | 500                                    |
+| Files per cached skill version                    | 200                                    |
+| Content per cached skill version                  | 1,000,000 UTF-8 bytes                  |
+| Skill API response                                | 8 MiB                                  |
 
 ## Operations
 
@@ -569,6 +692,8 @@ export const langfuseHealth = query({
 | `exporter.backoffUntil`, `exporter.consecutiveFailures`, `exporter.lastError`                                 | Present while Langfuse fails                                       |
 | `exporter.lastAcceptedAt`, `exporter.accepted`, `exporter.deadLettered`, `exporter.expired`                   | Progress counters                                                  |
 | `prompts.tracked`, `prompts.errors`, `prompts.lastListAt`, `prompts.lastWebhookAt`, `prompts.oldestAttemptAt` | State of the prompt cache                                          |
+| `skills.tracked`, `skills.errors`, `skills.due`, `skills.oldestDueAt`, `skills.cooldownUntil`                 | State of the skill cache                                           |
+| `skills.lastListAt`, `skills.listError`                                                                       | The last skill listing, and why it ended early                     |
 
 Two internal functions help after an incident. Run them from the dashboard or
 the CLI:

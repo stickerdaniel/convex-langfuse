@@ -670,6 +670,7 @@ describe("health", () => {
         expired: 0,
       },
       prompts: { tracked: 0, errors: 0 },
+      skills: { tracked: 0, errors: 0, due: 0 },
     });
   });
 });

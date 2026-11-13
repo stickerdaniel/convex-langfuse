@@ -4,7 +4,7 @@ import convexLangfuse from "@stickerdaniel/convex-langfuse/convex.config.js";
 
 // The app declares the Langfuse settings and binds them to the component by
 // reference, so `npx convex env set` changes what the component sees. The
-// component's routes, such as the prompt webhook, are served under
+// component's routes, such as the prompt and skill webhooks, are served under
 // `/langfuse/`.
 const app = defineApp({
   env: {
@@ -12,6 +12,7 @@ const app = defineApp({
     LANGFUSE_SECRET_KEY: v.optional(v.string()),
     LANGFUSE_BASE_URL: v.optional(v.string()),
     LANGFUSE_WEBHOOK_SECRET: v.optional(v.string()),
+    LANGFUSE_SKILL_WEBHOOK_SECRET: v.optional(v.string()),
   },
 });
 app.use(convexLangfuse, {
@@ -21,6 +22,7 @@ app.use(convexLangfuse, {
     LANGFUSE_SECRET_KEY: app.env.LANGFUSE_SECRET_KEY,
     LANGFUSE_BASE_URL: app.env.LANGFUSE_BASE_URL,
     LANGFUSE_WEBHOOK_SECRET: app.env.LANGFUSE_WEBHOOK_SECRET,
+    LANGFUSE_SKILL_WEBHOOK_SECRET: app.env.LANGFUSE_SKILL_WEBHOOK_SECRET,
   },
 });
 

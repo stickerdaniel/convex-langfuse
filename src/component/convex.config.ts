@@ -13,6 +13,7 @@ const component = defineComponent("convexLangfuse", {
     LANGFUSE_TRACING_ENVIRONMENT: v.optional(v.string()),
     LANGFUSE_RELEASE: v.optional(v.string()),
     LANGFUSE_WEBHOOK_SECRET: v.optional(v.string()),
+    LANGFUSE_SKILL_WEBHOOK_SECRET: v.optional(v.string()),
   },
 });
 component.use(batchWorker);

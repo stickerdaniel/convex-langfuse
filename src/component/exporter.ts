@@ -57,6 +57,7 @@ import {
   withRemoved,
   type Removed,
 } from "./outbox.js";
+import { parseRetryAfter } from "./retry.js";
 import { basicAuth, exportConfig, type ExportConfig } from "./settings.js";
 import { buildExportBody } from "../shared/otlp.js";
 import { VERSION } from "../shared/version.js";
@@ -529,18 +530,6 @@ export const kick = internalMutation({
     return null;
   },
 });
-
-/** Parses `Retry-After`, given in seconds or as an HTTP date. */
-export function parseRetryAfter(
-  value: string | null,
-  now: number,
-): number | undefined {
-  if (value === null) return undefined;
-  const trimmed = value.trim();
-  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
-  const at = Date.parse(trimmed);
-  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
-}
 
 /**
  * Where a request goes, as far as its outcome classes differ: the OTLP

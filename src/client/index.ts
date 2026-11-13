@@ -307,6 +307,94 @@ function promptsOf(component: ComponentApi): Prompts {
   };
 }
 
+/**
+ * A cached skill version. `files` is sorted by path and holds each file's
+ * text. Equal `snapshotId` values mean equal file sets: the same paths with
+ * the same content hashes.
+ */
+export type Skill = {
+  name: string;
+  version: number;
+  description: string;
+  /** The frontmatter of `SKILL.md`, as Langfuse parsed it. */
+  frontmatter: Record<string, unknown>;
+  files: Array<{ path: string; content: string }>;
+  snapshotId: string;
+};
+
+/** A skill name with a label (default `production`) or a version, not both. */
+export type SkillSelector = { name: string } & (
+  | { label?: "production" | "latest"; version?: never }
+  | { version: number; label?: never }
+);
+
+/** The result of `skills.sync`, as the component returns it. */
+export type SkillSyncResult = FunctionReturnType<
+  ComponentApi["skills"]["sync"]
+>;
+
+/**
+ * The component's skill cache. It holds the `production` and `latest`
+ * version of each tracked Langfuse skill with the content of its files, and
+ * never fetches on a read. A signed webhook refreshes a skill after a
+ * change; a listing every 15 minutes and a daily refresh per skill repair
+ * missed deliveries.
+ *
+ * A name with a lone surrogate is refused with a `ConvexError`
+ * `invalid_skill_name` before the component call.
+ */
+export interface Skills {
+  /**
+   * The cached skill for a label (default `production`) or a version, or
+   * `null` on a miss. A version is served while a label holds it or held it
+   * within the last 7 days, as last fetched; that window is no pin. From a
+   * query, it is reactive: the query reruns when a refresh moves the label.
+   * Throws `invalid_skill_selector` on a label and a version together or a
+   * version that is not a positive integer, and `invalid_skill_name` for a
+   * name Langfuse cannot hold.
+   */
+  get(ctx: RunQueryCtx, selector: SkillSelector): Promise<Skill | null>;
+  /**
+   * Turns the cache on. Without `names` it tracks every skill of the project
+   * from now on. With `names` it adds those names, also while Langfuse has
+   * no such skill yet, and never removes one. Refreshes run in the
+   * background; `health` shows the backlog. The status is `incomplete` when
+   * a name was not tracked because 500 names are.
+   */
+  sync(
+    ctx: RunMutationCtx,
+    args?: { names?: string[] },
+  ): Promise<SkillSyncResult>;
+}
+
+/** Convex would refuse a lone surrogate with an error that has no code. */
+function checkSkillName(name: string): void {
+  if (hasLoneSurrogate(name)) throw new ConvexError("invalid_skill_name");
+}
+
+function skillsOf(component: ComponentApi): Skills {
+  return {
+    async get(ctx, { name, label, version }) {
+      checkSkillName(name);
+      const stored = await ctx.runQuery(component.skills.get, {
+        name,
+        label,
+        version,
+      });
+      if (!stored) return null;
+      const frontmatter = JSON.parse(stored.frontmatter) as Record<
+        string,
+        unknown
+      >;
+      return { ...stored, frontmatter };
+    },
+    async sync(ctx, args = {}) {
+      for (const name of args.names ?? []) checkSkillName(name);
+      return await ctx.runMutation(component.skills.sync, args);
+    },
+  };
+}
+
 /** An observation named by a key, hashed together with the trace id, or by its id. */
 export type ObservationRef =
   | { key: string; id?: never }
@@ -757,11 +845,14 @@ export class Langfuse<
   readonly #fingerprints = new Map<string, Promise<string>>();
   /** The prompt cache: `get`, `pin` and `sync`. */
   readonly prompts: Prompts;
+  /** The skill cache: `get` and `sync`. */
+  readonly skills: Skills;
 
   constructor(component: ComponentApi, options: LangfuseOptions<S>) {
     this.#component = component;
     this.#options = options;
     this.prompts = promptsOf(component);
+    this.skills = skillsOf(component);
   }
 
   /**

@@ -18,6 +18,7 @@ import {
   WORKER_NAME,
 } from "./constants.js";
 import { promptHealth, vPromptHealth } from "./prompts.js";
+import { skillHealth, vSkillHealth } from "./skills.js";
 import type { Kind } from "./schema.js";
 import { exportConfig } from "./settings.js";
 
@@ -306,7 +307,8 @@ const vLastError = v.object({
  * bytes, so before it is consumed the bytes can also be too high.
  * `oldestPendingAt` is the
  * creation time of the oldest pending row. `backoffUntil` is set only while a
- * backoff is active. `prompts` is the state of the prompt cache.
+ * backoff is active. `prompts` and `skills` are the state of the prompt and
+ * the skill cache.
  */
 export const health = query({
   args: {},
@@ -328,6 +330,7 @@ export const health = query({
       expired: v.number(),
     }),
     prompts: vPromptHealth,
+    skills: vSkillHealth,
   }),
   handler: async (ctx) => {
     const now = Date.now();
@@ -368,6 +371,7 @@ export const health = query({
         expired: exporter?.expired ?? 0,
       },
       prompts: await promptHealth(ctx),
+      skills: await skillHealth(ctx),
     };
   },
 });

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+### Added
+
+- A skill cache with `skills.get` and `skills.sync`. It stores the `production`
+  and `latest` version of each tracked Langfuse skill with its file contents,
+  and serves them from queries without calling Langfuse.
+- A signed skill webhook route, `/skill-webhook`, with the env value
+  `LANGFUSE_SKILL_WEBHOOK_SECRET`. A listing every 15 minutes and a daily
+  refresh per skill repair missed deliveries.
+- `health.skills`: tracked names, failed refreshes, the backlog, a rate limit
+  pause and the last listing.
+
 ## 0.1.1
 
 ### Fixed
