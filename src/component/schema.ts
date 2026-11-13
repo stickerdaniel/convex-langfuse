@@ -26,6 +26,13 @@ export const vPromptSource = v.union(
   v.literal("fallback"),
 );
 
+export const vSkillLabel = v.union(
+  v.literal("production"),
+  v.literal("latest"),
+);
+export type SkillLabel = Infer<typeof vSkillLabel>;
+export const vSkillPriority = v.union(v.literal(0), v.literal(1));
+
 export default defineSchema({
   // Pending exports. The payload lives in its own table, so claims and
   // retention read only these small rows. Every deletion of an `outbox` or
@@ -286,4 +293,156 @@ export default defineSchema({
    * running refreshes write, and conflict with them.
    */
   promptSlots: defineTable({ name: v.string() }).index("by_name", ["name"]),
+
+  /**
+   * A tracked skill name and its pending request. A request raises
+   * `requested` and sets `eligibleAt`; the refresh that claimed the count it
+   * finds clears the request on success.
+   */
+  skillNames: defineTable({
+    name: v.string(),
+    /** Raised by every request; a refresh compares it with its claim. */
+    requested: v.number(),
+    /**
+     * When the pending request may be claimed; unset when none is pending.
+     * A failure moves it to the retry time, a newer webhook moves it earlier.
+     */
+    eligibleAt: v.optional(v.number()),
+    /** 0 for a webhook or `sync`, 1 for a listing or the daily refresh. */
+    priority: vSkillPriority,
+    /** When the pending request was first queued; the older goes first. */
+    queuedAt: v.optional(v.number()),
+    /** The refresh in flight: its run's generation and the count it serves. */
+    claimed: v.optional(
+      v.object({ generation: v.number(), requested: v.number() }),
+    ),
+    /** Consecutive failed refreshes, for the backoff. */
+    failures: v.number(),
+    /** Fixed code of the last refresh's failure. */
+    error: v.optional(v.string()),
+    /** When the tick queues the next daily refresh. */
+    fullDueAt: v.number(),
+    /** The last refresh that succeeded. */
+    lastFullAt: v.optional(v.number()),
+    /** Named by `sync({ names })`: kept while Langfuse has no such skill. */
+    watch: v.boolean(),
+  })
+    .index("by_name", ["name"])
+    .index("by_priority_eligibleAt", ["priority", "eligibleAt"])
+    .index("by_priority_queuedAt", ["priority", "queuedAt"])
+    .index("by_fullDueAt", ["fullDueAt"]),
+
+  /**
+   * One row per tracked skill name, created and deleted with its
+   * `skillNames` row and never changed in between. The `MAX_SKILL_NAMES`
+   * bound counts these rows, as `promptSlots` does for prompts.
+   */
+  skillSlots: defineTable({ name: v.string() }).index("by_name", ["name"]),
+
+  /**
+   * The version a label of a skill name points to. `version` and `remoteId`
+   * copy the version's, so the listing compares without reading versions.
+   */
+  skillLabels: defineTable({
+    name: v.string(),
+    label: vSkillLabel,
+    versionId: v.id("skillVersions"),
+    version: v.number(),
+    remoteId: v.string(),
+  }).index("by_name_label", ["name", "label"]),
+
+  /**
+   * One fetched skill version. Its files are written in the same
+   * transaction, so a stored version is complete until the sweep marks it
+   * `deleting`.
+   */
+  skillVersions: defineTable({
+    name: v.string(),
+    /** The Langfuse id of the version; a recreated version has another. */
+    remoteId: v.string(),
+    version: v.number(),
+    description: v.string(),
+    /** Canonical JSON of the frontmatter object. */
+    frontmatter: v.string(),
+    /** Sorted by path. `sha256` is the base64 SHA-256 of the content. */
+    files: v.array(v.object({ path: v.string(), sha256: v.string() })),
+    /** Hex SHA-256 of the JSON array of `[path, sha256]` pairs. */
+    snapshotId: v.string(),
+    storedAt: v.number(),
+    /** The first time a label pointed to it; orders recreated versions. */
+    publishedAt: v.optional(v.number()),
+    /** Set while no label points to it. */
+    releasedAt: v.optional(v.number()),
+    /** Set by the sweep, which deletes its files and then the row. */
+    deleting: v.optional(v.boolean()),
+  })
+    .index("by_remoteId", ["remoteId"])
+    .index("by_name_version", ["name", "version"])
+    .index("by_releasedAt", ["releasedAt"])
+    .index("by_publishedAt_storedAt", ["publishedAt", "storedAt"]),
+
+  /** One file of one skill version. */
+  skillFiles: defineTable({
+    versionId: v.id("skillVersions"),
+    path: v.string(),
+    content: v.string(),
+  }).index("by_version", ["versionId"]),
+
+  /**
+   * Singleton state of the skill fetch loop, created by the first
+   * `skills.dispatch`. Only `skills.dispatch` and `skills.advance` write it.
+   */
+  skillFetcher: defineTable({
+    /** Fences runs: only the run with the current generation writes. */
+    generation: v.number(),
+    leaseExpiresAt: v.optional(v.number()),
+    runStartedAt: v.optional(v.number()),
+    /** The earliest start of the next request. */
+    nextRequestAt: v.number(),
+    /** Set after a 429: no request starts before it. */
+    cooldownUntil: v.optional(v.number()),
+    /** The listing walk in progress. */
+    list: v.optional(
+      v.object({
+        /** The next page to fetch, from 1. */
+        page: v.number(),
+        startedAt: v.number(),
+        /** Tracked names the pages read so far listed. */
+        seen: v.array(v.string()),
+        /** Set once a page listed a name mode `all` could not track. */
+        overflow: v.optional(v.boolean()),
+      }),
+    ),
+    /** When the last walk ended. */
+    lastListAt: v.optional(v.number()),
+    /** Fixed code of the last walk that ended early. */
+    listError: v.optional(v.string()),
+    /**
+     * Set when a walk in mode `all` listed a name over the bound. Kept by a
+     * walk that ended early; cleared by a complete walk that found none.
+     */
+    overflow: v.optional(v.boolean()),
+    /** The last background request, for the background share. */
+    lastBackgroundAt: v.optional(v.number()),
+    /** What the last background request fetched; the next one alternates. */
+    lastBackgroundKind: v.optional(
+      v.union(v.literal("list"), v.literal("name")),
+    ),
+  }),
+
+  /**
+   * Singleton, written only by `skills.sync`. `all` tracks every skill of the
+   * project, `names` the names `sync` was given. Without it the skill cache
+   * is off.
+   */
+  skillSync: defineTable({
+    mode: v.union(v.literal("all"), v.literal("names")),
+  }),
+
+  /**
+   * Singleton, written only by `skills.wake`. `skills.nextWork` reads it, so
+   * a loop transaction that read the work before a wake committed is run
+   * again.
+   */
+  skillWake: defineTable({ at: v.number() }),
 });

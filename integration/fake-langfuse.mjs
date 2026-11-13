@@ -43,6 +43,13 @@
 // of a prompt, moves the labels to it and answers `{ version, createdAt }`.
 // After `POST /control/webhook` with `{ url, secret }`, every created prompt
 // version is posted to `url` as a signed `prompt-version` event.
+//
+// Skills follow the shapes of Langfuse 4.80.0: `GET /skills/{name}?label=
+// |version=&includeContent=true` and the listing `GET /skills?page&limit`,
+// one row per name with `latestVersion` and `productionVersion`. `POST
+// /control/skills` with `{ name, files: [{ path, content }], labels }` adds
+// the next version of a skill, moves `labels` and `latest` to it and answers
+// `{ version }`.
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -97,6 +104,13 @@ const configs = [];
 const observations = new Map();
 /** Prompt name to its versions: `{ version, type, prompt, config, labels }`. */
 const prompts = new Map();
+/**
+ * Skill name to its versions: `{ id, version, files, labels, createdAt }`,
+ * each file `{ path, content }`.
+ */
+const skills = new Map();
+/** Skill name to the time of its last change, for the listing order. */
+const skillUpdatedAt = new Map();
 /** Where created prompt versions are posted, or `null`. */
 let webhook = null;
 /**
@@ -140,6 +154,53 @@ function addPrompt({ name, type = "text", prompt, config = {}, labels = [] }) {
   versions.push(entry);
   if (webhook) void postWebhook(name, entry);
   return entry;
+}
+
+/** Adds the next version of skill `name`; it takes `labels` and `latest`. */
+function addSkill({ name, files, labels = ["production"] }) {
+  const versions = skills.get(name) ?? [];
+  skills.set(name, versions);
+  const moved = [...labels, "latest"];
+  for (const entry of versions) {
+    entry.labels = entry.labels.filter((label) => !moved.includes(label));
+  }
+  const entry = {
+    id: randomUUID(),
+    version: versions.length + 1,
+    files,
+    labels: moved,
+    createdAt: new Date().toISOString(),
+  };
+  versions.push(entry);
+  skillUpdatedAt.set(name, Date.now());
+  return entry;
+}
+
+/** The skill version the public API returns, with contents when asked. */
+function skillBody(name, entry, includeContent) {
+  return {
+    id: entry.id,
+    createdAt: entry.createdAt,
+    updatedAt: entry.createdAt,
+    projectId: "fake",
+    createdBy: "API",
+    name,
+    description: "A skill of the integration run.",
+    frontmatter: { name, description: "A skill of the integration run." },
+    version: entry.version,
+    tags: [],
+    labels: entry.labels,
+    commitMessage: null,
+    files: entry.files.map(({ path, content }, i) => ({
+      id: `${entry.id}-${i}`,
+      path,
+      blobId: `${entry.id}-blob-${i}`,
+      sha256Hash: createHash("sha256").update(content, "utf8").digest("base64"),
+      contentType: "text/plain",
+      contentLength: Buffer.byteLength(content, "utf8"),
+      ...(includeContent ? { content } : {}),
+    })),
+  };
 }
 
 /** The prompt object the public API returns for one version. */
@@ -423,7 +484,8 @@ async function publicApi(req, res, url) {
   const route = url.pathname.replace(/^\/api\/public/, "");
   const key = `${req.method} ${route
     .replace(/^\/scores\/.+/, "/scores/{id}")
-    .replace(/^\/v2\/prompts\/.+/, "/v2/prompts/{name}")}`;
+    .replace(/^\/v2\/prompts\/.+/, "/v2/prompts/{name}")
+    .replace(/^\/skills\/.+/, "/skills/{name}")}`;
   stats.api[key] = (stats.api[key] ?? 0) + 1;
   if (req.method === "GET" && route.startsWith("/v2/prompts")) {
     stats.promptRequests.push({
@@ -553,6 +615,59 @@ async function publicApi(req, res, url) {
       isActive: entry.labels.includes("production"),
     });
   }
+  if (req.method === "GET" && route === "/skills") {
+    const page = Number(url.searchParams.get("page") ?? 1);
+    const limit = Number(url.searchParams.get("limit") ?? 10);
+    const names = [...skills.keys()].sort(
+      (a, b) =>
+        skillUpdatedAt.get(b) - skillUpdatedAt.get(a) || (a < b ? -1 : 1),
+    );
+    const find = (name, label) =>
+      skills.get(name).find((entry) => entry.labels.includes(label));
+    const data = names.slice((page - 1) * limit, page * limit).map((name) => ({
+      name,
+      description: "A skill of the integration run.",
+      tags: [],
+      latestVersion: find(name, "latest").version,
+      latestVersionCreatedAt: find(name, "latest").createdAt,
+      latestVersionLastUpdatedAt: find(name, "latest").createdAt,
+      productionVersion: find(name, "production")?.version ?? null,
+    }));
+    const totalPages = Math.ceil(names.length / limit);
+    return json(res, 200, {
+      data,
+      meta: {
+        page,
+        limit,
+        totalItems: names.length,
+        totalPages,
+        hasNextPage: page < totalPages,
+      },
+    });
+  }
+  if (req.method === "GET" && route.startsWith("/skills/")) {
+    const name = decodeURIComponent(route.slice("/skills/".length));
+    const version = url.searchParams.get("version");
+    const label = url.searchParams.get("label") ?? "production";
+    const entry = skills
+      .get(name)
+      ?.find((item) =>
+        version === null
+          ? item.labels.includes(label)
+          : item.version === Number(version),
+      );
+    if (!entry) {
+      return json(res, 404, {
+        message: "Skill version not found",
+        error: "LangfuseNotFoundError",
+      });
+    }
+    return json(
+      res,
+      200,
+      skillBody(name, entry, url.searchParams.get("includeContent") === "true"),
+    );
+  }
   if (req.method === "GET" && route === "/v2/observations") {
     const traceId = url.searchParams.get("traceId");
     const data = [...(observations.get(traceId)?.values() ?? [])].map(
@@ -671,6 +786,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/control/prompts") {
       const { version } = addPrompt(JSON.parse(await readBody(req)));
       return json(res, 200, { version, createdAt: Date.now() });
+    }
+    if (req.method === "POST" && url.pathname === "/control/skills") {
+      const { version } = addSkill(JSON.parse(await readBody(req)));
+      return json(res, 200, { version });
     }
     if (req.method === "POST" && url.pathname === "/control/webhook") {
       webhook = JSON.parse(await readBody(req));

@@ -218,3 +218,92 @@ export const SNAPSHOT_GRACE_MS = HOUR;
 export const WEBHOOK_TOLERANCE_MS = 5 * MINUTE;
 /** Timeout of one prompt API request. */
 export const PROMPT_TIMEOUT_MS = 10 * SECOND;
+
+/** Name of the batch-worker loop that drives the skill fetches. */
+export const SKILL_WORKER_NAME = "skills";
+/** Skill names the cache tracks at most. */
+export const MAX_SKILL_NAMES = 500;
+/** Characters of a skill name, as Langfuse allows. */
+export const MAX_SKILL_NAME_LENGTH = 64;
+/**
+ * Shortest time between the end of one skill request and the start of the
+ * next. Every skill endpoint counts toward the organization's `public-api`
+ * rate limit, 30 requests per minute on Langfuse Cloud Hobby.
+ */
+export const SKILL_REQUEST_SPACING_MS = 2_500;
+/**
+ * How far a webhook or `sync` request is due ahead of now. A burst of
+ * deliveries for one name within this time leads to one refresh.
+ */
+export const SKILL_REQUEST_DELAY_MS = 2 * SECOND;
+/** Longest pause `advance` hands to the run before it asks again. */
+export const SKILL_MAX_WAIT_MS = 2_500;
+/**
+ * A background request goes before urgent names once no background request
+ * was handed out for this long, so a stream of webhooks does not starve it.
+ */
+export const SKILL_BACKGROUND_SHARE_MS = 30 * SECOND;
+/** Names one selection reads per priority. */
+export const SKILL_SELECT_WINDOW = 10;
+/** Pauses of one name after consecutive failures, the last one repeating. */
+export const SKILL_BACKOFF_MS = [
+  5 * SECOND,
+  30 * SECOND,
+  2 * MINUTE,
+  10 * MINUTE,
+];
+/** Pause of every skill request after a 429 without `Retry-After`. */
+export const SKILL_COOLDOWN_MS = MINUTE;
+/** Shortest pause after a 429. */
+export const SKILL_COOLDOWN_MIN_MS = 5 * SECOND;
+/** Longest pause after a 429, whatever `Retry-After` asks for. */
+export const SKILL_COOLDOWN_MAX_MS = 15 * MINUTE;
+/** A listing walk starts once the last one ended this long ago. */
+export const SKILL_LIST_INTERVAL_MS = 15 * MINUTE;
+/** Names per listing page, the server maximum. */
+export const SKILL_LIST_PAGE_LIMIT = 100;
+/** Pages one listing walk reads at most. */
+export const SKILL_LIST_MAX_PAGES = 10;
+/** Every tracked name gets a background refresh once per this interval. */
+export const SKILL_FULL_REFRESH_MS = 24 * HOUR;
+/** Names one tick queues for their daily refresh at most. */
+export const SKILL_TICK_NAMES = 5;
+/**
+ * `get({ version })` serves a version that a label held within this window.
+ * The sweep deletes a version once no label held it for this long.
+ */
+export const SKILL_VERSION_WINDOW_MS = 7 * 24 * HOUR;
+/** A stored version that no refresh published is deleted after this time. */
+export const SKILL_UNPUBLISHED_GRACE_MS = HOUR;
+/**
+ * Bytes of one skill API response that a fetch reads. A version holds at
+ * most `MAX_SKILL_BYTES` of content, which JSON escaping can grow up to six
+ * times, plus metadata.
+ */
+export const MAX_SKILL_RESPONSE_BYTES = 8 * MIB;
+/** Files of one cached version. */
+export const MAX_SKILL_FILES = 200;
+/**
+ * Summed UTF-8 bytes of the file contents of one cached version. One version
+ * and its files are written in one transaction, below the 16 MiB a
+ * transaction writes, and every file fits one 1 MiB document.
+ */
+export const MAX_SKILL_BYTES = 1_000_000;
+/** Characters of a file path, as Langfuse allows. */
+export const MAX_SKILL_PATH_LENGTH = 512;
+/** Characters of a description, as Langfuse allows. */
+export const MAX_SKILL_DESCRIPTION_LENGTH = 1_024;
+/** UTF-8 bytes of the canonical frontmatter JSON. */
+export const MAX_SKILL_FRONTMATTER_BYTES = 64 * KIB;
+/** Nesting levels of the frontmatter: an object of strings has one. */
+export const MAX_SKILL_FRONTMATTER_DEPTH = 15;
+/**
+ * Content bytes one skill sweep reads and deletes at most. It starts no
+ * version whose `MAX_SKILL_BYTES` would pass the budget.
+ */
+export const SKILL_SWEEP_BYTES = 4 * MIB;
+/**
+ * Rows of one version number, or of one Langfuse version id, that a read
+ * takes: the recreations of the number and the rows the sweep is deleting.
+ */
+export const MAX_SKILL_VERSION_ROWS = 100;

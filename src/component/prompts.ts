@@ -138,11 +138,11 @@ async function storeSnapshot(
   });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function compareStrings(a: string, b: string): number {
+export function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
@@ -157,7 +157,7 @@ function sortKeys(value: unknown): unknown {
 }
 
 /** JSON with object keys sorted at every depth, so equal values give equal strings. */
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortKeys(value));
 }
 

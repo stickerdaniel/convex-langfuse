@@ -16,3 +16,15 @@ export async function withPauses<T>(
   }
   return await run();
 }
+
+/** Parses `Retry-After`, given in seconds or as an HTTP date. */
+export function parseRetryAfter(
+  value: string | null,
+  now: number,
+): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
+  const at = Date.parse(trimmed);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}

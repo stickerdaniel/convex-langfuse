@@ -52,6 +52,16 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             oldestAttemptAt?: number;
             tracked: number;
           };
+          skills: {
+            cooldownUntil?: number;
+            due: number;
+            errors: number;
+            lastListAt?: number;
+            listError?: string;
+            oldestDueAt?: number;
+            overflow: boolean;
+            tracked: number;
+          };
         },
         Name
       >;
@@ -154,6 +164,29 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           value: number | string;
         },
         { enqueued: boolean; reason?: "disabled" | "backlog" },
+        Name
+      >;
+    };
+    skills: {
+      get: FunctionReference<
+        "query",
+        "internal",
+        { label?: "production" | "latest"; name: string; version?: number },
+        {
+          description: string;
+          files: Array<{ content: string; path: string }>;
+          frontmatter: string;
+          name: string;
+          snapshotId: string;
+          version: number;
+        } | null,
+        Name
+      >;
+      sync: FunctionReference<
+        "mutation",
+        "internal",
+        { names?: Array<string> },
+        { status: "ok" | "incomplete"; tracked: number },
         Name
       >;
     };

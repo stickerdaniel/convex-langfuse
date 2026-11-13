@@ -186,3 +186,29 @@ export const backlog = query({
     };
   },
 });
+
+/** The cached `production` version of skill `name`, or `null`. */
+export const skill = query({
+  args: { name: v.string() },
+  returns: v.union(
+    v.null(),
+    v.object({
+      version: v.number(),
+      files: v.array(v.object({ path: v.string(), content: v.string() })),
+    }),
+  ),
+  handler: async (ctx, { name }) => {
+    const cached = await strict.skills.get(ctx, { name });
+    return cached && { version: cached.version, files: cached.files };
+  },
+});
+
+/** Tracks `names`, as `skills.sync` does. */
+export const syncSkills = mutation({
+  args: { names: v.array(v.string()) },
+  returns: v.object({
+    status: v.union(v.literal("ok"), v.literal("incomplete")),
+    tracked: v.number(),
+  }),
+  handler: async (ctx, { names }) => await strict.skills.sync(ctx, { names }),
+});

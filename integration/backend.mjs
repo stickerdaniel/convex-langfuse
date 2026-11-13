@@ -279,6 +279,18 @@ export async function startFake() {
       if (!response.ok) throw new Error("fake endpoint control failed");
       return await response.json();
     },
+    /**
+     * Adds the next version of a skill with `files` and `labels`; it also
+     * takes `latest`. Returns `{ version }`.
+     */
+    async addSkill(skill) {
+      const response = await fetch(`${url}/control/skills`, {
+        method: "POST",
+        body: JSON.stringify(skill),
+      });
+      if (!response.ok) throw new Error("fake endpoint control failed");
+      return await response.json();
+    },
     async stats() {
       return await (await fetch(`${url}/stats`)).json();
     },

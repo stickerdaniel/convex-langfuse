@@ -33,7 +33,7 @@ import {
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const api = anyApi.harness;
 const nodeApi = anyApi.nodeHarness;
-const { convex, streamLogs, linkPackage } = convexCli(HERE);
+const { convex, setEnv, streamLogs, linkPackage } = convexCli(HERE);
 
 // ── Cases ──────────────────────────────────────────────────────────────────
 
@@ -1025,6 +1025,115 @@ async function main() {
         return (
           `${added.length} names reserved after the first refresh published ` +
           `and while ${unpublished} of the last 50 had not; all cached`
+        );
+      },
+    );
+
+    await runCase(
+      "13 a skill of 1,000,000 bytes in 200 files and the skill webhook",
+      async () => {
+        const name = "integration-skill";
+        // 200 files of 5,000 UTF-8 bytes each, with two-byte characters.
+        const files = Array.from({ length: 200 }, (_, i) => {
+          const path =
+            i === 0 ? "SKILL.md" : `reference/${String(i).padStart(3, "0")}.md`;
+          const head = i === 0 ? `---\nname: ${name}\n---\n` : `file ${i}\n`;
+          const left = 5_000 - Buffer.byteLength(head, "utf8");
+          const content =
+            head + "é".repeat(Math.floor(left / 2)) + "x".repeat(left % 2);
+          return { path, content };
+        });
+        const bytes = files.reduce(
+          (sum, { content }) => sum + Buffer.byteLength(content, "utf8"),
+          0,
+        );
+        if (bytes !== 1_000_000) throw new Error(`fixture of ${bytes} bytes`);
+        await fake.addSkill({ name, files, labels: ["production"] });
+        const synced = await client.mutation(api.syncSkills, { names: [name] });
+        if (synced.status !== "ok") {
+          throw new Error(`skills.sync returned ${JSON.stringify(synced)}`);
+        }
+        const cached = (version) =>
+          waitFor(
+            `skill version ${version} in the cache`,
+            async () => {
+              const skill = await client.query(api.skill, { name });
+              return skill?.version === version && skill;
+            },
+            60_000,
+          );
+        const first = await cached(1);
+        const uploaded = new Map(files.map((f) => [f.path, f.content]));
+        if (
+          first.files.length !== files.length ||
+          first.files.some((f) => uploaded.get(f.path) !== f.content)
+        ) {
+          throw new Error("the cached files differ from the uploaded ones");
+        }
+
+        const secret = `lf-whsec_${randomBytes(32).toString("hex")}`;
+        await setEnv(backend, "LANGFUSE_SKILL_WEBHOOK_SECRET", secret);
+        const url = `${backend.siteUrl}/langfuse/skill-webhook`;
+        const post = (body, signature) =>
+          fetch(url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...(signature ? { "x-langfuse-signature": signature } : {}),
+            },
+            body,
+          });
+        const sign = (body) => {
+          const t = Math.floor(Date.now() / 1_000);
+          const hex = createHmac("sha256", secret)
+            .update(`${t}.${body}`, "utf8")
+            .digest("hex");
+          return `t=${t},v1=${hex}`;
+        };
+        const second = `---\nname: ${name}\n---\nVersion 2\n`;
+        await fake.addSkill({
+          name,
+          files: [{ path: "SKILL.md", content: second }],
+          labels: ["production"],
+        });
+        // The payload of a 4.80.0 delivery, without the fields the
+        // component ignores.
+        const body = JSON.stringify({
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          type: "skill-version",
+          apiVersion: "v1",
+          action: "created",
+          skill: { name, version: 2, labels: ["production", "latest"] },
+        });
+        // The route answers 404 until the component sees the secret.
+        const response = await waitFor(
+          "a signed delivery to be answered",
+          async () => {
+            const response = await post(body, sign(body));
+            return response.status !== 404 && response;
+          },
+          30_000,
+        );
+        const text = await response.text();
+        if (response.status !== 200 || text !== "") {
+          throw new Error(
+            `signed delivery answered ${response.status} with ${text.length} bytes`,
+          );
+        }
+        const unsigned = await post(body);
+        if (unsigned.status !== 401) {
+          throw new Error(`unsigned delivery answered ${unsigned.status}`);
+        }
+        const updated = await cached(2);
+        if (updated.files[0]?.content !== second) {
+          throw new Error("version 2 differs from the uploaded file");
+        }
+        const fetched = (await fake.stats()).api["GET /skills/{name}"] ?? 0;
+        return (
+          `200 files of 1,000,000 bytes stored and read back byte for byte; ` +
+          `signed delivery 200, unsigned 401; version 2 cached after ` +
+          `${fetched} skill GETs`
         );
       },
     );

@@ -33,6 +33,7 @@ type Env = {
   readonly LANGFUSE_BASE_URL: string | undefined;
   readonly LANGFUSE_PUBLIC_KEY: string | undefined;
   readonly LANGFUSE_SECRET_KEY: string | undefined;
+  readonly LANGFUSE_SKILL_WEBHOOK_SECRET: string | undefined;
   readonly LANGFUSE_WEBHOOK_SECRET: string | undefined;
 };
 

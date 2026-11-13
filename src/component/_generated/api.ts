@@ -15,9 +15,12 @@ import type * as http from "../http.js";
 import type * as outbox from "../outbox.js";
 import type * as prompts from "../prompts.js";
 import type * as retention from "../retention.js";
+import type * as retry from "../retry.js";
 import type * as scoreKeys from "../scoreKeys.js";
 import type * as scores from "../scores.js";
 import type * as settings from "../settings.js";
+import type * as signature from "../signature.js";
+import type * as skills from "../skills.js";
 import type * as traces from "../traces.js";
 import type * as tracing from "../tracing.js";
 
@@ -36,9 +39,12 @@ const fullApi: ApiFromModules<{
   outbox: typeof outbox;
   prompts: typeof prompts;
   retention: typeof retention;
+  retry: typeof retry;
   scoreKeys: typeof scoreKeys;
   scores: typeof scores;
   settings: typeof settings;
+  signature: typeof signature;
+  skills: typeof skills;
   traces: typeof traces;
   tracing: typeof tracing;
 }> = anyApi as any;

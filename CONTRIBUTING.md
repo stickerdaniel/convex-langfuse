@@ -22,7 +22,7 @@ Three more suites run on a local Convex backend, which the first run downloads
 at the pinned release:
 
 ```sh
-# 12 cases with a fake Langfuse endpoint, about 10 minutes. CI runs it.
+# 13 cases with a fake Langfuse endpoint, about 10 minutes. CI runs it.
 npm run test:integration
 
 # Load, outage, backlog threshold and prompt refresh drivers, about 70 minutes.
