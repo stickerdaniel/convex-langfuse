@@ -72,13 +72,15 @@ jobs:
           done
           ! grep -E '\.test(-d|-util)?\.ts$' "$OUT/files.txt" || fail "The tarball holds test files."
           # A consumer installs the tarball and loads both runtime entries,
-          # which load every file they import.
+          # which load every file they import. The install resolves the
+          # dependency ranges from the registry, as a consumer's does. Each
+          # command ends the subshell itself: `||` on it turns off `set -e`.
           smoke="$RUNNER_TEMP/smoke"
           mkdir -p "$smoke"
           (
-            cd "$smoke"
-            npm init -y > /dev/null
-            npm install --no-audit --no-fund --ignore-scripts "$OUT/package.tgz" > /dev/null
+            cd "$smoke" || exit 1
+            npm init -y > /dev/null || exit 1
+            npm install --no-audit --no-fund --ignore-scripts "$OUT/package.tgz" > /dev/null || exit 1
             node --input-type=module -e 'await import("@stickerdaniel/convex-langfuse"); await import("@stickerdaniel/convex-langfuse/ids");'
           ) || fail "The installed tarball does not load."
           status="$(curl --silent --show-error --retry 3 --max-time 30 --output /dev/null \
