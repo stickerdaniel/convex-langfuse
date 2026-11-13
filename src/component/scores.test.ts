@@ -11,6 +11,7 @@ import {
   MAX_PENDING_DELETES,
   MAX_ROW_BYTES,
   PENDING_BYTES_THRESHOLD,
+  RATE_LIMITED_MS,
   SCORE_SETTLE_MS,
 } from "./constants.js";
 import {
@@ -322,6 +323,59 @@ describe("score ops", () => {
     expect(exporter.lastError).toMatchObject({ class: "config", status: 404 });
     expect(exporter.backoffUntil).toBeUndefined();
     expect(exporter.consecutiveFailures).toBe(0);
+  });
+
+  test("score and trace deletion endpoints that answer 429 wait for Retry-After while 100 spans behind them are accepted", async () => {
+    fake.fallback = (request) =>
+      request.spanIds.length > 0
+        ? { status: 200 }
+        : { status: 429, headers: { "Retry-After": "3600" } };
+    // The deletion request comes first: a score write enqueued before it
+    // would hold it back.
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await upsert("s1", 1);
+    await recordSpans(0, 50);
+    await recordSpans(50, 50);
+    const sentSpans = () => fake.requests.flatMap((r) => r.spanIds).length;
+    await drive(t, fake, { until: () => sentSpans() === 100 });
+
+    // Every request goes out in the same run, without a pause.
+    expect(fake.requests.at(-1)!.at - fake.requests[0]!.at).toBeLessThan(100);
+    const apiRequests = fake.requests.filter((r) => r.spanIds.length === 0);
+    const state = await tables(t);
+    expect(state.outbox.map((row) => row.kind)).toEqual([
+      "traceDelete",
+      "scoreCreate",
+    ]);
+    for (const [i, row] of state.outbox.entries()) {
+      // The fake clock moves 1 ms per transaction.
+      const late = row.availableAt - apiRequests[i]!.at - 3_600_000;
+      expect(late).toBeGreaterThanOrEqual(0);
+      expect(late).toBeLessThan(100);
+    }
+    const { exporter } = await health();
+    expect(exporter.lastError).toMatchObject({
+      class: "transient",
+      status: 429,
+    });
+    expect(exporter.backoffUntil).toBeUndefined();
+    expect(exporter.consecutiveFailures).toBe(0);
+    expect(exporter.accepted).toBe(100);
+  });
+
+  test("a score answered 429 without Retry-After is sent again after 1 minute", async () => {
+    fake.respond({ status: 429 });
+    await upsert("s1", 1);
+    await drive(t, fake);
+
+    expect(scorePosts().map(scoreBody)).toMatchObject([
+      { id: "s1", value: 1 },
+      { id: "s1", value: 1 },
+    ]);
+    const gap = fake.requests[1]!.at - fake.requests[0]!.at;
+    expect(gap).toBeGreaterThanOrEqual(RATE_LIMITED_MS);
+    expect(gap).toBeLessThan(RATE_LIMITED_MS + 2_000);
+    expect((await tables(t)).outbox).toEqual([]);
   });
 
   test("a bad default environment refuses a score without its own, and a valid explicit one is accepted", async () => {

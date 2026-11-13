@@ -32,6 +32,7 @@ import {
   CONFIG_BACKOFF_CAP_MS,
   DEFERRED_MS,
   LEASE_MS,
+  RATE_LIMITED_MS,
   REQUEST_TIMEOUT_MS,
   RUN_BUDGET_MS,
   SCORE_SETTLE_MS,
@@ -73,7 +74,10 @@ const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
   });
 
 export const vReport = v.object({
-  /** `deferred` is a route error of an API op; spans never get it. */
+  /**
+   * `deferred` is a route error or a rate limit of an API op, which waits
+   * `retryAfterMs` when set; spans never get it.
+   */
   outcome: v.union(
     v.literal("accepted"),
     v.literal("rejected"),
@@ -251,7 +255,8 @@ function backoffDelay(report: Report, failures: number, cap: number): number {
  *
  * An API op differs from a span batch: it never counts toward the breaker, a
  * rejected op becomes a dead letter at once, and a `deferred` op moves
- * `DEFERRED_MS` ahead while the run goes on. Score ops also move through
+ * ahead, by `DEFERRED_MS` or the wait of its rate limit, while the run goes
+ * on. Score ops also move through
  * their `scoreKeys` state on claim and with the outcome; every score op that
  * leaves the outbox, also one superseded by a waiting successor, adds to the
  * removed totals. Trace deletion requests never count.
@@ -363,18 +368,19 @@ export const advance = internalMutation({
           }
           break;
         case "deferred":
-          // A route error of one endpoint: only this op waits, the run goes
-          // on with the rows behind it. A waiting successor supersedes it.
+          // A route error or a rate limit of one endpoint: only this op
+          // waits, the run goes on with the rows behind it. A waiting
+          // successor supersedes it.
           if (op && (await markFailed(ctx, op, now))) {
             removed.push(op);
           } else if (op) {
             await ctx.db.patch("outbox", op._id, {
-              availableAt: now + DEFERRED_MS,
+              availableAt: now + (report.retryAfterMs ?? DEFERRED_MS),
             });
           }
           patch.lastError = {
             at: now,
-            class: "config",
+            class: report.status === 429 ? "transient" : "config",
             ...(report.status === undefined ? {} : { status: report.status }),
           };
           break;
@@ -538,7 +544,11 @@ export function parseRetryAfter(
 /**
  * Maps an HTTP status to the exporter's outcome classes. A route error (404,
  * 405, any 3xx) is `config` for the OTLP request and `deferred` for an API
- * op, so one wrong API route does not stop the spans.
+ * op, so one wrong API route does not stop the spans. A 429 is `transient`
+ * for the OTLP request and `deferred` for an API op, for the `Retry-After`
+ * time or `RATE_LIMITED_MS`: Langfuse Cloud limits each endpoint group on its
+ * own, deletions per day, so a rate limit of one API op says nothing about
+ * the spans.
  */
 export function classify(
   status: number,
@@ -562,6 +572,13 @@ export function classify(
     return target === "api"
       ? { outcome: "deferred", status }
       : { outcome: "config", status, ...timing };
+  }
+  if (status === 429 && target === "api") {
+    return {
+      outcome: "deferred",
+      status,
+      retryAfterMs: retryAfterMs ?? RATE_LIMITED_MS,
+    };
   }
   if ([408, 425, 429].includes(status) || status >= 500) {
     return { outcome: "transient", status, ...timing };

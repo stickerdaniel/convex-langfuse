@@ -89,6 +89,8 @@ export const SCORE_SETTLE_MS = 30 * SECOND;
 export const API_TIMEOUT_MS = 10 * SECOND;
 /** How far a route error (404, 405, 3xx) moves an API op ahead. */
 export const DEFERRED_MS = 30 * MINUTE;
+/** How far a 429 without `Retry-After` moves an API op ahead. */
+export const RATE_LIMITED_MS = MINUTE;
 /**
  * Trace deletion requests in the outbox and the dead letters together at
  * which `traces.remove` throws.
