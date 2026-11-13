@@ -11,6 +11,8 @@ import {
   MAX_PENDING_DELETES,
   MAX_ROW_BYTES,
   PENDING_BYTES_THRESHOLD,
+  RATE_LIMITED_CAP_MS,
+  RATE_LIMITED_MS,
   SCORE_SETTLE_MS,
 } from "./constants.js";
 import {
@@ -89,6 +91,7 @@ async function recordSpans(from: number, count: number) {
 const isScorePost = (r: RecordedRequest) =>
   r.method === "POST" && r.path === "/api/public/scores";
 const scorePosts = () => fake.requests.filter(isScorePost);
+const isDelete = (r: RecordedRequest) => r.method === "DELETE";
 const scoreBody = (r: RecordedRequest) =>
   JSON.parse(r.body) as { id: string; value: number; configId?: string };
 const health = () => t.query(api.outbox.health, {});
@@ -322,6 +325,96 @@ describe("score ops", () => {
     expect(exporter.lastError).toMatchObject({ class: "config", status: 404 });
     expect(exporter.backoffUntil).toBeUndefined();
     expect(exporter.consecutiveFailures).toBe(0);
+  });
+
+  test("score and trace deletion endpoints that answer 429 wait for Retry-After while 100 spans behind them are accepted", async () => {
+    fake.fallback = (request) =>
+      request.method === "DELETE"
+        ? { status: 429, headers: { "Retry-After": "3600" } }
+        : { status: 200 };
+    await t.mutation(api.traces.remove, { traceIds: [TRACE.traceId] });
+    await t.mutation(api.scores.remove, { id: "s1" });
+    await recordSpans(0, 50);
+    await recordSpans(50, 50);
+    const sentSpans = () => fake.requests.flatMap((r) => r.spanIds).length;
+    await drive(t, fake, { until: () => sentSpans() === 100 });
+
+    // Every request goes out in the same run, without a pause.
+    expect(fake.requests.at(-1)!.at - fake.requests[0]!.at).toBeLessThan(100);
+    const deletions = fake.requests.filter(isDelete);
+    expect(deletions.map((r) => r.path)).toEqual([
+      "/api/public/traces",
+      "/api/public/scores/s1",
+    ]);
+    const state = await tables(t);
+    expect(state.outbox.map((row) => row.kind)).toEqual([
+      "traceDelete",
+      "scoreDelete",
+    ]);
+    for (const [i, row] of state.outbox.entries()) {
+      // The fake clock moves 1 ms per transaction.
+      const late = row.availableAt - deletions[i]!.at - 3_600_000;
+      expect(late).toBeGreaterThanOrEqual(0);
+      expect(late).toBeLessThan(100);
+    }
+    const { exporter } = await health();
+    expect(exporter.lastError).toMatchObject({
+      class: "transient",
+      status: 429,
+    });
+    expect(exporter.backoffUntil).toBeUndefined();
+    expect(exporter.consecutiveFailures).toBe(0);
+    expect(exporter.accepted).toBe(100);
+  });
+
+  test.each([
+    ["without Retry-After", RATE_LIMITED_MS, {}],
+    ["with Retry-After 0", 1_000, { "Retry-After": "0" }],
+  ])(
+    "a score deletion answered 429 %s is sent again after %i ms",
+    async (_, wait, headers) => {
+      fake.respond({ status: 429, headers });
+      await t.mutation(api.scores.remove, { id: "s1" });
+      await drive(t, fake);
+
+      const deletions = fake.requests.filter(isDelete);
+      expect(deletions.map((r) => r.path)).toEqual([
+        "/api/public/scores/s1",
+        "/api/public/scores/s1",
+      ]);
+      const gap = deletions[1]!.at - deletions[0]!.at;
+      expect(gap).toBeGreaterThanOrEqual(wait);
+      expect(gap).toBeLessThan(wait + 2_000);
+      expect((await tables(t)).outbox).toEqual([]);
+    },
+  );
+
+  test("a Retry-After of a week moves a score deletion ahead by one day", async () => {
+    fake.fallback = { status: 429, headers: { "Retry-After": "604800" } };
+    await t.mutation(api.scores.remove, { id: "s1" });
+    await drive(t, fake, { until: () => fake.requests.length === 1 });
+    await drive(t, fake, {
+      until: async () => !(await health()).exporter.running,
+    });
+
+    const [row] = (await tables(t)).outbox;
+    const late = row!.availableAt - fake.requests[0]!.at - RATE_LIMITED_CAP_MS;
+    expect(late).toBeGreaterThanOrEqual(0);
+    expect(late).toBeLessThan(100);
+    expect(fake.requests).toHaveLength(1);
+  });
+
+  test("a score write answered 429 holds the spans behind it, which share its limit", async () => {
+    fake.respond({ status: 429, headers: { "Retry-After": "7" } });
+    await upsert("s1", 1);
+    await recordSpans(0, 1);
+    await drive(t, fake);
+
+    expect(fake.requests.map((r) => r.spanIds.length)).toEqual([0, 0, 1]);
+    expect(fake.requests[1]!.at - fake.requests[0]!.at).toBeGreaterThanOrEqual(
+      7_000,
+    );
+    expect((await tables(t)).outbox).toEqual([]);
   });
 
   test("a bad default environment refuses a score without its own, and a valid explicit one is accepted", async () => {

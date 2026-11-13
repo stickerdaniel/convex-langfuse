@@ -89,6 +89,14 @@ export const SCORE_SETTLE_MS = 30 * SECOND;
 export const API_TIMEOUT_MS = 10 * SECOND;
 /** How far a route error (404, 405, 3xx) moves an API op ahead. */
 export const DEFERRED_MS = 30 * MINUTE;
+/** How far a 429 without `Retry-After` moves a deletion ahead. */
+export const RATE_LIMITED_MS = MINUTE;
+/**
+ * Longest wait a 429 gives a deletion: one day, the longest rate limit window
+ * of Langfuse Cloud. The shortest is `BACKOFF_BASE_MS`, so `Retry-After: 0`
+ * does not repeat the request without a pause.
+ */
+export const RATE_LIMITED_CAP_MS = 24 * HOUR;
 /**
  * Trace deletion requests in the outbox and the dead letters together at
  * which `traces.remove` throws.

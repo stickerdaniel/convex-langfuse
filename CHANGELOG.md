@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+### Fixed
+
+- A score or trace deletion request that Langfuse answers with 429 delays only
+  that request, for the `Retry-After` time or 1 minute. Before, it stopped the
+  export of observations until the rate limit ended, up to a day on Langfuse
+  Cloud, which counts deletions per day.
+
 ## 0.1.0
 
 ### Breaking Changes
