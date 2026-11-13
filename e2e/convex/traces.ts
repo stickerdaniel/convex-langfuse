@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { Langfuse } from "convex-langfuse";
+import { Langfuse } from "@stickerdaniel/convex-langfuse";
 import { components } from "./_generated/api";
 import { mutation } from "./_generated/server";
 

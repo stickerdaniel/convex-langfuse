@@ -79,8 +79,12 @@ Your functions never wait for Langfuse and never fail because Langfuse is down.
 
 ## Setup
 
-This fork has no npm release yet. The npm package `convex-langfuse` is the
-upstream project and has a different API.
+```sh
+npm install @stickerdaniel/convex-langfuse
+```
+
+The npm package `convex-langfuse` without the scope is the upstream project and
+has a different API.
 
 Add the component in `convex/convex.config.ts` and bind its settings to your
 app's environment variables:
@@ -88,7 +92,7 @@ app's environment variables:
 ```ts
 import { defineApp } from "convex/server";
 import { v } from "convex/values";
-import convexLangfuse from "convex-langfuse/convex.config";
+import convexLangfuse from "@stickerdaniel/convex-langfuse/convex.config";
 
 const app = defineApp({
   env: {
@@ -133,7 +137,7 @@ needs no Langfuse project.
 Create the client once, for example in `convex/langfuse.ts`:
 
 ```ts
-import { Langfuse } from "convex-langfuse";
+import { Langfuse } from "@stickerdaniel/convex-langfuse";
 import { components } from "./_generated/api";
 
 export const langfuse = new Langfuse(components.convexLangfuse, {
@@ -239,8 +243,9 @@ same trace and the same observation without a lookup:
   `<traceId>:<key>`.
 
 Pass `traceId` or `id` instead when you already hold ids, for example W3C trace
-context from another service. `convex-langfuse/ids` exports `traceIdFromSeed`
-and `observationIdFromKey` without the client, for a service outside Convex.
+context from another service. `@stickerdaniel/convex-langfuse/ids` exports
+`traceIdFromSeed` and `observationIdFromKey` without the client, for a service
+outside Convex.
 
 A key recorded twice gives two rows in Langfuse. Record from an idempotent
 mutation, or put the attempt into the key.
@@ -251,7 +256,7 @@ Declare the score names once. `score` then accepts only these names, with values
 of their type:
 
 ```ts
-import { defineScores, Langfuse } from "convex-langfuse";
+import { defineScores, Langfuse } from "@stickerdaniel/convex-langfuse";
 import { components } from "./_generated/api";
 
 const scores = defineScores({
@@ -611,7 +616,7 @@ component and its child component in one call:
 
 ```ts
 import { convexTest } from "convex-test";
-import { register } from "convex-langfuse/test";
+import { register } from "@stickerdaniel/convex-langfuse/test";
 import schema from "./schema";
 
 const modules = import.meta.glob("./**/*.ts");

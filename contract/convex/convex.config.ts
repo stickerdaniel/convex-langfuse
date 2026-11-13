@@ -1,6 +1,6 @@
 import { defineApp } from "convex/server";
 import { v } from "convex/values";
-import convexLangfuse from "convex-langfuse/convex.config.js";
+import convexLangfuse from "@stickerdaniel/convex-langfuse/convex.config.js";
 
 // The app declares the Langfuse settings and binds them to the component by
 // reference; the contract runner sets them with `npx convex env set`. The
