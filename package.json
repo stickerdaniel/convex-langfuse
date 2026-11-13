@@ -52,7 +52,10 @@
   "files": [
     "dist",
     "src",
-    "NOTICE"
+    "NOTICE",
+    "!src/**/*.test.ts",
+    "!src/**/*.test-d.ts",
+    "!src/**/*.test-util.ts"
   ],
   "exports": {
     "./package.json": "./package.json",
