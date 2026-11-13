@@ -513,9 +513,9 @@ throws an `Error` whose message is the code, which rolls back a mutation.
   discarding.
 - **Scores and deletion requests.** Each one is a request of its own. A 404, a
   405 or a redirect from its endpoint delays only that request by 30 minutes. A
-  429 delays only that request for the `Retry-After` time, or 1 minute without
-  one. Observations behind it are still sent. Langfuse Cloud counts deletion
-  requests per day and plan
+  429 delays only that request for the `Retry-After` time, at least 1 second and
+  at most 1 day, or 1 minute without one. Observations behind it are still sent.
+  Langfuse Cloud counts deletion requests per day and plan
   ([API limits](https://langfuse.com/faq/all/api-limits)); a deletion past the
   limit waits for the next day's window.
 - **Backlog.** Above 25,000 pending observations and score operations or 256 MiB

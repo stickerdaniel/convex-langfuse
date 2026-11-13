@@ -11,6 +11,7 @@ import {
   MAX_PENDING_DELETES,
   MAX_ROW_BYTES,
   PENDING_BYTES_THRESHOLD,
+  RATE_LIMITED_CAP_MS,
   RATE_LIMITED_MS,
   SCORE_SETTLE_MS,
 } from "./constants.js";
@@ -363,19 +364,40 @@ describe("score ops", () => {
     expect(exporter.accepted).toBe(100);
   });
 
-  test("a score answered 429 without Retry-After is sent again after 1 minute", async () => {
-    fake.respond({ status: 429 });
-    await upsert("s1", 1);
-    await drive(t, fake);
+  test.each([
+    ["without Retry-After", RATE_LIMITED_MS, {}],
+    ["with Retry-After 0", 1_000, { "Retry-After": "0" }],
+  ])(
+    "a score answered 429 %s is sent again after %i ms",
+    async (_, wait, headers) => {
+      fake.respond({ status: 429, headers });
+      await upsert("s1", 1);
+      await drive(t, fake);
 
-    expect(scorePosts().map(scoreBody)).toMatchObject([
-      { id: "s1", value: 1 },
-      { id: "s1", value: 1 },
-    ]);
-    const gap = fake.requests[1]!.at - fake.requests[0]!.at;
-    expect(gap).toBeGreaterThanOrEqual(RATE_LIMITED_MS);
-    expect(gap).toBeLessThan(RATE_LIMITED_MS + 2_000);
-    expect((await tables(t)).outbox).toEqual([]);
+      expect(scorePosts().map(scoreBody)).toMatchObject([
+        { id: "s1", value: 1 },
+        { id: "s1", value: 1 },
+      ]);
+      const gap = fake.requests[1]!.at - fake.requests[0]!.at;
+      expect(gap).toBeGreaterThanOrEqual(wait);
+      expect(gap).toBeLessThan(wait + 2_000);
+      expect((await tables(t)).outbox).toEqual([]);
+    },
+  );
+
+  test("a Retry-After of a week moves a score ahead by one day", async () => {
+    fake.fallback = { status: 429, headers: { "Retry-After": "604800" } };
+    await upsert("s1", 1);
+    await drive(t, fake, { until: () => fake.requests.length === 1 });
+    await drive(t, fake, {
+      until: async () => !(await health()).exporter.running,
+    });
+
+    const [row] = (await tables(t)).outbox;
+    const late = row!.availableAt - fake.requests[0]!.at - RATE_LIMITED_CAP_MS;
+    expect(late).toBeGreaterThanOrEqual(0);
+    expect(late).toBeLessThan(100);
+    expect(fake.requests).toHaveLength(1);
   });
 
   test("a bad default environment refuses a score without its own, and a valid explicit one is accepted", async () => {

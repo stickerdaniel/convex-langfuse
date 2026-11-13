@@ -32,6 +32,7 @@ import {
   CONFIG_BACKOFF_CAP_MS,
   DEFERRED_MS,
   LEASE_MS,
+  RATE_LIMITED_CAP_MS,
   RATE_LIMITED_MS,
   REQUEST_TIMEOUT_MS,
   RUN_BUDGET_MS,
@@ -546,7 +547,8 @@ export function parseRetryAfter(
  * 405, any 3xx) is `config` for the OTLP request and `deferred` for an API
  * op, so one wrong API route does not stop the spans. A 429 is `transient`
  * for the OTLP request and `deferred` for an API op, for the `Retry-After`
- * time or `RATE_LIMITED_MS`: Langfuse Cloud limits each endpoint group on its
+ * time or `RATE_LIMITED_MS`, within `BACKOFF_BASE_MS` and
+ * `RATE_LIMITED_CAP_MS`: Langfuse Cloud limits each endpoint group on its
  * own, deletions per day, so a rate limit of one API op says nothing about
  * the spans.
  */
@@ -577,7 +579,10 @@ export function classify(
     return {
       outcome: "deferred",
       status,
-      retryAfterMs: retryAfterMs ?? RATE_LIMITED_MS,
+      retryAfterMs: Math.min(
+        RATE_LIMITED_CAP_MS,
+        Math.max(BACKOFF_BASE_MS, retryAfterMs ?? RATE_LIMITED_MS),
+      ),
     };
   }
   if ([408, 425, 429].includes(status) || status >= 500) {

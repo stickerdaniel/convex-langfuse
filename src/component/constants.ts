@@ -92,6 +92,12 @@ export const DEFERRED_MS = 30 * MINUTE;
 /** How far a 429 without `Retry-After` moves an API op ahead. */
 export const RATE_LIMITED_MS = MINUTE;
 /**
+ * Longest wait a 429 gives an API op: one day, the longest rate limit window
+ * of Langfuse Cloud. The shortest is `BACKOFF_BASE_MS`, so `Retry-After: 0`
+ * does not repeat the request without a pause.
+ */
+export const RATE_LIMITED_CAP_MS = 24 * HOUR;
+/**
  * Trace deletion requests in the outbox and the dead letters together at
  * which `traces.remove` throws.
  */
