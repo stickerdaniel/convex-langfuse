@@ -776,10 +776,13 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const { convex } = convexCli(HERE);
 
   // Runs once, also from a signal. A failed unbinding fails the run, because
-  // the deployment would go on exporting through the tunnel.
+  // the deployment would go on exporting through the tunnel. It waits for
+  // the boot, so no setting of the boot lands after the unbinding.
   let stopping;
+  let booted = Promise.resolve();
   const stop = () => (stopping ??= stopOnce());
   const stopOnce = async () => {
+    await booted;
     const failures = [];
     // Without a base URL the component is disabled and exports nothing.
     await convex(backend, ["env", "remove", "LANGFUSE_BASE_URL"]).catch(
@@ -818,11 +821,12 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
     return logs;
   };
   // `integration/backend.mjs` exits at once on a signal, for local backends.
-  // This run starts none, and its cleanup must finish first.
+  // This run starts none, and its cleanup must finish first; a repeated
+  // signal waits for the same cleanup.
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.removeAllListeners(signal);
-    process.once(signal, () => {
-      print(`${signal}: cleaning up`);
+    process.on(signal, () => {
+      if (stopping === undefined) print(`${signal}: cleaning up`);
       stop()
         .catch((error) => console.error(error.message))
         .finally(() => process.exit(1));
@@ -838,12 +842,16 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
       `run ${runId}: Langfuse ${health.version} at ${langfuseUrl}, ` +
         `Convex deployment ${backend.url}`,
     );
-    // The tunnel must lead to this run's proxy.
+    // The tunnel must lead to this run's proxy, and the proxy to Langfuse.
     const probe = `/api/public/health?run=${runId}`;
-    await fetch(`${proxyUrl}${probe}`).catch(() => undefined);
-    if (!proxy.records.some((record) => record.path === probe)) {
+    await fetch(`${proxyUrl}${probe}`, {
+      signal: AbortSignal.timeout(15_000),
+    }).catch(() => undefined);
+    const probed = proxy.records.find((record) => record.path === probe);
+    if (probed?.status !== 200) {
       throw new Error(
-        `${proxyUrl} does not lead to the proxy on port ${proxyPort}`,
+        `${proxyUrl} does not lead through the proxy on port ${proxyPort} ` +
+          `to Langfuse: ${probed ? `HTTP ${probed.status}` : "no request"}`,
       );
     }
     const canary = randomBytes(16).toString("hex");
@@ -881,7 +889,12 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
 
   let started;
   try {
-    started = await boot();
+    const booting = boot();
+    booted = booting.then(
+      () => undefined,
+      () => undefined,
+    );
+    started = await booting;
   } catch (error) {
     error.logs = await stop().catch((cleanup) => {
       console.error(cleanup.message);

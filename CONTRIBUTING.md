@@ -73,13 +73,14 @@ cleanup fails exits with 1 and names what is left. A wrapper that ends the
 process at once, such as a secret runner on Ctrl-C, skips the cleanup; then run
 `npx convex env remove LANGFUSE_BASE_URL` with the deploy key. The other
 settings, the host app, the score configs, the prompt webhook and the run's
-traces and scores stay; the traces carry the environment `contract-<run id>`.
+traces and scores stay. The traces carry the environment `contract-<run id>`,
+except the canary trace the suite sends before its cases.
 
 Langfuse Cloud differs from the local stack in three ways, and the cloud run
 allows for each:
 
-- Its Hobby plan allows 30 requests per minute on the read API, so the suite
-  pauses 3 s between two reads.
+- Its Hobby plan allows 30 requests per minute on the read API, for the whole
+  organization, so a read that must be repeated waits 3 s.
 - Reading back takes 5 to 15 s instead of 2 s, so every deadline is four times
   as long.
 - Deletions are applied in batches, traces 4 to 19 minutes and scores 34 to 49

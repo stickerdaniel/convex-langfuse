@@ -2,8 +2,8 @@
 // read back with `GET /api/public/v3/scores?id=<id>`, step by step: the
 // first value, the same id and timestamp with a new value, then the
 // deletion. The component sends operations of one id at least 30 s apart,
-// so each step waits for the one before. `scoreDeleted` holds the proof of
-// a deletion, which differs on Langfuse Cloud.
+// so each step waits for the one before. `scoreDeleted` waits until the
+// score is gone, or on Langfuse Cloud until it accepted the deletion.
 
 /** How long Langfuse may take to show, change or remove a score. */
 const SCORE_MS = 90_000;
