@@ -48,6 +48,7 @@ export default [
       differences,
       rowDifferences,
       expectNone,
+      awaitRemoval,
     }) {
       const seed = `contract:${runId}:deleted`;
       const traceId = traceIdFromSeed(seed);
@@ -117,6 +118,9 @@ export default [
         "deletion request body",
         differences(JSON.parse(request.body), { traceIds: [traceId] }),
       );
+      // Langfuse Cloud applies deletions in batches; there the 200 above is
+      // the proof.
+      if (!awaitRemoval) return "deletion request answered 200";
       await poll(
         "the observations gone",
         () => observations(traceId, "core"),

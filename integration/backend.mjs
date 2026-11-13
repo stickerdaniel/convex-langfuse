@@ -323,6 +323,8 @@ function cliEnv(backend) {
   for (const key of Object.keys(env)) {
     if (key.startsWith("CONVEX_")) delete env[key];
   }
+  if (backend.deployKey)
+    return { ...env, CONVEX_DEPLOY_KEY: backend.deployKey };
   return {
     ...env,
     CONVEX_SELF_HOSTED_URL: backend.url,
@@ -332,7 +334,8 @@ function cliEnv(backend) {
 
 /**
  * The Convex CLI for the host app in `dir`, whose `convex/` folder it
- * deploys. `backend` is anything with `url` and `adminKey`.
+ * deploys. `backend` is anything with `url` and `adminKey`, or with
+ * `deployKey` for a Convex Cloud deployment.
  */
 export function convexCli(dir) {
   async function convex(backend, args) {

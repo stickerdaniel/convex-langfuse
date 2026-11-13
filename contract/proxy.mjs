@@ -14,11 +14,14 @@
 
 import { createServer } from "node:http";
 
+/** Headers a tunnel in front of the proxy adds; Langfuse must not see them. */
+const TUNNEL_HEADER = /^(cf-|cdn-loop$|x-forwarded-|x-real-ip$)/;
+
 /**
- * Starts the proxy on a free port of 127.0.0.1 in front of `target`, the
- * Langfuse web URL.
+ * Starts the proxy on 127.0.0.1 in front of `target`, the Langfuse web URL,
+ * on `port` or on a free one.
  */
-export async function startProxy(target) {
+export async function startProxy(target, port = 0) {
   /** Every request the proxy received, in arrival order. */
   const records = [];
   let dropMatch;
@@ -43,7 +46,11 @@ export async function startProxy(target) {
       outgoing.writeHead(503).end();
       return;
     }
-    const headers = { ...incoming.headers };
+    const headers = Object.fromEntries(
+      Object.entries(incoming.headers).filter(
+        ([name]) => !TUNNEL_HEADER.test(name),
+      ),
+    );
     delete headers.host;
     delete headers["content-length"];
     let answer;
@@ -73,7 +80,10 @@ export async function startProxy(target) {
     delete passed["transfer-encoding"];
     outgoing.writeHead(answer.status, passed).end(answered);
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
 
   return {
     url: `http://127.0.0.1:${server.address().port}`,
