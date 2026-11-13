@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0
 
 ### Added
 
@@ -11,7 +11,7 @@
   `LANGFUSE_SKILL_WEBHOOK_SECRET`. A listing every 15 minutes and a daily
   refresh per skill repair missed deliveries.
 - `health.skills`: tracked names, failed refreshes, the backlog, a rate limit
-  pause and the last listing.
+  pause, the last listing and names over the 500-name bound.
 
 ## 0.1.1
 
