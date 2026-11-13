@@ -67,20 +67,24 @@ export CONTRACT_PROXY_URL=https://<public host of the tunnel>
 node contract/run.mjs --cloud
 ```
 
-At the end the suite removes `LANGFUSE_BASE_URL` from the deployment and deletes
-its prompts. Its traces and scores stay in the project, in an environment named
-`contract-<run id>`.
+At the end, and on SIGINT or SIGTERM, the suite removes `LANGFUSE_BASE_URL` from
+the deployment, which stops its export, and deletes its prompts. A run whose
+cleanup fails exits with 1 and names what is left. A wrapper that ends the
+process at once, such as a secret runner on Ctrl-C, skips the cleanup; then run
+`npx convex env remove LANGFUSE_BASE_URL` with the deploy key. The other
+settings, the host app, the score configs, the prompt webhook and the run's
+traces and scores stay; the traces carry the environment `contract-<run id>`.
 
 Langfuse Cloud differs from the local stack in three ways, and the cloud run
 allows for each:
 
 - Its Hobby plan allows 30 requests per minute on the read API, so the suite
-  reads every 3 s.
+  pauses 3 s between two reads.
 - Reading back takes 5 to 15 s instead of 2 s, so every deadline is four times
   as long.
 - Deletions are applied in batches, traces 4 to 19 minutes and scores 34 to 49
-  minutes after the request. The suite takes the 2xx answer of Langfuse to the
-  deletion request as proof.
+  minutes after the request. The cloud run checks only that Langfuse accepted
+  each deletion request with 2xx.
 
 The scripts under `e2e/` check traces, scores and prompts against a Langfuse
 instance of your own. They create traces, scores and prompts with unique names.

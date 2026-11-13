@@ -340,8 +340,8 @@ const DEFAULT_PACE = { scale: 1, pauseMs: 500, awaitRemoval: true };
  * The pace for Langfuse Cloud. Its Hobby plan allows 30 requests per minute
  * on the read API, for the whole organization. It applies deletions in
  * batches: traces 4 to 19 minutes and scores 34 to 49 minutes after the
- * request, measured on 2026-11-13. So the suite takes
- * Langfuse's 2xx answer to the deletion request as proof.
+ * request, measured on 2026-11-13. So the suite checks only that Langfuse
+ * accepted the deletion request with 2xx.
  */
 const CLOUD_PACE = { scale: 4, pauseMs: 3_000, awaitRemoval: false };
 
@@ -407,6 +407,8 @@ async function prepareCases({
     },
     /** Whether a deleted trace or score must be gone from Langfuse. */
     awaitRemoval: pace.awaitRemoval,
+    /** The pause between two reads of a loop that runs outside `poll`. */
+    readPauseMs: Math.max(1_000, pace.pauseMs),
     steps: [],
     postSpan: (span) => postSpan(langfuse, span),
     poll: (what, read, check, deadlineMs) =>
@@ -771,16 +773,27 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   const steps = [];
   const langfuse = publicApi({ baseUrl: langfuseUrl, ...keys });
   const proxy = await startProxy(langfuseUrl, proxyPort);
-  let convex;
+  const { convex } = convexCli(HERE);
 
-  const stop = async () => {
+  // Runs once, also from a signal. A failed unbinding fails the run, because
+  // the deployment would go on exporting through the tunnel.
+  let stopping;
+  const stop = () => (stopping ??= stopOnce());
+  const stopOnce = async () => {
+    const failures = [];
     // Without a base URL the component is disabled and exports nothing.
-    await convex?.(backend, ["env", "remove", "LANGFUSE_BASE_URL"]).catch(
-      (error) => print(`cleanup: ${String(error.message).split("\n")[0]}`),
+    await convex(backend, ["env", "remove", "LANGFUSE_BASE_URL"]).catch(
+      (error) =>
+        failures.push(
+          `LANGFUSE_BASE_URL is still set on ${backend.url}; remove it with ` +
+            `\`npx convex env remove LANGFUSE_BASE_URL\`: ` +
+            String(error.message).split("\n")[0],
+        ),
     );
     await deletePrompts(langfuse, `contract-${runId}-`).catch((error) =>
-      print(`cleanup: ${error.message}`),
+      failures.push(`prompts of the run left in Langfuse: ${error.message}`),
     );
+    for (const failure of failures) print(`cleanup failed: ${failure}`);
     const logs = await collectLogs({
       runId,
       lines,
@@ -797,8 +810,24 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
       },
     });
     await proxy.stop();
+    if (failures.length > 0) {
+      throw Object.assign(new Error(`cleanup failed: ${failures.join("; ")}`), {
+        logs,
+      });
+    }
     return logs;
   };
+  // `integration/backend.mjs` exits at once on a signal, for local backends.
+  // This run starts none, and its cleanup must finish first.
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.removeAllListeners(signal);
+    process.once(signal, () => {
+      print(`${signal}: cleaning up`);
+      stop()
+        .catch((error) => console.error(error.message))
+        .finally(() => process.exit(1));
+    });
+  }
 
   const boot = async () => {
     const bootStart = Date.now();
@@ -846,7 +875,6 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
       webhook: async () => webhookSecret,
       pace,
     });
-    convex = prepared.convex;
     measures.bootMs = Date.now() - bootStart;
     return prepared;
   };
@@ -855,7 +883,10 @@ export async function startCloudSuite({ pace = CLOUD_PACE } = {}) {
   try {
     started = await boot();
   } catch (error) {
-    error.logs = await stop();
+    error.logs = await stop().catch((cleanup) => {
+      console.error(cleanup.message);
+      return cleanup.logs;
+    });
     throw error;
   }
   const { context, deploy } = started;
@@ -874,10 +905,11 @@ async function deletePrompts(langfuse, prefix) {
     if (page >= meta.totalPages) break;
   }
   for (const name of names.filter((name) => name.startsWith(prefix))) {
-    await langfuse.send(
+    const response = await langfuse.send(
       "DELETE",
       `/api/public/v2/prompts/${encodeURIComponent(name)}`,
     );
+    if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
   }
 }
 
@@ -988,6 +1020,7 @@ async function main() {
       logs = await suite.stop();
     }
   } catch (error) {
+    failed = true;
     console.error(`contract run failed: ${error?.message ?? error}`);
     logs ??= error?.logs;
   }
