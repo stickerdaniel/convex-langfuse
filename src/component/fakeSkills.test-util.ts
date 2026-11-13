@@ -6,7 +6,9 @@
 // skill-service.ts`, with ids of the fake's own.
 
 import { createHash } from "node:crypto";
+import batchWorker from "@convex-dev/batch-worker/test";
 import { vi } from "vitest";
+import componentTest from "../test.js";
 import type {
   Behaviour,
   FakeLangfuse,
@@ -255,12 +257,35 @@ export function skillEvent(
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realTick = () => new Promise((resolve) => realSetTimeout(resolve, 1));
 
+let imported: Promise<unknown> | undefined;
+
+/**
+ * Imports the function modules of this component and of batch-worker once
+ * per test file. convex-test imports a module on its first call. A first
+ * import of batch-worker's `loop.ts` takes 5 to 7 ms of real time on an idle
+ * machine and hundreds of ms under parallel load. `driveSkills` would
+ * advance the clock during that import.
+ */
+function importFunctionModules(): Promise<unknown> {
+  // Both records use keys like `./component/schema.ts`, so they stay apart.
+  // convex-test never imports tests or `convex.config.ts`.
+  imported ??= Promise.all(
+    [componentTest.modules, batchWorker.modules]
+      .flatMap((modules) => Object.entries(modules))
+      .filter(([path]) => !/(\.test(-util)?|convex\.config)\.ts$/.test(path))
+      .map(([, load]) => load()),
+  );
+  return imported;
+}
+
 /**
  * Advances the fake clock one timer at a time until `until` holds, for at
  * most `maxMs` of fake time. The skill run sleeps on the fake clock between
  * requests, so it never finishes while the clock stands still: after 4 real
  * ticks of 1 ms without the scheduled functions finishing, the step treats
- * them as waiting for a timer and advances the clock. `onStep` runs after every
+ * them as waiting for a timer and advances the clock. A function that has to
+ * import its module first would look like such a wait, so the driver imports
+ * every function module before the first step. `onStep` runs after every
  * step, for sampling state or interleaving a delivery.
  */
 export async function driveSkills(
@@ -276,6 +301,7 @@ export async function driveSkills(
     maxMs?: number;
   } = {},
 ): Promise<void> {
+  await importFunctionModules();
   const deadline = Date.now() + maxMs;
   for (let step = 0; step < 200_000; step++) {
     let settled = false;
