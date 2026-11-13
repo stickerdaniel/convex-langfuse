@@ -44,10 +44,7 @@
     "test:contract:faults": "node contract/faults.mjs",
     "preversion": "npm install --legacy-peer-deps && npm run build:clean && run-p test lint typecheck",
     "prepack": "node scripts/sync-version.mjs && npm run build",
-    "prepublishOnly": "npm whoami || npm login",
-    "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
-    "release": "npm version patch && npm publish && git push --follow-tags",
-    "version": "node scripts/sync-version.mjs && git add src/shared/version.ts && vim -c 'normal o' -c 'normal o## '$npm_package_version CHANGELOG.md && prettier -w CHANGELOG.md && git add CHANGELOG.md"
+    "version": "node scripts/sync-version.mjs && git add src/shared/version.ts"
   },
   "files": [
     "dist",
